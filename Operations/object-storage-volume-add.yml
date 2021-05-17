@@ -6,11 +6,11 @@
   vars:
     cloudname: AWS_S3
     cloudvendor: AMAZON_S3
-    cloudbucket: pm-gfs-1
+    cloudbucket: mybucket
     cloudaccesskey: ''
     cloudsecretkey: ''
-    cloudvolname: sharedosv
-    shared_volume: true
+    cloudvolname: mybucket
+    shared_volume: false
   tasks:
   - name: Add an Object Storage volume
     uri:

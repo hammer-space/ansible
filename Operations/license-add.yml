@@ -4,7 +4,7 @@
   vars_files:
   - ./anvil.yml
   vars:
-    activationid: '0215-397f-da92-482e-96ec-22a1-0fda-9eae'
+    activationid: ''
   tasks:
   - name: Add and activate a license
     uri:
