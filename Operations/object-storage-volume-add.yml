@@ -7,8 +7,8 @@
     cloudname: AWS_S3
     cloudvendor: AMAZON_S3
     cloudbucket: pm-gfs-1
-    cloudaccesskey: 'AKIAJQ6P6L22DVPK7FUQ'
-    cloudsecretkey: '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'
+    cloudaccesskey: ''
+    cloudsecretkey: ''
     cloudvolname: sharedosv
     shared_volume: true
   tasks:
