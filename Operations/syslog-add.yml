@@ -1,0 +1,33 @@
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+    params: { "enabled": true,"syslogServers":[{"server":{"address":"10.200.79.19","prefixLength": 0},"port":514,"transport":"UDP"}]}
+  tasks:
+  - name: Get syslog
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/syslog"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: syslog
+  - name: Add syslog
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/syslog/{{ syslog.json[0].uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: "{{ syslog.json[0] | combine(params) }}"
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 120
+# Need to add enable syslog

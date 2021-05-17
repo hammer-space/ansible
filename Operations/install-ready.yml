@@ -1,0 +1,23 @@
+# Wait for Anvil installation to complete
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+  tasks:
+  - name: Query API
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/sites/local"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: _result
+    until: _result.status == 200
+    retries: 120 # 120 * 10 seconds = 20 minutes
+    delay: 10 # Every 10 seconds

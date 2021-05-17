@@ -1,0 +1,23 @@
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+    av_servers: '[
+      { "name": "av1","details":["icap://10.200.77.96:1344","MCAFEE_AV"]}
+    ]'
+  tasks:
+  - name: Add Antivirus (ICAP) servers
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/antivirus"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"_type":"ANTIVIRUS","node":{"_type":"NODE","name":"{{ item.name }}","nodeType":"{{ item.details.1 }}","endpoint":"{{ item.details.0 }}"}}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ av_servers }}"

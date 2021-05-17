@@ -1,0 +1,25 @@
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+    cloudname: AWS_S3
+    cloudvendor: AMAZON_S3
+    cloudbucket: pm-gfs-1
+    cloudaccesskey: 'AKIAJQ6P6L22DVPK7FUQ'
+    cloudsecretkey: '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'
+    cloudvolname: sharedosv
+    shared_volume: true
+  tasks:
+  - name: Add an Object Storage volume
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/object-storage-volumes"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ cloudvolname }}","objectStoreLogicalVolume":{"_type":"OBJECT_STORE_LOGICAL_VOLUME","name":"{{ cloudbucket }}","node":{"_type":"NODE","name":"{{ cloudname }}"}},"_type":"OBJECT_STORAGE_VOLUME","node":{"_type":"NODE","name":"{{ cloudname }}"},"shared":"{{ shared_volume }}"}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no

@@ -1,0 +1,19 @@
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+    activationid: '0215-397f-da92-482e-96ec-22a1-0fda-9eae'
+  tasks:
+  - name: Add and activate a license
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/licenses"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"activationId":"{{ activationid }}"}'
+      force_basic_auth: yes
+      status_code: 202
+      body_format: json
+      validate_certs: no
