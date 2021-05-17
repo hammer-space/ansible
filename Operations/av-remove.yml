@@ -5,7 +5,7 @@
   - ./anvil.yml
   vars:
     av_servers: '[
-      { "name": "av1","details":["icap://10.200.77.96:1344","MCAFEE_AV"]}
+      { "name": "av1","details":["icap://<IP>:1344","MCAFEE_AV"]}
     ]'
   tasks:
   - name: Remove Antivirus (ICAP) servers

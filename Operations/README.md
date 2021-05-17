@@ -13,7 +13,6 @@ password: ''  # admin password
 addomain: mydomain.a.com   # Active Directory domain
 aduser: Administrator      # Active Directory user
 adpassword: ''  # Active Directory password
-activationid: ''  # License key
 '''
 
 - Active Directory ( join / leave )

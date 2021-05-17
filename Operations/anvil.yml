@@ -2,7 +2,3 @@
 data_cluster_mgmt_ip: <IP>
 hsuser: admin
 password: ''  # admin password
-addomain: <Active Directory domain>
-aduser: Administrator
-adpassword: ''
-activationid: ''

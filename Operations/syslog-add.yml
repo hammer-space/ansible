@@ -4,7 +4,7 @@
   vars_files:
   - ./anvil.yml
   vars:
-    params: { "enabled": true,"syslogServers":[{"server":{"address":"10.200.79.19","prefixLength": 0},"port":514,"transport":"UDP"}]}
+    params: { "enabled": true,"syslogServers":[{"server":{"address":"<IP>","prefixLength": 0},"port":514,"transport":"UDP"}]}
   tasks:
   - name: Get syslog
     uri:

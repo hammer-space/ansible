@@ -7,9 +7,8 @@
     share_snapshots: '[
       {"name":"Data","details":["hourly","1_week"]},
       {"name":"Data","details":["daily","1_month"]},
-      {"name":"Data","details":["69bad503-932b-4b57-80c2-7feab31da6ec","1_year"]},
       {"name":"Data","details":["monthly","7_years"]}
-    ]' 
+    ]'
   tasks:
   - name: Delete snapshot schedule associated with a share
     uri:

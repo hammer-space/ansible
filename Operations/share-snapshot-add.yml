@@ -9,7 +9,7 @@
       {"name":"Devwork","details":["daily","1_month"]},
       {"name":"Devwork","details":["weekly","1_year"]},
       {"name":"Devwork","details":["monthly","7_years"]}
-    ]' 
+    ]'
   tasks:
   - name: Add snapshot schedule to share
     uri:
