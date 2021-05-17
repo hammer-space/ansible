@@ -4,7 +4,8 @@ A set of playbooks to automate operations for a Hammerspace installation.
 Each example includes a variable file, anvil.yml which contains required
 information to successfully run the playbook.
 
-*anvil.yml - variables used for operations*
+**anvil.yml - variables used for operations**
+
 'data_cluster_mgmt_ip: <ANVIL MGMT IP>   # management IP for Anvil
 hsuser: admin # User with admin level role
 password: ''  # admin password
