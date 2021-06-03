@@ -7,17 +7,17 @@ information to successfully run the playbook.
 
 ```
 data_cluster_mgmt_ip: <ANVIL MGMT IP>   # management IP for Anvil
-hsuser: admin # User with admin level role
-password: ''  # admin user password
+hsuser:               admin             # user with admin level role
+password:             ''                # admin user password
 ```
 ### Playbooks ###
-- Active Directory ( join / leave )
-- Installation check (checks if an installation is ready to receive API calls)
-- Anti-virus ( add / remove )
-- License ( add )
-- Retention ( add / remove )
-- Schedule ( add )
-- Share snapshot ( add / remove )
-- Syslog ( add / remove )
-- Objective ( add / set )
-- Object Volume ( add )
+- Active Directory ( [join](ad-join.yml) / [leave](ad-leave.yml) )
+- [Installation check](install-ready.yml) - checks if an installation is ready to receive API calls)
+- Anti-virus ( [add](av-add.yml) / [remove](av-remove.yml) )
+- License ( [add](license-add.yml) )
+- Retention ( [add](retention-add.yml) / [remove](retention-delete.yml) )
+- Schedule ( [add](schedule-add.yml) )
+- Share snapshot ( [add](share-snapshot-add.yml) / [remove](share-snapshot-remove.yml) )
+- Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) )
+- Objective ( [add](objective-add.yml) / [set](objective-set.yml) )
+- Object Volume ( [add](object-storage-volume-add.yml) )
