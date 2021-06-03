@@ -11,13 +11,13 @@ hsuser:               admin             # user with admin level role
 password:             ''                # admin user password
 ```
 ### Playbooks ###
-- Active Directory ( [join](ad-join.yml) / [leave](ad-leave.yml) )
-- [Installation check](install-ready.yml) - checks if an installation is ready to receive API calls)
-- Anti-virus ( [add](av-add.yml) / [remove](av-remove.yml) )
-- License ( [add](license-add.yml) )
-- Retention ( [add](retention-add.yml) / [remove](retention-delete.yml) )
-- Schedule ( [add](schedule-add.yml) )
-- Share snapshot ( [add](share-snapshot-add.yml) / [remove](share-snapshot-remove.yml) )
-- Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) )
-- Objective ( [add](objective-add.yml) / [set](objective-set.yml) )
-- Object Volume ( [add](object-storage-volume-add.yml) )
+- Active Directory ( [join](ad-join.yml) / [leave](ad-leave.yml) ) - Join and leave Active Directory
+- [Installation check](install-ready.yml) - Checks if an installation is ready to receive API calls.
+- Anti-virus ( [add](av-add.yml) / [remove](av-remove.yml) ) - Add and remove ICAP servers used for anti-virus scanning
+- License ( [add](license-add.yml) ) - Add product license
+- Retention ( [add](retention-add.yml) / [remove](retention-delete.yml) ) - Add and remove retention schedules
+- Schedule ( [add](schedule-add.yml) ) - Add and remove regular schedules
+- Share snapshot ( [add](share-snapshot-add.yml) / [remove](share-snapshot-remove.yml) ) - Take and remove share snapshots
+- Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) ) - Add and remove syslog servers
+- Objective ( [add](objective-add.yml) / [set](objective-set.yml) ) - Add and set objectives
+- Object Volume ( [add](object-storage-volume-add.yml) ) - Add object storage volumes
