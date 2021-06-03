@@ -1,10 +1,11 @@
 ## Common API operations for managing a Hammerspace installation
 
 A set of playbooks to automate operations for a Hammerspace installation.
+
 Each example includes a variable file, anvil.yml which contains required
 information to successfully run the playbook.
 
-**anvil.yml - variables used for operations**
+[anvil.yml](anvil.yml)
 
 ```
 data_cluster_mgmt_ip: <ANVIL MGMT IP>   # management IP for Anvil
