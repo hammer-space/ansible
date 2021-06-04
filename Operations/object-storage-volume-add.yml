@@ -1,15 +1,18 @@
+# This playbook add a storage node and object storage mybucket
+# cloudvendor:  AMAZON_S3 | ACTIVE_SCALE_S3 | IBM_S3 | CLOUDIAN_S3 | ECS_S3 | GENERIC_S3 | GOOGLE_S3 | SCALITY_S3 | STORAGE_GRID_S3 | AZURE | GOOGLE_CLOUD | HCP_S3 | WASABI_S3 | NETAPP_S3 | SNOWFLAKE | INTERNAL_S3
+# shared_volume: Set to true if used with Global File System feature
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
   - ./anvil.yml
   vars:
-    cloudname: AWS_S3
-    cloudvendor: AMAZON_S3
+    cloudname: <FRIENDLY NAME FOR NODE i.e. AWS_S3
+    cloudvendor: <SPECIFIC VENDOR, SEE LIST ABOVE FOR EXAMPLES>
     cloudbucket: mybucket
     cloudaccesskey: ''
     cloudsecretkey: ''
-    cloudvolname: mybucket
+    cloudvolname: <FRIENDLY NAME FOR CLOUD VOLUME>
     shared_volume: false
   tasks:
   - name: Add an Object Storage volume

@@ -1,3 +1,5 @@
+# This playbook adds a set of snapshot schedules to one or more share_snapshots
+# Note that the schedules must exist before trying to apply them
 ---
 - hosts: localhost
   gather_facts: False

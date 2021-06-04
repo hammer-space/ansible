@@ -1,3 +1,4 @@
+# This playbook adds additional schedules that can be used to schedule snapshots, system tasks.
 ---
 - hosts: localhost
   gather_facts: False

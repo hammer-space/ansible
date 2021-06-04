@@ -1,3 +1,4 @@
+# This playbook disables and clears the syslog configuration
 ---
 - hosts: localhost
   gather_facts: False

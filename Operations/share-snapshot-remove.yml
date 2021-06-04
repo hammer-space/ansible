@@ -1,3 +1,5 @@
+# This playbook removes snapshot schedules.
+# Note that snapshot schedules can only be removed if they are not in use
 ---
 - hosts: localhost
   gather_facts: False

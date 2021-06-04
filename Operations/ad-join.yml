@@ -4,7 +4,8 @@
   vars_files:
   - ./anvil.yml
   vars:
-    params: {'domain': "{{ addomain }}", 'username': "{{ aduser }}", 'password': "{{ adpassword }}", 'joined': true}
+    params: {'domain': "{{ <ENTER YOUR DOMAIN HERE> }}", 'username': "{{ <DOMAIN USER> }}", 'password': "{{ <DOMAIN USER PASSWORD> }}", 'joined': true}
+
   tasks:
   - name: Get AD
     uri:

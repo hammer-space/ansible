@@ -1,4 +1,5 @@
 # Wait for Anvil installation to complete
+# First boot after installation takes longer than any subsequent reboot
 ---
 - hosts: localhost
   gather_facts: False

@@ -1,3 +1,4 @@
+# This playbook adds a set of useful objectives
 ---
 - hosts: localhost
   gather_facts: False

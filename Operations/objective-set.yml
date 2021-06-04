@@ -1,3 +1,4 @@
+# This playbook sets objectives on a share or a path in the System
 ---
 - hosts: localhost
   gather_facts: False

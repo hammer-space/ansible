@@ -1,3 +1,4 @@
+# This playbook adds retention rules that apply to snapshots and file clones.
 ---
 - hosts: localhost
   gather_facts: False

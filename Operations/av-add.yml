@@ -5,7 +5,7 @@
   - ./anvil.yml
   vars:
     av_servers: '[
-      { "name": "av1","details":["icap://<IP>:1344","MCAFEE_AV"]}
+      { "name": "av1","details":["icap://<ICAP SERVER IP>:1344","MCAFEE_AV"]}
     ]'
   tasks:
   - name: Add Antivirus (ICAP) servers

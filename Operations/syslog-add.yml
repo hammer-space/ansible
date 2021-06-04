@@ -1,10 +1,11 @@
+# This playbook adds syslog servers that can receive events
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
   - ./anvil.yml
   vars:
-    params: { "enabled": true,"syslogServers":[{"server":{"address":"<IP>","prefixLength": 0},"port":514,"transport":"UDP"}]}
+    params: { "enabled": true,"syslogServers":[{"server":{"address":"<IP>","prefixLength": 0},"port":514,"transport":"<UDP or TCP>"}]}
   tasks:
   - name: Get syslog
     uri:
