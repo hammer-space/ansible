@@ -3,7 +3,7 @@
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
   vars:
     schedules: '[
       { "name": "monthly", "details": [ "01 00 1 * *" ]} ]'

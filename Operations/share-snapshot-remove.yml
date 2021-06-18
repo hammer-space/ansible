@@ -4,7 +4,7 @@
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
   vars:
     share_snapshots: '[
       {"name":"Data","details":["hourly","1_week"]},

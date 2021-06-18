@@ -3,7 +3,7 @@
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
   vars:
     share_objectives: '[
       { "name": "Data", "details": [ "/","Undelete files to cloud" ]},

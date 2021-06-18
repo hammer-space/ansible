@@ -1,0 +1,49 @@
+# This playbook removes a storage system
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+# Uncomment of of the variable files below
+#  - ./vars_netapp_7mode.yml
+#  - ./vars_netapp_Cmode.yml
+#  - ./vars_netapp_cloud_volume.yml
+#  - ./vars_isilon.yml
+#  - ./vars_VNX.yml
+#  - ./vars_unity.yml
+#  - ./vars_otherNFS.yml
+#  - ./vars_cloud_filestore.yml
+#  - ./vars_softnas.yml
+#  - ./vars_windows_file_server.yml
+  vars:
+  tasks:
+  - name: Remove and monitor progress of storage system
+    block:
+      - name: Remove a storage system
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes/{{ node_name|urlencode }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: DELETE
+          body: ''
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 180
+        register: node_add
+      - name: Check status of removal of storage system
+        uri:
+          url: "{{ node_add.location }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: GET
+          body: '{}'
+          force_basic_auth: yes
+          status_code: 200
+          body_format: json
+          validate_certs: no
+        register: _result
+        until: _result.json.status == "COMPLETED"
+        retries: 10
+        delay: 10

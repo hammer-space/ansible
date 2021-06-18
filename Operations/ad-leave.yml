@@ -1,8 +1,9 @@
+# This playbook leaves active directory if joined
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
   vars:
     params: {'domain': "{{ addomain }}", 'username': "{{ aduser }}", 'joined': false}
   tasks:

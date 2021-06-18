@@ -3,7 +3,7 @@
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
   vars:
     objectives: '[
       {"name":"Recently used with local copy","details":["Keep most recently used files with a local copy","IF LAST_USE_AGE<1HOUR THEN {SLO(\\\"keep-online\\\")}"]},

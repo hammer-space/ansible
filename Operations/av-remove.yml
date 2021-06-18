@@ -1,11 +1,12 @@
+# This playbook removed ICAP servers
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
   vars:
     av_servers: '[
-      { "name": "av1","details":["icap://<IP>:1344","MCAFEE_AV"]}
+      { "name": "<FRIENDLY NODE NAME, i.e. av1>","details":["icap://<ICAP SERVER IP>:1344","MCAFEE_AV"]}
     ]'
   tasks:
   - name: Remove Antivirus (ICAP) servers

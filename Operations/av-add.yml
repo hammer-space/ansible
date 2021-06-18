@@ -1,11 +1,12 @@
+# This playbook adds ICAP servers. Multiple ICAP servers can be specified by using multiple entries
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
   vars:
     av_servers: '[
-      { "name": "av1","details":["icap://<ICAP SERVER IP>:1344","MCAFEE_AV"]}
+      { "name": "<FRIENDLY NODE NAME, i.e. av1>","details":["icap://<ICAP SERVER IP>:1344","MCAFEE_AV"]}
     ]'
   tasks:
   - name: Add Antivirus (ICAP) servers

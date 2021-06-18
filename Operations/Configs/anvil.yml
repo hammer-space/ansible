@@ -1,0 +1,5 @@
+# Parameters used for playbooks
+---
+data_cluster_mgmt_ip: <ANVIL MGMT IP>
+hsuser: admin # Has to be a user with admin role
+password: '<ADMIN PASSWORD>'  # admin password

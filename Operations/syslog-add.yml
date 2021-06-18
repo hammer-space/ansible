@@ -3,7 +3,7 @@
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
   vars:
     params: { "enabled": true,"syslogServers":[{"server":{"address":"<IP>","prefixLength": 0},"port":514,"transport":"<UDP or TCP>"}]}
   tasks:

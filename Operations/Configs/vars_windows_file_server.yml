@@ -1,0 +1,3 @@
+node_name: "My Windows File Server"  # User-friendly name
+node_ip: "<EXPORT IP>"
+node_type: "WINDOWS_FILE_SERVER"

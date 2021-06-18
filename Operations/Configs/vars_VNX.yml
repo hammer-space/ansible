@@ -1,0 +1,3 @@
+node_name: "My VNX"  # User-friendly name
+node_ip: "<EXPORT IP>"
+node_type: "EMC_VNX"
