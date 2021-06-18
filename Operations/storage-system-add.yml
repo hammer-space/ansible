@@ -5,16 +5,16 @@
   vars_files:
   - Configs/anvil.yml
 # Uncomment one of the variable files below
-#  - ./vars_netapp_7mode.yml
-#  - ./vars_netapp_Cmode.yml
-#  - ./vars_netapp_cloud_volume.yml
-#  - ./vars_isilon.yml
-#  - ./vars_VNX.yml
-#  - ./vars_unity.yml
-#  - ./vars_otherNFS.yml
-#  - ./vars_cloud_filestore.yml
-#  - ./vars_softnas.yml
-#  - ./vars_windows_file_server.yml
+#  - Configs/vars_netapp_7mode.yml
+#  - Configs/vars_netapp_Cmode.yml
+#  - Configs/vars_netapp_cloud_volume.yml
+#  - Configs/vars_isilon.yml
+#  - Configs/vars_VNX.yml
+#  - Configs/vars_unity.yml
+#  - Configs/vars_otherNFS.yml
+#  - Configs/vars_cloud_filestore.yml
+#  - Configs/vars_softnas.yml
+#  - Configs/vars_windows_file_server.yml
   tasks:
   - name: Add a storage system
     block:
