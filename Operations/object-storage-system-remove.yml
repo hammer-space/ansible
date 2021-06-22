@@ -1,0 +1,53 @@
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  # Uncomment one of the variable files below
+#  - Configs/amazon_s3.yml
+#  - Configs/vars_azure_blob.yml
+#  - Configs/vars_google_cloud_native.yml
+#  - Configs/vars_google_cloud_s3.yml
+#  - Configs/vars_generic_s3.yml
+#  - Configs/vars_storage_grid.yml
+#  - Configs/vars_active_scale.yml
+#  - Configs/vars_cloudian.yml
+#  - Configs/vars_google_cloud_s3.yml
+#  - Configs/vars_scality.yml
+#  - Configs/vars_ecs.yml
+#  - Configs/vars_ibm_cloud_storage.yml
+#  - Configs/vars_snowflake.yml
+#  - Configs/vars_wasabi.yml
+#  - Configs/vars_netapp_s3.yml
+
+  tasks:
+  - name: Remove and monitor progress of storage system
+    block:
+      - name: Remove a storage system
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes/{{ node_name|urlencode }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: DELETE
+          body: ''
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 180
+        register: node_add
+      - name: Check status of removal of storage system
+        uri:
+          url: "{{ node_add.location }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: GET
+          body: '{}'
+          force_basic_auth: yes
+          status_code: 200
+          body_format: json
+          validate_certs: no
+        register: _result
+        until: _result.json.status == "COMPLETED"
+        retries: 10
+        delay: 10

@@ -1,9 +1,9 @@
-## Common API operations for managing a Hammerspace installation
+## Common API operations for managing Hammerspace
 
-A set of playbooks to automate operations for a Hammerspace installation.
+A set of playbooks to automate operations for Hammerspace.
 
-Each example includes a variable file, [anvil.yml](anvil.yml) which contains required
-information to successfully run the playbook.
+Each example includes at least one variable file, [anvil.yml](anvil.yml) which contains required
+information to successfully run the playbook. Some playbooks also refer to additional variable files. All of these files are located in the Configs sub-directory.
 
 ```
 data_cluster_mgmt_ip: <ANVIL MGMT IP>   # management IP for Anvil
@@ -20,6 +20,8 @@ Each playbook contains a variable section with the relevant variables to the API
 - Retention ( [add](retention-add.yml) / [remove](retention-delete.yml) ) - Add and remove retention schedules
 - Schedule ( [add](schedule-add.yml) ) - Add and remove regular schedules
 - Share snapshot ( [add](share-snapshot-add.yml) / [remove](share-snapshot-remove.yml) ) - Take and remove share snapshots
+- Storage system ( [add](storage-system-add.yml) / [remove](storage-system-remove.yml) ) - Add and remove storage systems (nodes)
+- Object/Cloud Storage system ( [add](object-storage-system-add.yml) / [remove](object-storage-system-remove.yml) ) - Add and remove Object/Cloud storage systems (nodes)
 - Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) ) - Add and remove syslog servers
 - Objective ( [add](objective-add.yml) / [set](objective-set.yml) ) - Add and set objectives
 - Object Volume ( [add](object-storage-volume-add.yml) ) - Add object storage volumes

@@ -1,0 +1,490 @@
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+# Uncomment one of the variable files below
+#  - Configs/amazon_s3.yml
+#  - Configs/vars_azure_blob.yml
+#  - Configs/vars_google_cloud_native.yml
+#  - Configs/vars_google_cloud_s3.yml
+#  - Configs/vars_generic_s3.yml
+#  - Configs/vars_storage_grid.yml
+#  - Configs/vars_active_scale.yml
+#  - Configs/vars_cloudian.yml
+#  - Configs/vars_google_cloud_s3.yml
+#  - Configs/vars_scality.yml
+#  - Configs/vars_ecs.yml
+#  - Configs/vars_ibm_cloud_storage.yml
+#  - Configs/vars_snowflake.yml
+#  - Configs/vars_wasabi.yml
+#  - Configs/vars_netapp_s3.yml
+
+  tasks:
+  - name: Add an object storage system
+    block:
+      - name: Add Amazon AWS S3 storage system
+        when: node_type == "AMAZON_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "false" # Not used with AWS S3
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Azure
+      - name: Add Azure blob storage system
+        when: node_type == "AZURE"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "false" # Not used with Azure
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Google Cloud
+      - name: Add Google Cloud native storage system
+        when: node_type == "GOOGLE_CLOUD"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "false"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Google Cloud S3-compatible
+      - name: Add Google Cloud S3 compatible storage system
+        when: node_type == "GOOGLE_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "false"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Generic S3
+      - name: Add Generic S3 storage system
+        when: node_type == "GENERIC_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# ActiveScale
+      - name: Add Active scale storage system
+        when: node_type == "ACTIVE_SCALE_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# IBM_S3
+      - name: Add IBM Cloud Storage storage system
+        when: node_type == "IBM_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Cloudian
+      - name: Add Cloudian storage system
+        when: node_type == "CLOUDIAN_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# ECS
+      - name: Add ECS storage system
+        when: node_type == "ECS_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Scality
+      - name: Add Scality storage system
+        when: node_type == "SCALITY_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# StorageGrid
+      - name: Add StorageGrid storage system
+        when: node_type == "STORAGE_GRID_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# HCP
+      - name: Add HCP storage system
+        when: node_type == "HCP_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Wasabi
+      - name: Add Wasabi storage system
+        when: node_type == "WASABI_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Netapp
+      - name: Add Netapp storage system
+        when: node_type == "NETAPP_S3"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "{{ node_bucket_naming_virtual_host }}"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+# Snowflake
+      - name: Add Snowflake storage system
+        when: node_type == "SNOWFLAKE"
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body:
+            nodeType: "{{ node_type }}"
+            mgmtNodeCredentials: {"username": "{{ node_access_key }}", "password": "{{ node_secret_key }}","cert":""}
+            name: "{{ node_name }}"
+            _type: "NODE"
+            endpoint: "{{ node_endpoint | default(omit) }}"
+            mgmtIpAddress: {"address": ""}
+            trustCertificate: "false"
+            useVirtualHostNaming: "false"
+            s3SigningType: "{{ node_signing_type | default(omit) }}"
+            proxyInfo: {"proxyHost":"{{ node_proxyhost | default(omit) }}","proxyPort":"{{ node_proxyport | default(omit) }}","proxyUsername":"{{proxyusername | default(omit) }}","proxyPassword":"{{ proxypassword | default(omit) }}"}
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: node_add
+      # This needs to be done since Ansible registers the results variable even if the task is skipped
+      - name: Set location variable
+        set_fact:
+          final_location: "{{ node_add.location }}"
+        when: node_add.location is defined
+
+      - name: Check status of Cloud/Object Storage System add
+        uri:
+          url: "{{ final_location }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: GET
+          body: '{}'
+          force_basic_auth: yes
+          status_code: 200
+          body_format: json
+          validate_certs: no
+        register: _result
+        until: _result.json.status == "COMPLETED"
+        retries: 20
+        delay: 10

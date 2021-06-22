@@ -1,0 +1,14 @@
+node_name: "My Amazon"
+node_type: "AMAZON_S3"
+node_access_key: "<ACCESS KEY>"
+node_secret_key: "<SECRET KEY>"
+# node_endpoint is not required for Amazon, Azure and Google cloud storage systems. It should either be specified with an address or left undefined.
+#    node_endpoint: ""
+# Recommended to leave this undefined unless the default method (mostly S3_V4) does not work.
+#    node_signing_type: "S3_V4_SIGNING" # S3_DEFAULT_SIGNING | S3_V4_SIGNING
+node_bucket_naming_virtual_host: "false"
+# All proxy information optional. Leave undefined unless required
+#node_proxyhost: ""
+#node_proxyport: ""
+#node_proxyusername: ""
+#node_proxypassword: ""

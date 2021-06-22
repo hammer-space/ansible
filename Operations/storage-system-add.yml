@@ -76,7 +76,6 @@
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
-
 # Netapp Cloud Volumes Service
       - name: Add Netapp Cloud Volume storage system
         when: node_type == "NETAPP_CLOUD"
