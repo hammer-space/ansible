@@ -4,7 +4,7 @@ node_access_key: "<SNOWFLAKE USERNAME>"
 node_secret_key: "<SNOWFLAKE PASSWORD>"
 # Node endpoint includes the https address from the account.
 # Replace https with snowflake:// and add database, schema and warehouse as part of the endpoint string
-node_endpoint: "snowflake://ZPA32592.snowflakecomputing.com/?db=DEMO_DB&schema=PUBLIC&warehouse=COMPUTE_WH"
+node_endpoint: "snowflake://XYZ.snowflakecomputing.com/?db=DEMO_DB&schema=PUBLIC&warehouse=COMPUTE_WH"
 # All proxy information optional. Leave undefined unless required
 #node_proxyhost: ""
 #node_proxyport: ""
