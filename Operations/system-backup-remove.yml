@@ -1,0 +1,36 @@
+# This playbook removes system and metadata backup job
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    params: {'"backup_path": "<DESTINATION BACKUP DIRECTORY>", "backup_ip": "<OTHER NFS SERVER IP>", "backup_schedule": "daily"'}
+
+  tasks:
+  - name: Get System Backup
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: system_backup
+  - name: Remove System Backup
+# Only try to remove it if there is a system backup configured
+    when: ( system_backup.json|json_query('values[?name == `uuid`]') )
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup/{{ system_backup.json[0].uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: "{{ system_backup.json[0] | combine(params) }}"
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 60

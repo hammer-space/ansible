@@ -1,8 +1,9 @@
+# This playbook adds an object storage system
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
+  - Configs/anvil.yml
 # Uncomment one of the variable files below
 #  - Configs/amazon_s3.yml
 #  - Configs/vars_azure_blob.yml
