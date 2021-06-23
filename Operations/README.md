@@ -23,5 +23,6 @@ Each playbook contains a variable section with the relevant variables to the API
 - Storage system ( [add](storage-system-add.yml) / [remove](storage-system-remove.yml) ) - Add and remove storage systems (nodes)
 - Object/Cloud Storage system ( [add](object-storage-system-add.yml) / [remove](object-storage-system-remove.yml) ) - Add and remove Object/Cloud storage systems (nodes)
 - Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) ) - Add and remove syslog servers
+- System backup ( [add](system-backup-add.yml) / [remove](system-backup-remove.yml) ) - Add and remove system and metadata backups
 - Objective ( [add](objective-add.yml) / [set](objective-set.yml) ) - Add and set objectives
 - Object Volume ( [add](object-storage-volume-add.yml) ) - Add object storage volumes
