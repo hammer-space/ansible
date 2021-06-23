@@ -1,19 +1,17 @@
-# This playbook add a storage node and object storage mybucket
-# cloudvendor:  AMAZON_S3 | ACTIVE_SCALE_S3 | IBM_S3 | CLOUDIAN_S3 | ECS_S3 | GENERIC_S3 | GOOGLE_S3 | SCALITY_S3 | STORAGE_GRID_S3 | AZURE | GOOGLE_CLOUD | HCP_S3 | WASABI_S3 | NETAPP_S3 | SNOWFLAKE | INTERNAL_S3
-# shared_volume: Set to true if used with Global File System feature
+# This playbook adds a storage node and object storage mybucket
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
   - Configs/anvil.yml
   vars:
-    cloudname: <FRIENDLY NAME FOR NODE i.e. AWS_S3
-    cloudvendor: <SPECIFIC VENDOR, SEE LIST ABOVE FOR EXAMPLES>
-    cloudbucket: mybucket
-    cloudaccesskey: ''
-    cloudsecretkey: ''
-    cloudvolname: <FRIENDLY NAME FOR CLOUD VOLUME>
-    shared_volume: false
+    node_name: "<FRIENDLY EXISTING NODE NAME>"
+    node_bucket: "<BUCKET NAME>"
+    object_volume_name: "My OSV"
+    object_shared: "false"   # true is required for Global File System
+# Parameters below this line are optional and should only be included when changing the default
+#    object_native: "false"  # turns off compression, chunking and encryption. Stores objects without chunking
+#    object_compression: "NO_COMPRESSION" # turns off chunk-level compression
   tasks:
   - name: Add an Object Storage volume
     uri:
@@ -21,7 +19,13 @@
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: POST
-      body: '{"name":"{{ cloudvolname }}","objectStoreLogicalVolume":{"_type":"OBJECT_STORE_LOGICAL_VOLUME","name":"{{ cloudbucket }}","node":{"_type":"NODE","name":"{{ cloudname }}"}},"_type":"OBJECT_STORAGE_VOLUME","node":{"_type":"NODE","name":"{{ cloudname }}"},"shared":"{{ shared_volume }}"}'
+      body:
+        name: "{{ object_volume_name }}"
+        objectStoreLogicalVolume: {"_type":"OBJECT_STORE_LOGICAL_VOLUME","name":"{{ node_bucket }}","node":{"_type":"NODE","name":"{{ node_name }}"}}
+        _type: "OBJECT_STORAGE_VOLUME"
+        node: {"_type":"NODE","name":"{{ node_name }}"}
+        shared: "{{ object_shared }}"
+        compressionType: "{{ object_compression | default(omit) }}"
       force_basic_auth: yes
       status_code: 200
       body_format: json
