@@ -5,8 +5,7 @@
   vars_files:
   - Configs/anvil.yml
   vars:
-    params: {'"backup_path": "<DESTINATION BACKUP DIRECTORY>", "backup_ip": "<OTHER NFS SERVER IP>", "backup_schedule": "daily"'}
-
+    params: {"backup_path": "/bak", "backup_ip": "10.200.79.8", "backup_schedule": "weekly"}
   tasks:
   - name: Get System Backup
     uri:
@@ -21,8 +20,10 @@
       validate_certs: no
     register: system_backup
   - name: Remove System Backup
-# Only try to remove it if there is a system backup configured
-    when: ( system_backup.json|json_query('values[?name == `uuid`]') )
+# Fail when there is no system backup configured
+  - fail: msg="No existing backup configured"
+    when: system_backup.json[0] is not defined
+  - name: Remove System Backup
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup/{{ system_backup.json[0].uoid.uuid }}"
       user: "{{ hsuser }}"

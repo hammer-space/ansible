@@ -1,0 +1,20 @@
+# This playbook deletes an object storage volume that has already been decommissioned
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    object_volume_name: "My OSV"  # Change this to the name of the OSV to be deleted
+  tasks:
+  - name: Delete an object storage volume (OSV)
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/object-storage-volumes/{{ object_volume_name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
