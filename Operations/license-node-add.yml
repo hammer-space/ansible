@@ -1,4 +1,4 @@
-# This playbook adds and activates a node-based licenses
+# This playbook adds and activates a node-based license
 ---
 - hosts: localhost
   gather_facts: False

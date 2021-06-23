@@ -16,7 +16,7 @@ Each playbook contains a variable section with the relevant variables to the API
 - Active Directory ( [join](ad-join.yml) / [leave](ad-leave.yml) ) - Join and leave Active Directory
 - [Installation check](install-ready.yml) - Checks if an installation is ready to receive API calls.
 - Anti-virus ( [add](av-add.yml) / [remove](av-remove.yml) ) - Add and remove ICAP servers used for anti-virus scanning
-- License ( [add](license-add.yml) ) - Add product license
+- License ( [add](license-node-add.yml) ) - Add product license
 - Retention ( [add](retention-add.yml) / [remove](retention-delete.yml) ) - Add and remove retention schedules
 - Schedule ( [add](schedule-add.yml) ) - Add and remove regular schedules
 - Share snapshot ( [add](share-snapshot-add.yml) / [remove](share-snapshot-remove.yml) ) - Take and remove share snapshots
