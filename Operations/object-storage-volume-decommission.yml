@@ -1,0 +1,35 @@
+# This playbook will start and wait for the decommissioning process. It will time out
+# after an hour however that will not cancel the decommissioning task. Decommissioning can take
+# a long time if the volume contains large amounts of data
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+    object_volume_name: "My OSV" # Change to the name of Object Storage Volume to be decommissioned
+    params: {"storageVolumeState": "DECOMMISSIONING"}
+  tasks:
+  - name: Get OSV details
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/object-storage-volumes/{{ object_volume_name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: osv_out
+  - name: Start decommissioning
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/object-storage-volumes/{{ osv_out.json.uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: "{{ osv_out.json | combine(params) }}"
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 3600
