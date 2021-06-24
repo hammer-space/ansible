@@ -3,9 +3,7 @@
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - ./anvil.yml
-  vars:
-    proxyUrl: "http://10.10.10.10:8080"
+  - Configs/anvil.yml
   tasks:
   - name: Configure proxy
     uri:
@@ -18,4 +16,3 @@
       status_code: 200
       body_format: json
       validate_certs: no
-
