@@ -1,0 +1,21 @@
+# This playbook clears the system proxy
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+    proxyUrl: "http://10.10.10.10:8080"
+  tasks:
+  - name: Configure proxy
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/cntl/clear-proxy"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+
