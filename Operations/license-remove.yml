@@ -1,0 +1,20 @@
+# This playbook removes a licenses
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    activationid: "<ACTIVATION ID>"
+  tasks:
+  - name: Remove a license
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/licenses/{{ activationid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 202
+      body_format: json
+      validate_certs: no
