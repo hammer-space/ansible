@@ -1,0 +1,21 @@
+# This playbook removes an identity provider for authenticating management users
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    idp:
+      name: "My AD Provider"
+  tasks:
+  - name: Add an identity provider
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/idp/{{ idp.name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no

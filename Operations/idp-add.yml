@@ -1,0 +1,28 @@
+# This playbook adds an identity provider for authenticating management users
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    idp:
+      name: "My AD Provider"
+      domain: '<AD DOMAIN>'
+      servers: '<AD DOMAIN SERVERS' # Comma separated
+      type: "AD"  # Only AD is currently supported
+  tasks:
+  - name: Add an identity provider
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/idp"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body:
+        name: "{{ idp.name }}"
+        domain: "{{ idp.domain }}"
+        servers: "{{ idp.servers }}"
+        type: "{{ idp.type }}"
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
