@@ -16,7 +16,7 @@ Each playbook contains a variable section with the relevant variables to the API
 - Active Directory ( [join](ad-join.yml) / [leave](ad-leave.yml) ) - Join and leave Active Directory
 - Anti-virus ( [add](av-add.yml) / [remove](av-remove.yml) ) - Add and remove ICAP servers used for anti-virus scanning
 - [Installation check](install-ready.yml) - Checks if an installation is ready to receive API calls.
-- License ( [add](license-node-add.yml) ) - Add product license
+- License ( [add](license-node-add.yml) / [remove](license-node-remove.yml) ) - Add product license
 - Objective ( [add](objective-add.yml) / [set](objective-set.yml) ) - Add and set objectives
 - Object/Cloud Storage system ( [add](object-storage-system-add.yml) / [remove](object-storage-system-remove.yml) ) - Add and remove Object/Cloud storage systems (nodes)
 - Object/Cloud Volume ( [add](object-storage-volume-add.yml) / [decommission](object-storage-volume-decommission.yml) /  [delete](object-storage-volume-delete.yml)) - Add and delete object storage volumes
