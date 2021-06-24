@@ -21,7 +21,7 @@ Each playbook contains a variable section with the relevant variables to the API
 - Object/Cloud Storage system ( [add](object-storage-system-add.yml) / [remove](object-storage-system-remove.yml) ) - Add and remove Object/Cloud storage systems (nodes)
 - Object/Cloud Volume ( [add](object-storage-volume-add.yml) / [decommission](object-storage-volume-decommission.yml) /  [delete](object-storage-volume-delete.yml)) - Add and delete object storage volumes
 - Retention ( [add](retention-add.yml) / [remove](retention-delete.yml) ) - Add and remove retention schedules
-- Schedule ( [add](schedule-add.yml) ) - Add and remove regular schedules
+- Schedule ( [add](schedule-add.yml) / [remove](schedule-remove.yml) ) - Add and remove schedules
 - Share snapshot ( [add](share-snapshot-add.yml) / [remove](share-snapshot-remove.yml) ) - Configure share snapshot schedules
 - Storage system ( [add](storage-system-add.yml) / [remove](storage-system-remove.yml) ) - Add and remove storage systems (nodes)
 - Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) ) - Add and remove syslog servers

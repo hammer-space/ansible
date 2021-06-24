@@ -1,4 +1,4 @@
-# This playbook adds additional schedules that can be used to schedule snapshots, system tasks.
+# This playbook removes a schedule
 ---
 - hosts: localhost
   gather_facts: False
@@ -8,13 +8,13 @@
     schedules: '[
       { "name": "monthly", "details": [ "01 00 1 * *" ]} ]'
   tasks:
-  - name: Create schedule
+  - name: Delete schedule
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules/{{ item.name }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
-      method: POST
-      body: '{"name":"{{ item.name }}","cronExpression":"{{ item.details.0 }}"}'
+      method: DELETE
+      body: '{}' #{"name":"{{ item.name }}","cronExpression":"{{ item.details.0 }}"}'
       force_basic_auth: yes
       status_code: 200
       body_format: json
