@@ -1,0 +1,35 @@
+# This playbook adds one or more shares
+# Examples
+# Create a share with no export restrictions and no max share size
+# {"name":"Data","path":"/data","exportOptions":[{"subnet":"*","accessPermissions":"RW","rootSquash":false}],"sizelimit":"0","size_warning_threshold":"90"}-
+# Create a share limited to 10 TB in share size and exported to two different subnets
+# {"name":"Data","path":"/data","exportOptions":[{"subnet":"20.20.20.0/16","accessPermissions":"RW","rootSquash":false},{"subnet":"10.10.10.0/28","accessPermissions":"RW","rootSquash":false}],"sizelimit":"10000000000000","size_warning_threshold":"90"}-
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    shares: '[
+      {"name":"<SHARE NAME>","path":"<PATH>","exportOptions":[{"subnet":"<IP/NETWORK/CIDR>","accessPermissions":"<RO or RW>","rootSquash":false}],"sizelimit":"<SIZE IN BYTES>","size_warning_threshold":"<PERCENTAGE>"},
+      {"name":"<SHARE NAME>","path":"<PATH>","exportOptions":[{"subnet":"<IP/NETWORK/CIDR>","accessPermissions":"<RO or RW>","rootSquash":true},{"subnet":"<IP/NETWORK/CIDR>","accessPermissions":"<RO or RW>","rootSquash":true}],"sizelimit":"<SIZE IN BYTES>","size_warning_threshold":"<PERCENTAGE>"}
+    ]'
+  tasks:
+  - name: Add a share
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/shares"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body:
+        name: "{{ item.name }}"
+        path: "{{ item.path }}"
+        exportOptions: "{{ item.exportOptions }}"
+        shareSizeLimit: "{{ item.sizelimit }}"
+        warnUtilizationPercentThreshold: "{{ item.size_warning_threshold }}"
+      force_basic_auth: yes
+      status_code: 202
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ shares }}"
