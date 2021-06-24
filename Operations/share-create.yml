@@ -10,26 +10,45 @@
   vars_files:
   - Configs/anvil.yml
   vars:
-    shares: '[
-      {"name":"<SHARE NAME>","path":"<PATH>","exportOptions":[{"subnet":"<IP/NETWORK/CIDR>","accessPermissions":"<RO or RW>","rootSquash":false}],"sizelimit":"<SIZE IN BYTES>","size_warning_threshold":"<PERCENTAGE>"},
-      {"name":"<SHARE NAME>","path":"<PATH>","exportOptions":[{"subnet":"<IP/NETWORK/CIDR>","accessPermissions":"<RO or RW>","rootSquash":true},{"subnet":"<IP/NETWORK/CIDR>","accessPermissions":"<RO or RW>","rootSquash":true}],"sizelimit":"<SIZE IN BYTES>","size_warning_threshold":"<PERCENTAGE>"}
-    ]'
+    shares:
+      name: "<SMB SHARE NAME>"
+      path: "</ENTER PATH>"
+      exportOptions:
+      - subnet: "*"
+        accessPermissions: "RW"
+        rootSquash: false
+      sizelimit: '0'   # Dynamic size limit based on available capacity
+      size_warning_threshold: '90'
   tasks:
-  - name: Add a share
+  - name: Create a share
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/shares"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: POST
       body:
-        name: "{{ item.name }}"
-        path: "{{ item.path }}"
-        exportOptions: "{{ item.exportOptions }}"
-        shareSizeLimit: "{{ item.sizelimit }}"
-        warnUtilizationPercentThreshold: "{{ item.size_warning_threshold }}"
+        name: "{{ shares.name }}"
+        path: "{{ shares.path }}"
+        exportOptions: "{{ shares.exportOptions }}"
+        shareSizeLimit: "{{ shares.sizelimit }}"
+        warnUtilizationPercentThreshold: "{{ shares.size_warning_threshold }}"
       force_basic_auth: yes
       status_code: 202
       body_format: json
       validate_certs: no
-    with_items:
-      - "{{ shares }}"
+    register: share_create
+  - name: Check status of share create
+    uri:
+      url: "{{ share_create.location }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: _result
+    until: _result.json.status == "COMPLETED"
+    retries: 30
+    delay: 2
