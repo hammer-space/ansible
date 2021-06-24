@@ -1,0 +1,51 @@
+# This playbook deletes a share
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+    share_name: "Data3"
+# Optional parameters
+#    delete_delay: "100000" # Specified in nanoseconds. 0=now/instant
+#    delete_path: "true" # delete share root directory - only successful if empty
+  tasks:
+  - name: Get the share details
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/shares/{{ share_name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: share_delete
+  - name: Delete the share
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/shares/{{ share_name|urlencode }}?delete-delay={{ delete_delay|default('0') }}&delete-path={{ delete_path|default('true') }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 202
+      body_format: json
+      validate_certs: no
+    register: delete_task
+  - name: Wait for successful share delete task execution
+    uri:
+      url: "{{ delete_task.location }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: _result
+    until: _result.json.status == "COMPLETED"
+    retries: 10
+    delay: 10
