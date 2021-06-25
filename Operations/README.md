@@ -1,6 +1,6 @@
 ## Common API operations for managing Hammerspace
 
-A set of playbooks to automate operations for Hammerspace.
+A set of playbooks to automate operations for Hammerspace. 
 
 Each example includes at least one variable file, [anvil.yml](anvil.yml) which contains required
 information to successfully run the playbook. Some playbooks also refer to additional variable files. All of these files are located in the Configs sub-directory.
