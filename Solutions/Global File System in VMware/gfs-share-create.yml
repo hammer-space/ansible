@@ -1,0 +1,32 @@
+#
+# Adds a share, specifically only on the first site since they are auto-created on additional sites
+# by the replication/GFS configuration
+#
+- block:
+  - name: Add a share on the first site
+    uri:
+      url: "https://{{ item.details.1 }}:8443/mgmt/v1.2/rest/shares"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ share_name }}", "path": "{{ path }}", "exportOptions": [{"subnet": "{{ subnet }}", "accessPermissions": "{{ access_permissions }}", "rootSquash": {{ root_squash }}}], "shareSizeLimit":0}'
+      force_basic_auth: yes
+      status_code: 202
+      body_format: json
+      validate_certs: no
+    register: share_create
+  - name: Check status of share create
+    uri:
+      url: "{{ share_create.location }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: _result
+    until: _result.json.status == "COMPLETED"
+    retries: 30
+    delay: 2

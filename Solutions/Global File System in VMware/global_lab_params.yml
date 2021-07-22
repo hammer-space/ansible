@@ -1,0 +1,16 @@
+---
+vmhost_hostname: <VCENTER HOST>
+vmhost_username: <USERNAME>
+vmhost_password: <PASSWORD>
+vmhost_cluster: ''
+vmhost_datacenter: <DATACENTER NAME>
+vmhost_datastore: <DATASTORE>
+vmhost_folder: ''
+vmhost_network_data: '<DATA NETWORK -REQUIRED>'
+vmhost_network_mgmt: '<MGMT NETWORK - OPTIONAL>'
+vmhost_network_ha: '<HA NETWORK - ONLY FOR HA>'
+vmhost_resource_pool: <Pick a name>
+domainname: '<DOMAIN NAME>'
+dns_servers: '[<DNS IP 1>, <DNS IP 2>]'
+ntp_servers: '[pool.ntp.org]'
+default_gateway: '<DEFAULT GATEWAY IP>'

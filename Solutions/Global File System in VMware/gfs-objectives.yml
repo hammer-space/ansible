@@ -1,0 +1,17 @@
+#
+# Creates a set of default Objectives
+# Parameters defined in main yaml file
+#
+  - name: Create objectives
+    uri:
+      url: "https://{{ outer_item.details.1 }}:8443/mgmt/v1.2/rest/objectives"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ item.name }}","comment":"{{ item.details.0 }}","expression":"{{ item.details.1 }}","basic":false,"extendedInfo":{"isAdvanced":"true"}}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ objectives }}"

@@ -1,0 +1,17 @@
+#
+# Adds snapshot schedules to shares
+#
+  - name: Create share snapshot schedule
+    when:  outer_item.details.5 == true
+    uri:
+      url: "https://{{ outer_item.details.1 }}:8443/mgmt/v1.2/rest/share-snapshots"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"schedule":{"name":"{{ item.name }}"},"retention":{"name":"{{ item.details.1 }}"},"share":{"name":"{{ item.details.0 }}"}}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ share_snapshot_schedules }}"

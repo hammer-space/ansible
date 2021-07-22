@@ -1,0 +1,16 @@
+#
+# Adds a set of default retention schedules, primarily used for snapshots
+#
+  - name: Create snapshot retention schedules
+    uri:
+      url: "https://{{ outer_item.details.1 }}:8443/mgmt/v1.2/rest/snapshot-retentions"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ item.name }}","retentionTime":"{{ item.details.0 }}","numOfCopies":"{{ item.details.1 }}"}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ retention_schedules }}"

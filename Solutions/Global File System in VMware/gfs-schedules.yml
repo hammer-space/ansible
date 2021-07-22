@@ -1,0 +1,16 @@
+#
+# Creates a set of schedules
+#
+  - name: Create schedules
+    uri:
+      url: "https://{{ outer_item.details.1 }}:8443/mgmt/v1.2/rest/schedules"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ item.name }}","cronExpression":"{{ item.details.0 }}"}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ schedules }}"

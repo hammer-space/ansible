@@ -1,0 +1,30 @@
+#
+# Configures Active Directory
+#
+- block:
+  - name: Get Active Directory
+    uri:
+      url: "https://{{ item.details.1 }}:8443/mgmt/v1.2/rest/ad"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: ad
+# Only join if not already joined
+  - name: Join Active Directory
+    when: ad.json[0].joined == false
+    uri:
+      url: "https://{{ item.details.1 }}:8443/mgmt/v1.2/rest/ad/{{ ad.json[0].uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: "{{ ad.json[0] | combine(adparams) }}"
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 300

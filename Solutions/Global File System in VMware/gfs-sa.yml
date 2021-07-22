@@ -1,0 +1,420 @@
+#
+# Ansible playbook to deploy multiple sites and automate configuration of numerous steps
+#
+# Deploy Standalone Anvil + 1 DSX - note that this playbook can be configured to include the HA deployment instead of Standalone
+#
+# Allows to set CPU/Mem for Anvil and DSX as variables
+# Workflow will appropriately wait for previous step or check task status where available
+#
+# The following configuration steps are done (not in order):
+# 1. Deployment of VMware Anvil + DSX using OVA
+# 2. Licensing
+# 3. Anti-virus ICAP configuration
+# 4. Active Directory
+# 5. Add Object Storage system
+# 6. Add Shared Object Volume (bucket)
+# 7. Retention schedules
+# 8. Snapshot schedules
+# 9. Share snapshot setup
+# 10. Objetives (set of default objetives)
+# 11. Global Share, configured across all sites
+#
+---
+- hosts: localhost
+  become: no
+  gather_facts: False
+  vars_files:
+  - ./global_lab_params.yml
+  vars:
+    image: <PATH TO OVA>
+    activationid: '<ACTIVATION ID>'
+    # Static IPs and password
+    # Prefix for all VM names and hostnames, must start with a letter
+    # true/false indicates the core site. Certain operations must/should be executes on only 1 site during setup
+    # gfs_config:
+    #   name: VM name prefix. Must be unique in VCenter
+    #   details: Sitename,ANVIL IP, Subnet, DSX IP, Replication Interval, Core site (only 1 can be true)
+    gfs_config: [
+      { "name": "a463-142", "details": ["SITE-A-463", "<SITE A ANVIL IP>", "22", "<SITE A DSX IP>", "5", true ]},
+      { "name": "b463-142", "details": ["SITE-B-463", "<SITE B ANVIL IP>", "22", "<SITE B DSX IP>", "5", false ]},
+      { "name": "c463-142", "details": ["SITE-C-463", "<SITE C ANVIL IP>", "22", "<SITE C DSX IP>", "5", false ]} ]
+    password: '<ANVIL PASSWORD>'
+    hsuser: admin
+    # Share configuration
+    share_name: Data
+    path: /data
+    access_permissions: RW
+    root_squash: false
+    subnet: '*'
+    # Cloud/Object storage - shared OSV - Amazon example
+    cloudname: AWS_S3
+    cloudvendor: AMAZON_S3
+    cloudbucket: <BUCKET NAME>
+    cloudaccesskey: '<ACCESS KEY>'
+    cloudsecretkey: '<SECRET KEY>'
+    cloudvolname: <VOLUME NAME IN ANVIL>
+    # Active Directory
+    addomain: <AD DOMAIN>
+    aduser: <Administrator or user with credentials to join domain>
+    adpassword: '<PASSWORD>'
+    adparams: {'domain': "{{ addomain }}", 'username': "{{ aduser }}", 'password': "{{ adpassword }}", 'joined': true}
+    # Virus scanning
+    avname: av1
+    avvendor: MCAFEE_AV # Valid : MCAFEE_AV, CLAM_AV
+    avendpoint: 'icap://<ICAP IP>:1344' # icap://<IP/HOST>:PORT  1344 is standard
+    # VM resource parameters
+    anvil_cpu: 16
+    anvil_mem: 24576  # MB
+    anvil_boot: 200 # GB (85 minimum for testing)
+    anvil_metadata: 200
+    dsx_cpu: 2
+    dsx_mem: 8192
+    dsx_boot: 200
+    dsx_data: 200
+    # Create snapshot retention schedules
+    retention_schedules: '[
+      { "name": "1_day", "details": [ "86400000", "null" ]},
+      { "name": "1_week","details": [ "604800000", "null" ]},
+      { "name": "1_month","details": [ "2678400000", "null" ]},
+      { "name": "1_year","details": [ "31536000000", "null" ]},
+      { "name": "7_years","details": [ "220752000000", "null" ]},
+      { "name": "3_copies","details": [ "null", "3" ]},
+      { "name": "7_copies","details": [ "null", "7" ]},
+      { "name": "30_copies","details": [ "null", "30" ]} ]'
+    # Product comes with hourly, daily and weekly snapshot schedules
+    schedules: '[
+      { "name": "monthly", "details": [ "01 00 1 * *" ]} ]'
+    # Define share snapshots - taken on a schedule
+    share_snapshot_schedules: '[
+      { "name": "hourly", "details": [ "Data", "1_week" ]},
+      { "name": "daily", "details": [ "Data", "1_month" ]},
+      { "name": "weekly", "details": [ "Data", "1_year" ]},
+      { "name": "monthly", "details": [ "Data", "7_years" ]} ]'
+    objectives: '[
+      {"name":"Recently used with local copy","details":["Keep most recently used files with a local copy","IF LAST_USE_AGE<1HOUR THEN {SLO(\\\"keep-online\\\")}"]},
+      {"name":"Tag for local copy","details":["Files with keyword local have a local copy","IF HAS_KEYWORD(\\\"local\\\") THEN {SLO(\\\"keep-online\\\")}"]},
+      {"name":"Archive files with keyword archive","details":["Archive files with keyword archive","IF HAS_KEYWORD(\\\"archive\\\") THEN {SLO(\\\"place-on-object-volumes\\\")}"]},
+      {"name":"Archive Directory","details":["Archive files in any directory named archive to object/cloud after 5 minutes of inactivity.","IF FNMATCH(\\\"*/archive/*\\\",PATH) THEN {SLO(\\\"place-on-shared-object-volumes\\\")}"]},
+      {"name":"Place most recent snapshot local and in cloud","details":["Keep the most recent snapshot local and in cloud","IF VERSION==2 THEN {SLO(\\\"keep-online\\\"),SLO(\\\"place-on-object-volumes\\\")}"]},
+      {"name":"Undelete files to cloud","details":["Store undelete files in cloud","IF IS_UNDELETE THEN {SLO(\\\"place-on-shared-object-volumes\\\")}"]},
+      {"name":"Keep most recently used local with tier to cloud","details":["Keeps files used within the last hour on local NAS and after a week, tier them to cloud","IF LAST_USE_AGE<1*HOUR THEN {SLO(\\\"keep-online\\\")} ELSE IF LAST_USE_AGE>7DAYS THEN {SLO(\\\"place-on-shared-object-volumes\\\")}"]} ]'
+#      {"name":"NAME","details":["DESC","EXPR"]},
+
+  tasks:
+  - name: Create a Standalone Anvil
+    vars:
+      deploy_properties:
+        guestinfo.init.cluster.domainname: '{{ domainname }}'
+        guestinfo.init.cluster.gateway.ipv4_default: '{{ default_gateway }}'
+        guestinfo.init.cluster.ntp_servers: '{{ ntp_servers }}'
+        guestinfo.init.cluster.dns_servers: '{{ dns_servers }}'
+        guestinfo.init.cluster.password: '{{ password }}'
+        guestinfo.init.cluster.metadata.ips: '[{{ item.details.1 }}/{{ item.details.2 }}]'
+        guestinfo.init.cluster.computer_name: '{{ item.details.0 }}'
+        guestinfo.init.nodes.0.hostname: "{{ item.details.0 }}-anvil"
+        guestinfo.init.nodes.0.ha_mode: Standalone
+        guestinfo.init.nodes.0.features: '[metadata]'
+        guestinfo.init.nodes.0.networks.ens160.roles: '[data,mgmt]'
+        guestinfo.init.nodes.0.networks.ens160.dhcp: False
+        guestinfo.init.nodes.0.networks.ens160.ips: '[{{ item.details.1 }}/{{ item.details.2 }}]'
+        guestinfo.init.nodes.0.networks.ens192.roles: '[]'
+        guestinfo.init.nodes.0.networks.ens192.dhcp: False
+        guestinfo.init.nodes.0.networks.ens224.roles: '[]'
+        guestinfo.init.nodes.0.networks.ens224.dhcp: False
+    community.vmware.vmware_deploy_ovf:
+      hostname: "{{ vmhost_hostname }}"
+      username: "{{ vmhost_username }}"
+      password: "{{ vmhost_password }}"
+      folder: "{{ vmhost_folder }}"
+      datacenter: "{{ vmhost_datacenter }}"
+      datastore: "{{ vmhost_datastore }}"
+      cluster: "{{ vmhost_cluster }}"
+      resource_pool: "{{ vmhost_resource_pool }}"
+      validate_certs: no
+      name: "{{ item.name }}-anvil"
+      disk_provisioning: thin
+      networks:
+        "VM Network": "{{ vmhost_network_data }}"
+        "VM Network 2": "{{ vmhost_network_data }}"
+        "VM Network 3": "{{ vmhost_network_data }}"
+      ova: "{{ image }}"
+      allow_duplicates: no
+      power_on: no
+      inject_ovf_env: yes
+      properties: "{{ deploy_properties | combine({'guestinfo.init.node_index': '0'}) }}"
+    with_items:
+      - "{{ gfs_config }}"
+  - name: Resize Anvil
+    community.vmware.vmware_guest:
+      hostname: "{{ vmhost_hostname }}"
+      username: "{{ vmhost_username }}"
+      password: "{{ vmhost_password }}"
+      folder: "{{ vmhost_folder }}"
+      datacenter: "{{ vmhost_datacenter }}"
+      datastore: "{{ vmhost_datastore }}"
+      cluster: "{{ vmhost_cluster }}"
+      resource_pool: "{{ vmhost_resource_pool }}"
+      validate_certs: no
+      name: "{{ item.name }}-anvil"
+      disk:
+        - size_gb: "{{ anvil_boot }}"
+        - size_gb: "{{ anvil_metadata }}"
+      hardware:
+        num_cpus: "{{ anvil_cpu }}"
+        memory_mb: "{{ anvil_mem }}"
+    delegate_to: localhost
+    with_items:
+      - "{{ gfs_config }}"
+  - name: Start Anvil
+    community.vmware.vmware_guest:
+      hostname: "{{ vmhost_hostname }}"
+      username: "{{ vmhost_username }}"
+      password: "{{ vmhost_password }}"
+      folder: "{{ vmhost_folder }}"
+      datacenter: "{{ vmhost_datacenter }}"
+      datastore: "{{ vmhost_datastore }}"
+      cluster: "{{ vmhost_cluster }}"
+      resource_pool: "{{ vmhost_resource_pool }}"
+      validate_certs: no
+      name: "{{ item.name }}-anvil"
+      state: 'powered-on'
+      wait_for_customization: yes
+      wait_for_ip_address: yes
+    delegate_to: localhost
+    with_items:
+      - "{{ gfs_config }}"
+  - name: Create a DSX
+    vars:
+      deploy_properties:
+        guestinfo.init.cluster.domainname: '{{ domainname }}'
+        guestinfo.init.cluster.gateway.ipv4_default: '{{ default_gateway }}'
+        guestinfo.init.cluster.ntp_servers: '{{ ntp_servers }}'
+        guestinfo.init.cluster.dns_servers: '{{ dns_servers }}'
+        guestinfo.init.cluster.password: '{{ password }}'
+        guestinfo.init.cluster.metadata.ips: '[{{ item.details.1 }}/{{ item.details.2 }}]'
+        guestinfo.init.cluster.computer_name: '{{ item.details.0 }}'
+        guestinfo.init.nodes.2.hostname: "{{ item.name  }}-dsx"
+        guestinfo.init.nodes.2.add_volumes: True
+        guestinfo.init.nodes.2.features: '[portal, storage]'
+        guestinfo.init.nodes.2.networks.ens160.roles: '[data, mgmt]'
+        guestinfo.init.nodes.2.networks.ens160.dhcp: False
+        guestinfo.init.nodes.2.networks.ens160.ips: '[{{ item.details.3 }}/{{ item.details.2 }}]'
+        guestinfo.init.nodes.2.networks.ens192.roles: '[]'
+        guestinfo.init.nodes.2.networks.ens192.dhcp: False
+        guestinfo.init.nodes.2.networks.ens224.roles: '[]'
+        guestinfo.init.nodes.2.networks.ens224.dhcp: False
+
+    community.vmware.vmware_deploy_ovf:
+      hostname: "{{ vmhost_hostname }}"
+      username: "{{ vmhost_username }}"
+      password: "{{ vmhost_password }}"
+      folder: "{{ vmhost_folder }}"
+      datacenter: "{{ vmhost_datacenter }}"
+      datastore: "{{ vmhost_datastore }}"
+      cluster: "{{ vmhost_cluster }}"
+      resource_pool: "{{ vmhost_resource_pool }}"
+      validate_certs: no
+      name: "{{ item.name }}-dsx"
+      disk_provisioning: thin
+      networks:
+        "VM Network": "{{ vmhost_network_data }}"
+        "VM Network 2": "{{ vmhost_network_data }}"
+        "VM Network 3": "{{ vmhost_network_data }}"
+      ova: "{{ image }}"
+      allow_duplicates: no
+      power_on: no
+      inject_ovf_env: yes
+      properties: "{{ deploy_properties | combine({'guestinfo.init.node_index': '2'}) }}"
+    delegate_to: localhost
+    with_items:
+      - "{{ gfs_config }}"
+  - name: Resize DSX
+    community.vmware.vmware_guest:
+      hostname: "{{ vmhost_hostname }}"
+      username: "{{ vmhost_username }}"
+      password: "{{ vmhost_password }}"
+      folder: "{{ vmhost_folder }}"
+      datacenter: "{{ vmhost_datacenter }}"
+      datastore: "{{ vmhost_datastore }}"
+      cluster: "{{ vmhost_cluster }}"
+      resource_pool: "{{ vmhost_resource_pool }}"
+      validate_certs: no
+      name: "{{ item.name }}-dsx"
+      disk:
+        - size_gb: "{{ dsx_boot }}"
+        - size_gb: "{{ dsx_data }}"
+      hardware:
+        num_cpus: "{{ dsx_cpu }}"
+        memory_mb: "{{ dsx_mem }}"
+    delegate_to: localhost
+    with_items:
+      - "{{ gfs_config }}"
+  - name: Start DSX
+    community.vmware.vmware_guest:
+      hostname: "{{ vmhost_hostname }}"
+      username: "{{ vmhost_username }}"
+      password: "{{ vmhost_password }}"
+      folder: "{{ vmhost_folder }}"
+      datacenter: "{{ vmhost_datacenter }}"
+      datastore: "{{ vmhost_datastore }}"
+      cluster: "{{ vmhost_cluster }}"
+      resource_pool: "{{ vmhost_resource_pool }}"
+      validate_certs: no
+      name: "{{ item.name }}-dsx"
+      state: 'powered-on'
+      wait_for_customization: yes
+      wait_for_ip_address: yes
+    delegate_to: localhost
+    with_items:
+      - "{{ gfs_config }}"
+  - name: Wait on Anvil
+    community.vmware.vmware_guest_tools_wait:
+      hostname: "{{ vmhost_hostname }}"
+      username: "{{ vmhost_username }}"
+      password: "{{ vmhost_password }}"
+      folder: "{{ vmhost_folder }}"
+      name: "{{ item.name }}-anvil"
+      validate_certs: no
+    register: anvil
+    with_items:
+      - "{{ gfs_config }}"
+  - name: Wait on DSX
+    community.vmware.vmware_guest_tools_wait:
+      hostname: "{{ vmhost_hostname }}"
+      username: "{{ vmhost_username }}"
+      password: "{{ vmhost_password }}"
+      folder: "{{ vmhost_folder }}"
+      name: "{{ item.name }}-dsx"
+      validate_certs: no
+    register: dsx
+    with_items:
+      - "{{ gfs_config }}"
+  - name: Query Anvil to check for API readiness
+    uri:
+      url: "https://{{ item.details.1 }}:8443/mgmt/v1.2/rest/sites/local"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: _result
+    until: _result.status == 200
+    retries: 50 # 120 * 10 seconds = 20 minutes
+    delay: 10 # Every 10 seconds
+    with_items:
+      - "{{ gfs_config }}"
+
+  - name: Identify Anvil Source Site
+    when: item.details.5 == true
+    ansible.builtin.set_fact:
+      anvil_source_ip: "{{ item.details.1 }}"
+    with_items:
+      - "{{ gfs_config }}"
+
+  - name: Create schedules
+    include_tasks: gfs-schedules.yml
+    with_items:
+      - "{{ gfs_config }}"
+    loop_control:
+      loop_var: outer_item
+
+  - name: Create an objective
+    include_tasks: gfs-objectives.yml
+    with_items:
+      - "{{ gfs_config }}"
+    loop_control:
+      loop_var: outer_item
+
+  - name: Add an Cloud/Object Storage System
+    include_tasks: gfs-object-system-add.yml
+    with_items:
+      - "{{ gfs_config }}"
+
+  - name: Add a shared Object Storage volume
+    uri:
+      url: "https://{{ item.details.1 }}:8443/mgmt/v1.2/rest/object-storage-volumes"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ cloudvolname }}","objectStoreLogicalVolume":{"_type":"OBJECT_STORE_LOGICAL_VOLUME","name":"{{ cloudbucket }}","node":{"_type":"NODE","name":"{{ cloudname }}"}},"_type":"OBJECT_STORAGE_VOLUME","node":{"_type":"NODE","name":"{{ cloudname }}"},"shared":true}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 120
+    with_items:
+      - "{{ gfs_config }}"
+
+  - name: Add a share on the first site
+    when:  item.details.5 == true
+    include_tasks: gfs-share-create.yml
+    with_items:
+      - "{{ gfs_config }}"
+
+  - name: Add share participants (sites) to the share
+    when:  item.details.5 == false
+    uri:
+      url: "https://{{ anvil_source_ip }}:8443/mgmt/v1.2/rest/share-replications"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ share_name }}", "shareIdentifier":"{{ share_name }}","remoteSiteMgmtAddress":"{{ item.details.1 }}", "username":"{{ hsuser }}","password":"{{ password }}","interval":"{{ item.details.4 }}"}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 60
+    with_items:
+      - "{{ gfs_config }}"
+
+  - name: Add an ICAP server
+    uri:
+      url: "https://{{ item.details.1 }}:8443/mgmt/v1.2/rest/antivirus"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"_type":"ANTIVIRUS","node":{"_type":"NODE","name": "{{ avname }}","nodeType": "{{ avvendor }}","endpoint": "{{ avendpoint }}" }}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 180
+    with_items:
+      - "{{ gfs_config }}"
+
+  - name: Add and activate a license
+    uri:
+      url: "https://{{ item.details.1 }}:8443/mgmt/v1.2/rest/licenses"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"activationId":"{{ activationid }}"}'
+      force_basic_auth: yes
+      status_code: 202
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ gfs_config }}"
+
+  - name: Create snapshot retention schedules
+    include_tasks: gfs-snapshot-retention.yml
+    with_items:
+      - "{{ gfs_config }}"
+    loop_control:
+      loop_var: outer_item
+# Create share snapshot schedule
+# Snapshots are global - only needs to run on 1 site, picking the core site
+  - name: Create take snapshot schedules
+    include_tasks: gfs-take-snapshot-schedules.yml
+    with_items:
+      - "{{ gfs_config }}"
+    loop_control:
+      loop_var: outer_item
+
+  - name: Join Active Directory on each site
+    include_tasks: gfs-ad.yml
+    with_items:
+      - "{{ gfs_config }}"

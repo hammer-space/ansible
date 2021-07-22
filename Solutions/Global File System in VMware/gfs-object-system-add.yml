@@ -1,0 +1,32 @@
+#
+# Adds Object Storage / Cloud Storage System
+#
+- block:
+  - name: Add an Cloud/Object Storage System
+    uri:
+      url: "https://{{ item.details.1 }}:8443/mgmt/v1.2/rest/nodes"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"nodeType": "{{ cloudvendor }}","mgmtNodeCredentials": {"username": "{{ cloudaccesskey }}", "password": "{{ cloudsecretkey }}"},"name": "{{ cloudname }}","_type":"NODE","mgmtIpAddress": {"address": ""},"trustCertificate": "false","useVirtualHostNaming": "false"}'
+      force_basic_auth: yes
+      status_code: 202
+      body_format: json
+      validate_certs: no
+      timeout: 60
+    register: add_osv
+  - name: Check status of Cloud/Object Storage System add
+    uri:
+      url: "{{ add_osv.location }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: _result
+    until: _result.json.status == "COMPLETED"
+    retries: 50
+    delay: 5
