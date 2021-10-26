@@ -1,0 +1,51 @@
+# This playbook creates and updates schedules. Schedules can be used to schedule snapshots, system tasks.
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    #''[
+    schedules:
+      { "name": "monthly", "cronExpression": "01 01 1 * *" }
+  tasks:
+  - name: Create snapshot retention schedules
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ schedules.name }}","cronExpression":"{{ schedules.cronExpression }}"}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: schedule_status
+    failed_when:
+      - schedule_status.status == 500
+# The next two tasks are only executed when the retention schedule already exists
+  - name: Update snapshot retention - Get current information
+    when: schedule_status.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules/{{ schedules.name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: snapshot_get
+  - name: Update current snapshot retention
+    when: schedule_status.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules/{{ snapshot_get.json.uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: "{{ snapshot_get.json | combine(schedules) }}"
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
