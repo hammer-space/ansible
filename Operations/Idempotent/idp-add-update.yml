@@ -1,0 +1,53 @@
+# This playbook adds an identity provider for authenticating management users
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    idp:
+      name: "My AD Provider"
+      domain: '<AD DOMAIN>'
+      servers: '<AD DOMAIN SERVERS' # Comma separated
+      type: "AD"  # Only AD is currently supported
+  tasks:
+  - name: Add identity provider
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/idp"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{{ idp }}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: __results
+    failed_when:
+      - __results.status == 500
+## The next two tasks are only executed when the retention already exists
+  - name: Get current identity provider
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/idp/{{ idp.name | urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: update_get
+  - name: Update current identity provider
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/idp/{{ update_get.json.uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: '{{ update_get.json|combine(idp)}}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
