@@ -18,14 +18,14 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    register: syslog
+    register: __results
   - name: Add syslog
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/syslog/{{ syslog.json[0].uoid.uuid }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/syslog/{{ __results.json[0].uoid.uuid }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: PUT
-      body: "{{ syslog.json[0] | combine(params) }}"
+      body: "{{ __results.json[0] | combine(params) }}"
       force_basic_auth: yes
       status_code: 200
       body_format: json

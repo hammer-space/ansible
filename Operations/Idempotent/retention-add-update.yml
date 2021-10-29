@@ -3,7 +3,7 @@
 - hosts: localhost
   gather_facts: False
   vars_files:
-    schedules:
+    retention:
       {"name":"1_day","retentionTime":"86400000","numOfCopies":null}
 
   tasks:
@@ -13,19 +13,19 @@
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: POST
-      body: '{{schedules}}'
+      body: '{{ retention }}'
       force_basic_auth: yes
       status_code: 200
       body_format: json
       validate_certs: no
-    register: schedule_status
+    register: __results
     failed_when:
-      - schedule_status.status == 500
+      - __results.status == 500
 ## The next two tasks are only executed when the retention already exists
-  - name: Update retention - Get current information
-    when: schedule_status.status == 400
+  - name: Get current retention
+    when: __results.status == 400
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/snapshot-retentions/{{ schedules.name | urlencode }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/snapshot-retentions/{{ retention.name | urlencode }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: GET
@@ -36,13 +36,13 @@
       validate_certs: no
     register: update_get
   - name: Update current retention
-    when: schedule_status.status == 400
+    when: __results.status == 400
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/snapshot-retentions/{{ update_get.json.uoid.uuid }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: PUT
-      body: '{{ update_get.json|combine(schedules)}}'
+      body: '{{ update_get.json|combine(retention)}}'
       force_basic_auth: yes
       status_code: 200
       body_format: json

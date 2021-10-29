@@ -5,7 +5,6 @@
   vars_files:
   - Configs/anvil.yml
   vars:
-    #''[
     schedules:
       { "name": "monthly", "cronExpression": "01 01 1 * *" }
   tasks:
@@ -20,12 +19,12 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    register: schedule_status
+    register: __results
     failed_when:
-      - schedule_status.status == 500
+      - __results.status == 500
 # The next two tasks are only executed when the retention schedule already exists
   - name: Update snapshot retention - Get current information
-    when: schedule_status.status == 400
+    when: __results.status == 400
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules/{{ schedules.name|urlencode }}"
       user: "{{ hsuser }}"
@@ -38,7 +37,7 @@
       validate_certs: no
     register: snapshot_get
   - name: Update current snapshot retention
-    when: schedule_status.status == 400
+    when: __results.status == 400
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules/{{ snapshot_get.json.uoid.uuid }}"
       user: "{{ hsuser }}"

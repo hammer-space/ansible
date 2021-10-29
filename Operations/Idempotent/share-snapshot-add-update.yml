@@ -21,12 +21,12 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    register: schedule_status
+    register: __results
     failed_when:
-      - schedule_status.status == 500
+      - __results.status == 500
 # The next two tasks are only executed when the retention schedule already exists which means it effectively updates the retention time.
   - name: Update schedule - Get current information
-    when: schedule_status.status == 400
+    when: __results.status == 400
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/share-snapshots?spec=schedule.name%3Deq%3D{{share_snapshots.schedule.name|urlencode }}&spec=share.name%3Deq%3D{{ share_snapshots.share.name|urlencode }}"
       user: "{{ hsuser }}"
@@ -39,7 +39,7 @@
       validate_certs: no
     register: update_get
   - name: Update current snapshot schedule
-    when: schedule_status.status == 400
+    when: __results.status == 400
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/share-snapshots/{{ share_snapshots.share.name|urlencode }}"
       user: "{{ hsuser }}"

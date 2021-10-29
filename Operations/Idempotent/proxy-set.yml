@@ -1,0 +1,20 @@
+# This playbook configures system proxy for support and heartbeat traffic
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    proxyUrl: "<http://IP:PORT>"
+  tasks:
+  - name: Configure proxy
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/cntl/set-proxy?proxyUri={{ proxyUrl }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
