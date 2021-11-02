@@ -7,7 +7,7 @@
   vars:
     # Recommended to use daily system backup schedule
     backup:
-      { "backupStorageVolume":{"ipAddress":{"address":"<OTHER NFS SERVER IP>","prefixLength":"<CIDR>"},"exportPath":"<DESTINATION BACKUP DIRECTORY>"},"_type":"BACKUP","schedule":{"uoid":null,"name":"daily"}}
+      { "backupStorageVolume":{"ipAddress":{"address":"<NFS SERVER IP>","prefixLength":"<CIDR>"},"exportPath":"<DESTINATION BACKUP DIRECTORY>"},"_type":"BACKUP","schedule":{"uoid":null,"name":"daily"}}
 
   tasks:
   - name: Configure System Backup

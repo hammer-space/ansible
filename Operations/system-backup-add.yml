@@ -5,25 +5,56 @@
   vars_files:
   - Configs/anvil.yml
   vars:
-    backup_path: "<DESTINATION BACKUP DIRECTORY>"
-    backup_ip: "<OTHER NFS SERVER IP>"
-    backup_schedule: "daily"  # Daily is recommended however any schedule can be used
+    backup:
+      backupStorageVolume:
+        ipAddress:
+          address: "<NFS SERVER IP>"
+          prefixLength: "<CIDR>"
+        exportPath: "<EXPORT PATH>"
+      _type: "BACKUP"
+      schedule:
+        uoid: null
+        name: "<SCHEDULE NAME>"
 
   tasks:
   - name: Configure System Backup
-    block:
-      - name: Configure System Backup
-        uri:
-          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup"
-          user: "{{ hsuser }}"
-          password: "{{ password }}"
-          method: POST
-          body:
-            _type: "BACKUP"
-            backupStorageVolume: {"ipAddress":{"address":"{{ backup_ip }}","prefixLength":32},"exportPath":"{{ backup_path }}"}
-            schedule: {"name":"{{ backup_schedule }}"}
-          force_basic_auth: yes
-          status_code: 200
-          body_format: json
-          validate_certs: no
-          timeout: 60
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body:  '{{ backup }}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 60
+    register: __results
+    failed_when:
+      - __results.status == 500
+# The next two tasks are only executed when the system backup needs to be updated
+  - name: Update System Backup - Get current information
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: update_get
+  - name: Update current System Backup configuration
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup/{{ update_get.json[0].uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: "{{ update_get.json | combine(backup,recursive=True) }}"
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
