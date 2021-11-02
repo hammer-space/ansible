@@ -5,9 +5,13 @@
   vars_files:
   - Configs/anvil.yml
   vars:
-    params: {"backup_path": "/bak", "backup_ip": "10.200.79.8", "backup_schedule": "weekly"}
+    backup:
+      backup_path: "/bak"
+      backup_ip: "10.200.79.8"
+      backup_schedule: "weekly"
+
   tasks:
-  - name: Get System Backup
+  - name: Get System Backup configuration
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup"
       user: "{{ hsuser }}"
@@ -18,18 +22,18 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    register: system_backup
-  - name: Remove System Backup
+    register: __results
+  - name: Remove System Backup configuration
 # Fail when there is no system backup configured
   - fail: msg="No existing backup configured"
-    when: system_backup.json[0] is not defined
+    when: __results.json[0] is not defined
   - name: Remove System Backup
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup/{{ system_backup.json[0].uoid.uuid }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/backup/{{ __results.json[0].uoid.uuid }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: DELETE
-      body: "{{ system_backup.json[0] | combine(params) }}"
+      body: "{{ __results.json[0] | combine(backup) }}"
       force_basic_auth: yes
       status_code: 200
       body_format: json
