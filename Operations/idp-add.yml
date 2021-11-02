@@ -17,11 +17,7 @@
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: POST
-      body:
-        name: "{{ idp.name }}"
-        domain: "{{ idp.domain }}"
-        servers: "{{ idp.servers }}"
-        type: "{{ idp.type }}"
+      body: '{{ idp }}'
       force_basic_auth: yes
       status_code: 200
       body_format: json

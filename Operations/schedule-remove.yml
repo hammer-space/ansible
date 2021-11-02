@@ -14,7 +14,7 @@
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: DELETE
-      body: '{}' #{"name":"{{ item.name }}","cronExpression":"{{ item.details.0 }}"}'
+      body: '{}'
       force_basic_auth: yes
       status_code: 200
       body_format: json

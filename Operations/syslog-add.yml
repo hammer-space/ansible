@@ -6,8 +6,21 @@
   - Configs/anvil.yml
   vars:
     params: { "enabled": true,"syslogServers":[{"server":{"address":"<IP>","prefixLength": 0},"port":514,"transport":"<UDP or TCP>"}]}
+  vars:
+    syslog:
+      enabled: true
+      syslogServers:
+        - server:
+            address: "<SYSLOG SERVER IP ADDRESS>"
+            prefixLength: 0 # CIDR or 0 for auto
+          port: 514
+          transport: "<TCP or UDP>"
+          messageTypes:
+            - EVENT # system events
+#            - FILESYSTEM # audit events
+
   tasks:
-  - name: Get syslog
+  - name: Get syslog configuration
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/syslog"
       user: "{{ hsuser }}"
@@ -18,17 +31,16 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    register: syslog
+    register: __results
   - name: Add syslog
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/syslog/{{ syslog.json[0].uoid.uuid }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/syslog/{{ __results.json[0].uoid.uuid }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: PUT
-      body: "{{ syslog.json[0] | combine(params) }}"
+      body: "{{ __results.json[0] | combine(syslog) }}"
       force_basic_auth: yes
       status_code: 200
       body_format: json
       validate_certs: no
-      timeout: 120
-# Need to add enable syslog
+      timeout: 60
