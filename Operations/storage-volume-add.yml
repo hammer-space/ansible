@@ -1,0 +1,72 @@
+# This playbook adds a storage volume
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    volume:
+      name: "<Friendly volume name>"
+      logicalVolume:
+        name: "<Logical volume name, typically the export path>"
+        _type: "LOGICAL_VOLUME"
+      node:
+        name: "<Storage System name>"
+        _type: "NODE"
+      _type: "STORAGE_VOLUME"
+      accessType: "READ_WRITE" # READ_WRITE for full management of the volume. READ_ONLY for referencing data on the volume
+
+  tasks:
+  - name: Adding a storage volume
+    block:
+# Check that the storage system exists
+      - name: Check for valid storage system
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes/{{ volume.node.name|urlencode }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: GET
+          body: ''
+          force_basic_auth: yes
+          status_code: 200
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: __node_results
+        failed_when:
+          - __node_results.status == 500
+      - fail: msg="Storage System not found"
+        when: __node_results.status == 404
+# Add a storage volume
+      - name: Add the storage volume
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/storage-volumes?force=true"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body: '{{ volume }}'
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 180
+        register: __results
+        failed_when:
+          - __results.status == 500
+# Wait for completion
+      - name: Check status of add storage volume
+        when: __results.status == 202
+        uri:
+          url: "{{ __results.location }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: GET
+          body: '{}'
+          force_basic_auth: yes
+          status_code: 200
+          body_format: json
+          validate_certs: no
+        register: _result
+        until: _result.json.status == "COMPLETED"
+        retries: 10
+        delay: 5
