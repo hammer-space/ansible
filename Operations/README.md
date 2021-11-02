@@ -26,7 +26,7 @@ Each playbook contains a variable section with the relevant variables to the API
 - Retention ( [add](retention-add.yml) / [remove](retention-delete.yml) ) - Add and remove retention schedules
 - Schedule ( [add](schedule-add.yml) / [remove](schedule-remove.yml) ) - Add and remove schedules
 - Share ( [create](share-create.yml) / [delete](share-delete.yml)) - Create and delete shares
-- Share snapshot ( [add](share-snapshot-add.yml) / [remove](share-snapshot-remove.yml) ) - Configure share snapshot schedules
+- Share snapshot ( [add](share-snapshot-schedule-add.yml) / [remove](share-snapshot-schedule-remove.yml) ) - Configure share snapshot schedules
 - Storage system ( [add](storage-system-add.yml) / [remove](storage-system-remove.yml) ) - Add and remove storage systems (nodes)
 - Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) ) - Add and remove syslog servers
 - System backup ( [add](system-backup-add.yml) / [remove](system-backup-remove.yml) ) - Add and remove system and metadata backups

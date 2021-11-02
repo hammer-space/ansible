@@ -6,12 +6,12 @@
   - Configs/anvil.yml
   vars:
     volume:
-      name: "<Friendly volume name>"
+      name: "<FRIENDLY VOLUME NAME>"
       logicalVolume:
-        name: "<Logical volume name, typically the export path>"
+        name: "<LOGICAL VOLUME NAME, typically the export path>"
         _type: "LOGICAL_VOLUME"
       node:
-        name: "<Storage System name>"
+        name: "<STORAGE SYSTEM NAME>"
         _type: "NODE"
       _type: "STORAGE_VOLUME"
       accessType: "READ_WRITE" # READ_WRITE for full management of the volume. READ_ONLY for referencing data on the volume

@@ -19,14 +19,14 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    register: site
+    register: __results
   - name: Update the site name
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/sites/{{ site.json.uoid.uuid }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/sites/{{ __results.json.uoid.uuid }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: PUT
-      body: "{{ site.json|combine(siteinfo) }}"
+      body: "{{ __results.json|combine(siteinfo) }}"
       force_basic_auth: yes
       status_code: 200
       body_format: json

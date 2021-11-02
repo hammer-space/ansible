@@ -3,29 +3,49 @@
 - hosts: localhost
   gather_facts: False
   vars_files:
-  - Configs/anvil.yml
-  vars:
-    schedules: '[
-      { "name": "1_day", "details": [ "86400000", "null" ]},
-      { "name": "1_week","details": [ "604800000", "null" ]},
-      { "name": "1_month","details": [ "2678400000", "null" ]},
-      { "name": "1_year","details": [ "31536000000", "null" ]},
-      { "name": "7_years","details": [ "220752000000", "null" ]},
-      { "name": "3_copies","details": [ "null", "3" ]},
-      { "name": "7_copies","details": [ "null", "7" ]},
-      { "name": "30_copies","details": [ "null", "30" ]}
-    ]'
+    retention:
+      name: "1_day"
+      retentionTime: "86400000"
+      numOfCopies: null
+
   tasks:
-  - name: Create snapshot retention schedules
+  - name: Create snapshot retention schedule
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/snapshot-retentions"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: POST
-      body: '{"name":"{{ item.name }}","retentionTime":"{{ item.details.0 }}","numOfCopies":"{{ item.details.1 }}"}'
+      body: '{{ retention }}'
       force_basic_auth: yes
       status_code: 200
       body_format: json
       validate_certs: no
-    with_items:
-      - "{{ schedules }}"
+    register: __results
+    failed_when:
+      - __results.status == 500
+## The next two tasks are only executed when the retention already exists
+  - name: Get current retention
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/snapshot-retentions/{{ retention.name | urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: update_get
+  - name: Update current retention
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/snapshot-retentions/{{ update_get.json.uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: '{{ update_get.json|combine(retention)}}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no

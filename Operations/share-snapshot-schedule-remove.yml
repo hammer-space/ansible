@@ -1,0 +1,41 @@
+# This playbook removes a snapshot schedule from a share
+# It does not remove any snapshots that are taken by that schedule
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    share_snapshot:
+      schedule:
+        name: "<SCHEDULE NAME>"
+      share:
+        name: "<SHARE NAME>"
+
+  tasks:
+  - name: Get snapshot schedule configuration
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/share-snapshots?spec=schedule.name%3Deq%3D{{ share_snapshot.schedule.name|urlencode }}&spec=share.name%3Deq%3D{{ share_snapshot.share.name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: ''
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: __results
+# Fail when there is no scheduled configured
+  - fail: msg="No share snapshot schedule configured."
+    when: __results.json[0] is not defined
+  - name: Remove a snapshot schedule for a share
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/share-snapshots/{{ __results.json[0].uoid.uuid }}?clear-snapshots=false"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: ''
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no

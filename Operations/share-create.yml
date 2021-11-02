@@ -10,15 +10,16 @@
   vars_files:
   - Configs/anvil.yml
   vars:
-    shares:
+    share:
       name: "<SMB SHARE NAME>"
       path: "</ENTER PATH>"
       exportOptions:
       - subnet: "*"
         accessPermissions: "RW"
         rootSquash: false
-      sizelimit: '0'   # Dynamic size limit based on available capacity
-      size_warning_threshold: '90'
+      shareSizeLimit: '0' # Dynamic size limit based on available capacity
+      warnUtilizationPercentThreshold: '90'
+
   tasks:
   - name: Create a share
     uri:
@@ -26,20 +27,18 @@
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: POST
-      body:
-        name: "{{ shares.name }}"
-        path: "{{ shares.path }}"
-        exportOptions: "{{ shares.exportOptions }}"
-        shareSizeLimit: "{{ shares.sizelimit }}"
-        warnUtilizationPercentThreshold: "{{ shares.size_warning_threshold }}"
+      body: '{{ share }}'
       force_basic_auth: yes
       status_code: 202
       body_format: json
       validate_certs: no
-    register: share_create
+    register: __results
+    failed_when:
+      - __results.status == 500
   - name: Check status of share create
+    when: __results.status == 202
     uri:
-      url: "{{ share_create.location }}"
+      url: "{{ __results.location }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: GET
@@ -52,3 +51,46 @@
     until: _result.json.status == "COMPLETED"
     retries: 30
     delay: 2
+# This part is executed if the share already exists
+  - name: Get current share
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/shares/{{ share.name | urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: update_get
+  - name: Update current share
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/shares/{{ update_get.json.uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: '{{ update_get.json|combine(share,recursive=True)}}'
+      force_basic_auth: yes
+      status_code: 202
+      body_format: json
+      validate_certs: no
+    register: __moreresults
+  - name: Check status of share update
+    when:  __results.status == 400
+    uri:
+      url: "{{ __moreresults.location }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: _result
+    until: _result.json.status == "COMPLETED"
+    retries: 20
+    delay: 5

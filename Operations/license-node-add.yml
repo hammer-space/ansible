@@ -21,3 +21,9 @@
       status_code: 202
       body_format: json
       validate_certs: no
+    failed_when:
+      - __results.status == 500
+  - name: Check if license is installed
+    when: __results.status == 400
+    debug:
+      msg: "License is already installed."

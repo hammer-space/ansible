@@ -1,4 +1,4 @@
-# This playbook adds a set of snapshot schedules to one or more share_snapshots
+# This playbook adds or updates a snapshot schedule for a share
 # Note that the schedules must exist before trying to apply them
 ---
 - hosts: localhost
@@ -7,7 +7,13 @@
   - Configs/anvil.yml
   vars:
     share_snapshots:
-      {"schedule":{"name":"daily"},"share":{"name":"Devwork"},"retention":{"name":"7_years","uoid":null}}
+      schedule:
+        name: "<SCHEDULE NAME>"
+      share:
+        name: "<SHARE NAME>"
+      retention:
+        name: "<RETENTION NAME>"
+        uoid: null
 
   tasks:
   - name: Add snapshot schedule to share
