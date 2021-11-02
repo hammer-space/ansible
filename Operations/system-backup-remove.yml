@@ -6,9 +6,9 @@
   - Configs/anvil.yml
   vars:
     backup:
-      backup_path: "/bak"
-      backup_ip: "10.200.79.8"
-      backup_schedule: "weekly"
+      backup_path: "<EXPORT PATH>"
+      backup_ip: "<NFS SERVER IP>"
+      backup_schedule: "<SCHEDULE>"
 
   tasks:
   - name: Get System Backup configuration
