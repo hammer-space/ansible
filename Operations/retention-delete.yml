@@ -1,24 +1,17 @@
-# This playbook removes retention rules
+# This playbook removes a retention schedule
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
   - Configs/anvil.yml
   vars:
-    schedules: '[
-      { "name": "1_day", "details": [ "86400000", "null" ]},
-      { "name": "1_week","details": [ "604800000", "null" ]},
-      { "name": "1_month","details": [ "2678400000", "null" ]},
-      { "name": "1_year","details": [ "31536000000", "null" ]},
-      { "name": "7_years","details": [ "220752000000", "null" ]},
-      { "name": "3_copies","details": [ "null", "3" ]},
-      { "name": "7_copies","details": [ "null", "7" ]},
-      { "name": "30_copies","details": [ "null", "30" ]}
-    ]'
+    schedule:
+      name: "<RETENTION SCHEDULE NAME>
+
   tasks:
   - name: Delete snapshot retention schedules
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/snapshot-retentions/{{ item.name|urlencode }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/snapshot-retentions/{{ schedule.name|urlencode }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: DELETE
@@ -27,5 +20,3 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    with_items:
-      - "{{ schedules }}"

@@ -5,8 +5,11 @@
   vars_files:
     retention:
       name: "1_day"
-      retentionTime: "86400000"
+      retentionTime: "86400000"  # Milliseconds. See loop examples for more details
       numOfCopies: null
+#      name: "30 copies"
+#      retentionTime: null
+#      numOfCopies: "30" # Number of copies to retain
 
   tasks:
   - name: Create snapshot retention schedule
