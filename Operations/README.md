@@ -21,7 +21,7 @@ Each playbook contains a variable section with the relevant variables to the API
 - Local site ( [update](local-site-update.yml)) - Update the site name
 - Objective ( [add](objective-add.yml) / [set](objective-set.yml) ) - Add and set objectives
 - Object/Cloud Storage system ( [add](object-storage-system-add.yml) / [remove](object-storage-system-remove.yml) ) - Add and remove Object/Cloud storage systems (nodes)
-- Object/Cloud Volume ( [add](object-storage-volume-add.yml) / [decommission](object-storage-volume-decommission.yml) /  [delete](object-storage-volume-delete.yml)) - Add and delete object storage volumes
+- Object/Cloud Volume ( [add](object-storage-volume-add.yml) / [decommission](object-storage-volume-decommission.yml) /  [delete](object-storage-volume-delete.yml)) - Add, decommission and delete object storage volumes
 - Proxy ( [set](proxy-set.yml) / [clear](proxy-clear.yml)) - Set and clear system proxy
 - Retention ( [add](retention-add.yml) / [remove](retention-delete.yml) ) - Add and remove retention schedules
 - Schedule ( [add](schedule-add.yml) / [remove](schedule-remove.yml) ) - Add and remove schedules
@@ -30,4 +30,4 @@ Each playbook contains a variable section with the relevant variables to the API
 - Storage system ( [add](storage-system-add.yml) / [remove](storage-system-remove.yml) ) - Add and remove storage systems (nodes)
 - Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) ) - Add and remove syslog servers
 - System backup ( [add](system-backup-add.yml) / [remove](system-backup-remove.yml) ) - Add and remove system and metadata backups
-- Volume add ( [add](storage-volume-add.yml) ) - Add storage volume
+- Volume add ( [add](storage-volume-add.yml) / [decommission](storage-volume-decommission.yml) /  [delete](storage-volume-delete.yml)) - Add, decommission and delete storage volumes

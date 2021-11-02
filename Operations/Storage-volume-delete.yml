@@ -1,0 +1,23 @@
+# This playbook deletes a storage volume. Note that the volume must be either decommissioned first or not in use.
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    volume:
+      name: "<VOLUME NAME>""
+      _type: "STORAGE_VOLUME"
+
+  tasks:
+  - name: Delete storage volume
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/storage-volumes/{{ volume.name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no

@@ -1,0 +1,42 @@
+# This playbook decommissions a storage volume
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    volume:
+      name: "<VOLUME NAME>"
+      _type: "STORAGE_VOLUME"
+      storageVolumeState: "DECOMMISSIONING"
+
+  tasks:
+  - name: Get storage volume details
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/storage-volumes/{{ volume.name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: __results
+    failed_when:
+      - __results.status == 500
+  - fail: msg="Storage volume not found."
+    when: __results.status == 404
+# Decommissioning can take a long time, recommended to monitor the task in another playbook if needed.
+  - name: Start decommissioning
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/storage-volumes/{{ __results.json.uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: "{{ __results.json | combine(volume) }}"
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+      timeout: 60
