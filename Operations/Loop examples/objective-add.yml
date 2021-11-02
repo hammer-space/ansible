@@ -1,0 +1,35 @@
+# This playbook adds a set of useful objectives
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    objectives: '[
+      {"name":"Recently used with local copy","details":["Keep most recently used files with a local copy","IF LAST_USE_AGE<1HOUR THEN {SLO(\\\"keep-online\\\")}"]},
+      {"name":"Tag for local copy","details":["Files with keyword local have a local copy","IF HAS_KEYWORD(\\\"local\\\") THEN {SLO(\\\"keep-online\\\")}"]},
+      {"name":"Virus scanning - 2 MB max file size","details":["This objective will align files less than 2 MB in size to configured ICAP servers and prevent data access until scanned.","IF VOLUME_GROUPS[|NAME=\\\"Virus-Scanners\\\"].NUMBER_UP AND DATA_ORIGIN_LOCAL AND (IS_BEING_CREATED OR ATTRIBUTES.VIRUS_SCAN==VIRUS_SCAN_STATE(\\\"unscanned\\\") AND SIZE<2*MBYTES AND IS_ONLINE) THEN {SLO(\\\"place-on-Virus-Scanners\\\"),SLO(\\\"block-open\\\")} ELSE IF ATTRIBUTES.VIRUS_SCAN==VIRUS_SCAN_STATE(\\\"threat\\\") THEN {SLO(\\\"place-on-Virus-Scanners\\\"),SLO(\\\"deny-open\\\")} ELSE {SLO(\\\"place-on-Virus-Scanners\\\")}"]},
+      {"name":"Virus scanning with skip list","details":["This objective will align files to configured ICAP servers and prevent data access until scanned. It will skip files with tag skip_virus_scan.","IF GET_TAG(\\\"skip_virus_scan\\\") THEN {} ELSE IF VOLUME_GROUPS[|NAME=\\\"Virus-Scanners\\\"].NUMBER_UP AND DATA_ORIGIN_LOCAL AND (IS_BEING_CREATED OR ATTRIBUTES.VIRUS_SCAN==VIRUS_SCAN_STATE(\\\"unscanned\\\") AND IS_ONLINE) THEN {SLO(\\\"place-on-Virus-Scanners\\\"),SLO(\\\"block-open\\\")} ELSE IF ATTRIBUTES.VIRUS_SCAN==VIRUS_SCAN_STATE(\\\"threat\\\") THEN {SLO(\\\"place-on-Virus-Scanners\\\"),SLO(\\\"deny-open\\\")} ELSE {SLO(\\\"place-on-Virus-Scanners\\\")}"]},
+      {"name":"Archive files with keyword archive","details":["Archive files with keyword archive","IF HAS_KEYWORD(\\\"archive\\\") THEN {SLO(\\\"place-on-object-volumes\\\")}"]},
+      {"name":"Archive Directory","details":["Archive files in any directory named archive to object/cloud after 5 minutes of inactivity.","IF FNMATCH(\\\"*/archive/*\\\",PATH) THEN {SLO(\\\"place-on-shared-object-volumes\\\")}"]},
+      {"name":"Place most recent snapshot local and in cloud","details":["Keep the most recent snapshot local and in cloud","IF VERSION==2 THEN {SLO(\\\"keep-online\\\"),SLO(\\\"place-on-object-volumes\\\")}"]},
+      {"name":"Undelete files to cloud","details":["Store undelete files in cloud","IF IS_UNDELETE THEN {SLO(\\\"place-on-shared-object-volumes\\\")}"]},
+      {"name":"WORM operations","details":["Enforces WORM if a file has expiration attribute set","IF ( attributes.worm_expire_date>now or attributes.legal_hold_expire_date>now ) THEN { SLO(\\\"deny-delete\\\"), SLO(\\\"deny-write\\\")}"]},
+      {"name":"Keep most recently used local with tier to cloud","details":["Keeps files used within the last hour on local NAS and after a week, tier them to cloud","IF LAST_USE_AGE<1*HOUR THEN {SLO(\\\"keep-online\\\")} ELSE IF LAST_USE_AGE>7DAYS THEN {SLO(\\\"place-on-shared-object-volumes\\\")}"]} ]'
+#      {"name":"NAME","details":["DESC","EXPR"]},
+#      {"name":"NAME","details":["DESC","EXPR")} ]'
+
+  tasks:
+  - name: Create an objective
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/objectives"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ item.name }}","comment":"{{ item.details.0 }}","expression":"{{ item.details.1 }}","basic":false,"extendedInfo":{"isAdvanced":"true"}}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ objectives }}"

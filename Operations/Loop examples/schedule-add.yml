@@ -1,0 +1,23 @@
+# This playbook adds additional schedules that can be used to schedule snapshots, system tasks.
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    schedules: '[
+      { "name": "monthly", "details": [ "01 00 1 * *" ]} ]'
+  tasks:
+  - name: Create schedule
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"name":"{{ item.name }}","cronExpression":"{{ item.details.0 }}"}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ schedules }}"

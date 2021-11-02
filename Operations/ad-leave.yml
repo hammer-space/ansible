@@ -5,9 +5,14 @@
   vars_files:
   - Configs/anvil.yml
   vars:
-    params: {'domain': "{{ addomain }}", 'username': "{{ aduser }}", 'joined': false}
+    params:
+      domain: "{{ <ENTER YOUR DOMAIN HERE> }}"
+      username: "{{ <DOMAIN USER> }}"
+      password: "{{ <DOMAIN USER PASSWORD> }}"
+      joined: false
+
   tasks:
-  - name: Get AD
+  - name: Get Active Directory configuration
     uri:
       url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/ad"
       user: "{{ hsuser }}"
@@ -18,15 +23,15 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    register: ad
-  - name: Leave AD
-    when: ad.json[0].joined == true
+    register: __results
+  - name: Leave Active Directory
+    when: __results.json[0].joined == true
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/ad/{{ ad.json[0].uoid.uuid }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/ad/{{ __results.json[0].uoid.uuid }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: PUT
-      body: "{{ ad.json[0] | combine(params) }}"
+      body: "{{ __results.json[0] | combine(params) }}"
       force_basic_auth: yes
       status_code: 200
       body_format: json

@@ -1,17 +1,22 @@
-# This playbook removed ICAP servers
+# This playbook removes an ICAP server
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
   - Configs/anvil.yml
   vars:
-    av_servers: '[
-      { "name": "<FRIENDLY NODE NAME, i.e. av1>","details":["icap://<ICAP SERVER IP>:1344","MCAFEE_AV"]}
-    ]'
+    av_server:
+      _type: "ANTIVIRUS"
+      node:
+        _type: "NODE"
+        name: "<FRIENDLY NODE NAME, i.e. av1>"
+        nodeType: "MCAFEE_AVE"
+        endpoint: "icap://<ICAP SERVER IP:PORT"
+
   tasks:
-  - name: Remove Antivirus (ICAP) servers
+  - name: Remove Antivirus (ICAP) server
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/antivirus/{{ item.name|urlencode }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/antivirus/{{ av_server.node.name|urlencode }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: DELETE
@@ -20,5 +25,3 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    with_items:
-      - "{{ av_servers }}"

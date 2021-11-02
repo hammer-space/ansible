@@ -1,0 +1,28 @@
+# This playbook adds a set of snapshot schedules to one or more share_snapshots
+# Note that the schedules must exist before trying to apply them
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    share_snapshots: '[
+      {"name":"Devwork","details":["hourly","1_week"]},
+      {"name":"Devwork","details":["daily","1_month"]},
+      {"name":"Devwork","details":["weekly","1_year"]},
+      {"name":"Devwork","details":["monthly","7_years"]}
+    ]'
+  tasks:
+  - name: Add snapshot schedule to share
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/share-snapshots"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{"schedule":{"name":"{{ item.details.0 }}"},"retention":{"name":"{{ item.details.1 }}"},"share":{"name":"{{ item.name }}"}}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ share_snapshots }}"

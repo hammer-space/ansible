@@ -6,7 +6,8 @@
   - Configs/anvil.yml
   vars:
     license:
-      {"activationId":"<INSERT ACTIVATION ID>","licenseType":"NODE"}
+      activationId: "<INSERT ACTIVATION ID>"
+      licenseType: "NODE"
 
   tasks:
   - name: Add and activate a license

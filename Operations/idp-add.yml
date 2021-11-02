@@ -7,8 +7,8 @@
   vars:
     idp:
       name: "My AD Provider"
-      domain: '<AD DOMAIN>'
-      servers: '<AD DOMAIN SERVERS' # Comma separated
+      domain: "<AD DOMAIN>"
+      servers: ""<AD DOMAIN SERVERS" # Comma separated if more than one
       type: "AD"  # Only AD is currently supported
   tasks:
   - name: Add an identity provider

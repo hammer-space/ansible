@@ -1,0 +1,56 @@
+# This playbook adds/updates an ICAP server
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    av_server:
+      _type: "ANTIVIRUS"
+      node:
+        _type: "NODE"
+        name: "<FRIENDLY NODE NAME, i.e. av1>"
+        nodeType: "MCAFEE_AVE"
+        endpoint: "icap://<ICAP SERVER IP:PORT"
+
+  tasks:
+  - name: Add ICAP server
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/antivirus"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{{ av_server }}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: __results
+    failed_when:
+      - __results.status == 500
+## The next two tasks are only executed when the ICAP server already exists
+  - name: Get current ICAP server
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/antivirus/{{ av_server.node.name | urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: GET
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: update_get
+  - name: Update current ICAP server
+    when: __results.status == 400
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/antivirus/{{ update_get.json.uoid.uuid }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: PUT
+      body: '{{ update_get.json|combine(av_server,recursive=True)}}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no

@@ -1,0 +1,23 @@
+# This playbook removes a schedule
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    schedules: '[
+      { "name": "monthly", "details": [ "01 00 1 * *" ]} ]'
+  tasks:
+  - name: Delete schedule
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules/{{ item.name }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: '{}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ schedules }}"

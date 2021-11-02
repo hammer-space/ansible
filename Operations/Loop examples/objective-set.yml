@@ -1,0 +1,25 @@
+# This playbook sets objectives on a share or a path in the System
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    share_objectives: '[
+      { "name": "Data", "details": [ "/","Undelete files to cloud" ]},
+      { "name": "Data", "details": [ "/","Keep most recently used local with tier to cloud" ]},
+      { "name": "Data", "details": [ "/","Virus scanning - 2 MB max file size" ]}
+    ]'
+  tasks:
+  - name: Set an objective on a path
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/shares/{{ item.name|urlencode }}/objective-set?path={{ item.details.0|urlencode }}&objective-identifier={{ item.details.1|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    with_items:
+      - "{{ share_objectives }}"
