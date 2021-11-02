@@ -1,4 +1,4 @@
-# This playbook creates and updates schedules. Schedules can be used to schedule snapshots, system tasks.
+# This playbook creates and updates a schedule. Schedules can be used to schedule snapshots, system tasks.
 ---
 - hosts: localhost
   gather_facts: False
@@ -6,7 +6,8 @@
   - Configs/anvil.yml
   vars:
     schedule:
-      { "name": "monthly", "cronExpression": "01 01 1 * *" }
+      name: "monthly"
+      cronExpression: "01 01 1 * *" # Regular cron expression
   tasks:
   - name: Create snapshot retention schedule
     uri:

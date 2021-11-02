@@ -1,16 +1,18 @@
 # This playbook removes a schedule
+# Note that only schedules that are no longer in use can be deleted
 ---
 - hosts: localhost
   gather_facts: False
   vars_files:
   - Configs/anvil.yml
   vars:
-    schedules: '[
-      { "name": "monthly", "details": [ "01 00 1 * *" ]} ]'
+    schedule:
+      name: "monthly"
+
   tasks:
-  - name: Delete schedule
+  - name: Delete snapshot retention schedules
     uri:
-      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules/{{ item.name }}"
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/schedules/{{ schedule.name }}"
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: DELETE
@@ -19,5 +21,3 @@
       status_code: 200
       body_format: json
       validate_certs: no
-    with_items:
-      - "{{ schedules }}"
