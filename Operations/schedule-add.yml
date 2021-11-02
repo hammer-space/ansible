@@ -15,7 +15,7 @@
       user: "{{ hsuser }}"
       password: "{{ password }}"
       method: POST
-      body: '{"name":"{{ schedule.name }}","cronExpression":"{{ schedule.cronExpression }}"}'
+      body: '{{ schedule }}'
       force_basic_auth: yes
       status_code: 200
       body_format: json
