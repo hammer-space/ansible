@@ -1,6 +1,6 @@
 ## Common API operations for managing Hammerspace
 
-A set of playbooks to automate operations for Hammerspace. 
+A set of playbooks to automate operations for Hammerspace.
 
 Each example includes at least one variable file, [anvil.yml](anvil.yml) which contains required
 information to successfully run the playbook. Some playbooks also refer to additional variable files. All of these files are located in the Configs sub-directory.
@@ -30,3 +30,4 @@ Each playbook contains a variable section with the relevant variables to the API
 - Storage system ( [add](storage-system-add.yml) / [remove](storage-system-remove.yml) ) - Add and remove storage systems (nodes)
 - Syslog ( [add](syslog-add.yml) / [remove](syslog-remove.yml) ) - Add and remove syslog servers
 - System backup ( [add](system-backup-add.yml) / [remove](system-backup-remove.yml) ) - Add and remove system and metadata backups
+- Volume add ( [add](system-volume-add.yml) ) - Add storage volume
