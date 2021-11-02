@@ -1,3 +1,6 @@
-node_name: "My VNX"  # User-friendly name
-node_ip: "<EXPORT IP>"
-node_type: "EMC_VNX"
+storage:
+  name: "My VNX"  # User-friendly name
+  nodeType: "EMC_VNX"
+  mgmtIpAddress:
+    address: "<EXPORT IP>"
+  _type: "NODE"

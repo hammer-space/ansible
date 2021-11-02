@@ -1,6 +1,12 @@
-node_name: "My Isilon"  # User-friendly name
-node_ip: "<MANAGEMENT IP>"
-node_type: "EMC_ISILON"
-node_username: "<USERNAME>"
-node_password: "<PASSWORD>"
-node_extendedinfo: '{"snmp_community":"<SNMP STRING>"}'  # Used for API access
+storage:
+  name: "My Isilon" # User-friendly name
+  mgmtIpAddress:
+    address: "<MANAGEMENT IP>"
+  mgmtNodeCredentials:
+    username: "<USERNAME>"
+    password: "<PASSWORD>"
+    cert: ""
+  extendedInfo:
+    snmp_community: "<SNMP STRING>" # Used for API access
+  nodeType: "EMC_ISILON"
+  _type: "NODE"

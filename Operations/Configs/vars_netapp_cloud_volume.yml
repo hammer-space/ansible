@@ -1,3 +1,6 @@
-node_name: "My Netapp"  # User-friendly name
-node_ip: "<EXPORT IP>"
-node_type: "NETAPP_CLOUD"
+storage:
+  name: "My Netapp"  # User-friendly name
+  nodeType: "NETAPP_CLOUD"
+  mgmtIpAddress:
+    address: "<EXPORT IP>"
+  _type: "NODE"

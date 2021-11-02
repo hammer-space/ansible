@@ -1,5 +1,10 @@
-node_name: "My Netapp"  # User-friendly name
-node_ip: "<MANAGEMENT IP>"
-node_type: "NETAPP_7MODE"
-node_username: "<USERNAME>"
-node_password: "<PASSWORD>"
+storage:
+  name: "My Netapp" # User-friendly name
+  mgmtIpAddress:
+    address: "<MANAGEMENT IP>"
+  mgmtNodeCredentials:
+    username: "<USERNAME>"
+    password: "<PASSWORD>"
+    cert: ""
+  nodeType: "NETAPP_7MODE"
+  _type: "NODE"

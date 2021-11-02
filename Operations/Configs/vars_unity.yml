@@ -1,3 +1,6 @@
-node_name: "My Unity"  # User-friendly name
-node_ip: "<EXPORT IP>"
-node_type: "EMC_UNITY"
+storage:
+  name: "My Unity"  # User-friendly name
+  nodeType: "EMC_UNITY"
+  mgmtIpAddress:
+    address: "<EXPORT IP>"
+  _type: "NODE"

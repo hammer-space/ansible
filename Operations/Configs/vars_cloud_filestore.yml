@@ -1,3 +1,6 @@
-node_name: "My Google Filestore"  # User-friendly name
-node_ip: "<EXPORT IP>"
-node_type: "GOOGLE_CLOUD_FILESTORE"
+storage:
+  name: "My Google Filestore" # User-friendly name
+  nodeType: "GOOGLE_CLOUD_FILESTORE"
+  mgmtIpAddress:
+    address: "<EXPORT IP>"
+  _type: "NODE"

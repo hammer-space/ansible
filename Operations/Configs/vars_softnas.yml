@@ -1,3 +1,6 @@
-node_name: "My SoftNAS"  # User-friendly name
-node_ip: "<EXPORT IP>"
-node_type: "SOFTNAS_CLOUD"
+storage:
+  name: "My SoftNAS"  # User-friendly name
+  nodeType: "SOFTNAS_CLOUD"
+  mgmtIpAddress:
+    address: "<EXPORT IP>"
+  _type: "NODE"

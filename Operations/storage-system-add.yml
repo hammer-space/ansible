@@ -20,19 +20,21 @@
     block:
 # Netapp 7-mode
       - name: Add Netapp 7-mode storage system
-        when: node_type == "NETAPP_7MODE"
+        when: storage.nodeType == "NETAPP_7MODE"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"mgmtNodeCredentials":{"username":"{{ node_username }}","password":"{{ node_password }}","cert":""},"_type":"NODE"}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
 # This needs to be done since Ansible registers the results variable even if the task is skipped
       - name: Set location variable
         set_fact:
@@ -40,177 +42,198 @@
         when: node_add.location is defined
 # Netapp C-mode
       - name: Add Netapp C-mode storage system
-        when: node_type == "NETAPP_CMODE"
+        when: storage.nodeType == "NETAPP_CMODE"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"mgmtNodeCredentials":{"username":"{{ node_username }}","password":"{{ node_password }}","cert":""},"_type":"NODE","extendedInfo":{{ node_extendedinfo }}}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
 # Dell-EMC Isilon
       - name: Add Isilon storage system
-        when: node_type == "EMC_ISILON"
+        when: storage.nodeType == "EMC_ISILON"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"mgmtNodeCredentials":{"username":"{{ node_username }}","password":"{{ node_password }}","cert":""},"_type":"NODE","extendedInfo":{{ node_extendedinfo }}}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
+
 # Netapp Cloud Volumes Service
       - name: Add Netapp Cloud Volume storage system
-        when: node_type == "NETAPP_CLOUD"
+        when: storage.nodeType == "NETAPP_CLOUD"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"_type":"NODE"}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
 # VNX
       - name: Add VNX storage system
-        when: node_type == "EMC_VNX"
+        when: storage.nodeType == "EMC_VNX"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"_type":"NODE"}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
 # Unity
       - name: Add Unity storage system
-        when: node_type == "EMC_UNITY"
+        when: storage.nodeType == "EMC_UNITY"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"_type":"NODE"}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
 # Google Filestore
       - name: Add Google Cloud Filestore storage system
-        when: node_type == "GOOGLE_CLOUD_FILESTORE"
+        when: storage.nodeType == "GOOGLE_CLOUD_FILESTORE"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"_type":"NODE"}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
 # SoftNAS
       - name: Add SoftNAS storage system
-        when: node_type == "SOFTNAS_CLOUD"
+        when: storage.nodeType == "SOFTNAS_CLOUD"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"_type":"NODE"}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
 # Windows File Server
       - name: Add Windows File Server storage system
-        when: node_type == "WINDOWS_FILE_SERVER"
+        when: storage.nodeType == "WINDOWS_FILE_SERVER"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"_type":"NODE"}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
 # Other NFS
       - name: Add Other NFS storage system
-        when: node_type == "OTHER"
+        when: storage.nodeType == "OTHER"
+#        when: node_type == "OTHER"
         uri:
           url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes"
           user: "{{ hsuser }}"
           password: "{{ password }}"
           method: POST
-          body: '{"name":"{{ node_name }}","nodeType":"{{ node_type }}","mgmtIpAddress":{"address":"{{ node_ip }}"},"_type":"NODE"}'
+          body: '{{ storage }}'
           force_basic_auth: yes
           status_code: 202
           body_format: json
           validate_certs: no
           timeout: 180
         register: node_add
+        failed_when:
+          - node_add.status == 500
       - name: Set location variable
         set_fact:
           final_location: "{{ node_add.location }}"
         when: node_add.location is defined
 # Wait for completion
       - name: Check status of add storage system
+        when: final_location is defined
         uri:
           url: "{{ final_location }}"
           user: "{{ hsuser }}"
