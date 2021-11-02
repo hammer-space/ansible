@@ -5,7 +5,7 @@
   vars_files:
   - ./anvil.yml
   vars:
-    share_name: "Data3"
+    share_name: "<SHARE NAME>"
 # Optional parameters
 #    delete_delay: "100000" # Specified in nanoseconds. 0=now/instant
 #    delete_path: "true" # delete share root directory - only successful if empty

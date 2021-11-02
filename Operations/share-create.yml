@@ -11,7 +11,7 @@
   - Configs/anvil.yml
   vars:
     share:
-      name: "<SMB SHARE NAME>"
+      name: "<SMB SHARE NAME>" # share name and SMB share name is the same name
       path: "</ENTER PATH>"
       exportOptions:
       - subnet: "*"
