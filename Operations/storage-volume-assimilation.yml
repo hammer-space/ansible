@@ -1,0 +1,103 @@
+# This playbook starts an assimilation task and monitors it for up to 5 minutes.
+# An assimilation may run for significantly longer than that (without blocking IO)
+# and a failure of the monitoring step should not be considered a failed assimilation
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - Configs/anvil.yml
+  vars:
+    volume:
+      name: "<VOLUME NAME>"
+      node:
+        name: "<NODE NAME>"
+    assim_params:
+      sourcePath: "/" # Most common
+      share: "<HAMMERSPACE SHARE NAME>"
+      destPath: "<DESTINATION PATH IN HAMMERSPACE SHARE>"
+      # Note that smbAssimilationSpec is only configured when doing SMB assimilation
+      # IF NFS only, set it to null: smbAssimilationSpec: null
+      smbAssimilationSpec:
+        uncPath: "<UNCPATH, e.g. //SMB_SERVER_FQDN/SMB_SHARE_NAME>"
+        server: null
+        share: null
+        path: null
+        username: "<USER WITH CREDENTIALS TO READ ALL DATA>" # Recommended to use backup role
+        password: "<PASSWORD>"
+        defaultUser: null
+        defaultGroup: null
+      log: true # Log results in log file
+      update: null # Only used when doing re-assimilation
+
+  tasks:
+  - name: Assimilating existing data
+    block:
+# Check that the storage system exists
+      - name: Check for storage system
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/nodes/{{ volume.node.name|urlencode }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: GET
+          body: ''
+          force_basic_auth: yes
+          status_code: 200
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: __node_results
+        failed_when:
+          - __node_results.status == 500
+      - fail: msg="Storage System {{ volume.node.name }} not found"
+        when: __node_results.status == 404
+# Check that the storage volume exists
+      - name: Check for storage volume
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/storage-volumes/{{ volume.name|urlencode|regex_replace('/','%2F') }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: GET
+          body: ''
+          force_basic_auth: yes
+          status_code: 200
+          body_format: json
+          validate_certs: no
+          timeout: 60
+        register: __volume_results
+        failed_when:
+          - __volume_results.status == 500
+      - fail: msg="Storage Volume {{ volume.name }} not found"
+        when: __volume_results.status == 404
+# Start assimilation
+      - name: Start volume assimilation
+        when: __volume_results.status == 200
+        uri:
+          url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/storage-volumes/{{ volume.name|urlencode|regex_replace('/','%2F') }}/assimilation"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: POST
+          body: '{{ assim_params }}'
+          force_basic_auth: yes
+          status_code: 202
+          body_format: json
+          validate_certs: no
+          timeout: 180
+        register: __results
+        failed_when:
+          - __results.status == 500
+# Wait for completion
+      - name: Check status of assimilation
+        when: __results.status == 202
+        uri:
+          url: "{{ __results.location }}"
+          user: "{{ hsuser }}"
+          password: "{{ password }}"
+          method: GET
+          body: '{}'
+          force_basic_auth: yes
+          status_code: 200
+          body_format: json
+          validate_certs: no
+        register: _result
+        until: _result.json.status == "COMPLETED"
+        retries: 30
+        delay: 10
