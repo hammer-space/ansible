@@ -1,0 +1,43 @@
+# This playbook creates a volume group
+# The example below includes all three types of locations that can be defined
+# NODE_LOCATION - storage node
+# VOLUME_LOCATION - volume
+# VOLUME_GROUP - another volume group
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+    volume_group:
+      name: "<VOLUME GROUP NAME>"
+      _type: "VOLUME_GROUP"
+      expressions:
+        - operator: "IN"
+          locations:
+            - _type: "NODE_LOCATION"
+              node:
+                _type: "NODE"
+                name: "<NODE NAME>"
+            - _type: "VOLUME_LOCATION"
+              storageVolume:
+                _type: "STORAGE_VOLUME"
+                name: "<VOLUME NAME>"
+            - _type: "VOLUME_GROUP"
+              name: "<VOLUME GROUP NAME>"
+
+  tasks:
+  - name: Create a volume group
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/volume-groups"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: POST
+      body: '{{ volume_group }}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: __results
+    failed_when:
+      - __results.status == 500

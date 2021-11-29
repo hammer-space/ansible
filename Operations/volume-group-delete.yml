@@ -1,0 +1,25 @@
+# This playbook deletes a volume group
+---
+- hosts: localhost
+  gather_facts: False
+  vars_files:
+  - ./anvil.yml
+  vars:
+    volume_group:
+      name: "<VOLUME GROUP NAME>"
+      _type: "VOLUME_GROUP"
+  tasks:
+  - name: Delete a volume group
+    uri:
+      url: "https://{{ data_cluster_mgmt_ip }}:8443/mgmt/v1.2/rest/volume-groups/{{ volume_group.name|urlencode }}"
+      user: "{{ hsuser }}"
+      password: "{{ password }}"
+      method: DELETE
+      body: '{{ volume_group }}'
+      force_basic_auth: yes
+      status_code: 200
+      body_format: json
+      validate_certs: no
+    register: __results
+    failed_when:
+      - __results.status == 500
