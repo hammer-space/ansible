@@ -19,7 +19,7 @@ Each playbook contains a variable section with the relevant variables to the API
 - Installation [check](install-ready.yml) - Checks if an installation is ready to receive API calls.
 - License ( [add](license-node-add.yml) / [remove](license-node-remove.yml) ) - Add and remove product license
 - Local site ( [update](local-site-update.yml)) - Update the site name
-- NTP ( [configure]ntp-configure.yml) - Configure NTP
+- NTP ( [configure](ntp-configure.yml) - Configure NTP
 - Objective ( [add](objective-add.yml) / [set](objective-set.yml) ) - Add and set objectives
 - Object/Cloud Storage system ( [add](object-storage-system-add.yml) / [remove](object-storage-system-remove.yml) ) - Add and remove Object/Cloud storage systems (nodes)
 - Object/Cloud Volume ( [add](object-storage-volume-add.yml) / [decommission](object-storage-volume-decommission.yml) /  [delete](object-storage-volume-delete.yml)) - Add, decommission and delete object storage volumes
