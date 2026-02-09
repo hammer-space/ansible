@@ -1,0 +1,5 @@
+---
+# Default firewall variables
+
+firewall_packages:
+  - firewalld

@@ -1,0 +1,9 @@
+---
+# Debian/Ubuntu NFS variables
+
+nfs_packages:
+  - nfs-kernel-server
+  - nfs-common
+  - rpcbind
+
+nfs_service: nfs-kernel-server

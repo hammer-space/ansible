@@ -1,0 +1,37 @@
+---
+# Verification playbook - run from a client to verify NFS exports
+# Usage: ansible-playbook -i inventory.yml verify_nfs.yml
+
+- name: Verify NFS Exports from Storage Servers
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    storage_servers:
+      - 10.1.2.10
+      - 10.1.2.11
+      - 10.1.2.12
+
+  tasks:
+    - name: Check NFS exports from each storage server
+      ansible.builtin.command: "showmount -e {{ item }}"
+      loop: "{{ storage_servers }}"
+      register: showmount_results
+      changed_when: false
+      failed_when: false
+
+    - name: Display NFS exports
+      ansible.builtin.debug:
+        msg: |
+          Server: {{ item.item }}
+          Exports:
+          {{ item.stdout | default('Unable to connect') }}
+      loop: "{{ showmount_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Test NFS mount (dry run)
+      ansible.builtin.debug:
+        msg: |
+          To test mounting, run:
+          sudo mount -t nfs {{ storage_servers[0] }}:/data0 /mnt/test

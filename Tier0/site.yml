@@ -1,0 +1,187 @@
+---
+# Main playbook for Hammerspace Tier 0 / LSS storage and NFS setup
+# Based on Hammerspace Tier 0 Deployment Guide v1.0
+# Usage: ansible-playbook -i inventory.yml site.yml
+
+- name: Configure Storage and NFS for Hammerspace Tier 0 / LSS
+  hosts: storage_servers
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - vars/main.yml
+
+  pre_tasks:
+    # Flush iptables immediately to prevent connectivity issues
+    - name: Flush iptables INPUT chain
+      ansible.builtin.iptables:
+        chain: INPUT
+        flush: true
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Flush iptables FORWARD chain
+      ansible.builtin.iptables:
+        chain: FORWARD
+        flush: true
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Set iptables INPUT policy to ACCEPT
+      ansible.builtin.iptables:
+        chain: INPUT
+        policy: ACCEPT
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Allow established connections
+      ansible.builtin.iptables:
+        chain: INPUT
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Allow SSH connections
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: 22
+        jump: ACCEPT
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Verify we have the required variables (skip if using dynamic discovery)
+      ansible.builtin.assert:
+        that:
+          - raid_arrays is defined or individual_drives is defined or use_dynamic_discovery | default(false)
+          - nfs_exports is defined or use_dynamic_discovery | default(false)
+        fail_msg: "Required variables are not defined. Check vars/main.yml or enable use_dynamic_discovery"
+
+    # Check if node is already registered in Hammerspace (to skip NFS restart)
+    - name: Check if node already exists in Hammerspace
+      ansible.builtin.uri:
+        url: "https://{{ hammerspace_api_host }}:8443/mgmt/v1.2/rest/nodes/{{ hammerspace_node_name | default(inventory_hostname) | urlencode }}"
+        user: "{{ hammerspace_api_user }}"
+        password: "{{ hammerspace_api_password }}"
+        method: GET
+        force_basic_auth: true
+        status_code: [200, 404]
+        validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+        timeout: 30
+      register: hs_node_precheck
+      failed_when: false
+      when:
+        - hammerspace_api_host is defined
+        - hammerspace_api_user is defined
+        - hammerspace_api_password is defined
+
+    - name: Set node_already_in_hammerspace fact
+      ansible.builtin.set_fact:
+        node_already_in_hammerspace: "{{ (hs_node_precheck.status | default(404)) == 200 }}"
+      when: hammerspace_api_host is defined
+
+    - name: Display node registration status
+      ansible.builtin.debug:
+        msg: "Node '{{ hammerspace_node_name | default(inventory_hostname) }}' {{ 'is already registered in Hammerspace - will skip NFS service restart' if node_already_in_hammerspace | default(false) else 'is not yet registered in Hammerspace' }}"
+      when: hammerspace_api_host is defined
+
+  roles:
+    # Dynamic NVMe discovery - groups drives by NUMA and excludes boot device
+    - role: nvme_discovery
+      when: use_dynamic_discovery | default(false)
+      tags: [discovery, nvme]
+
+    - role: precheck
+      tags: [precheck, validation]
+
+    - role: raid_setup
+      when: use_raid | default(true)
+      tags: [raid, storage]
+
+    - role: filesystem_setup
+      tags: [filesystem, storage]
+
+    - role: nfs_setup
+      tags: [nfs]
+
+    - role: firewall_setup
+      tags: [firewall]
+
+    # Hammerspace cluster integration via API
+    - role: hammerspace_integration
+      when: hammerspace_api_host is defined
+      tags: [hammerspace, integration]
+
+  post_tasks:
+    - name: Run systemctl daemon-reload after fstab changes
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    # =========================================================================
+    # Generate Instance Report (display_name, fault_domain, AZ)
+    # =========================================================================
+    - name: Convert fault domain to AZ for report
+      ansible.builtin.set_fact:
+        converted_az: "{{ oci_fault_domain | default('N/A') | regex_replace('FAULT-DOMAIN-', 'AZ') }}"
+
+    - name: Set report file path
+      ansible.builtin.set_fact:
+        instance_report_file: "{{ playbook_dir }}/instance_report.csv"
+      run_once: true
+
+    - name: Create instance report CSV with header
+      ansible.builtin.copy:
+        dest: "{{ instance_report_file }}"
+        content: "display_name,fault_domain,az\n"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Append instance data to report
+      ansible.builtin.lineinfile:
+        path: "{{ instance_report_file }}"
+        line: "{{ inventory_hostname }},{{ oci_fault_domain | default('N/A') }},{{ converted_az }}"
+        mode: '0644'
+      delegate_to: localhost
+
+    - name: Display instance report location
+      ansible.builtin.debug:
+        msg: |
+          Instance report generated: {{ instance_report_file }}
+          Instances: {{ ansible_play_hosts | length }}
+      run_once: true
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          HAMMERSPACE TIER 0 / LSS SETUP COMPLETE
+          ============================================
+          - RAID arrays configured: {{ raid_arrays | default([]) | length }}
+          - Mount points created: {{ mount_points | length }}
+          - NFS exports configured: {{ nfs_exports | default([]) | length }}
+          {% if hammerspace_api_host is defined %}
+          - Hammerspace integration: ENABLED
+            - Storage system registered: {{ hammerspace_node_name | default(inventory_hostname) }}
+            - Volumes added: {{ mount_points | length }}
+          {% else %}
+          - Hammerspace integration: SKIPPED (set hammerspace_api_host to enable)
+          {% endif %}
+
+          VERIFY:
+          1. NFS exports from another node:
+             showmount -e {{ ansible_default_ipv4.address }}
+
+          {% if hammerspace_api_host is defined %}
+          2. Hammerspace CLI:
+             anvil> node-list
+             anvil> volume-list
+          {% else %}
+          2. Manual Hammerspace integration (if not using API):
+             anvil> node-add --type OTHER --name {{ inventory_hostname }} --ip {{ ansible_default_ipv4.address }}
+             {% for mp in mount_points %}
+             anvil> volume-add --name {{ inventory_hostname }}::{{ mp.path }} --node-name {{ inventory_hostname }} --logical-volume-name {{ mp.path }}
+             {% endfor %}
+          {% endif %}
+          ============================================

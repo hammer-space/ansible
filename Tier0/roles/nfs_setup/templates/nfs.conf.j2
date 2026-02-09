@@ -1,0 +1,90 @@
+#
+# /etc/nfs.conf - NFS daemon configuration
+# Managed by Ansible - {{ ansible_date_time.iso8601 }}
+# Configured per Hammerspace Tier 0 Deployment Guide recommendations
+#
+
+[general]
+# pipefs-directory=/var/lib/nfs/rpc_pipefs
+
+[exportfs]
+# debug=0
+
+[gssd]
+# verbosity=0
+# rpc-verbosity=0
+# use-memcache=0
+# use-machine-creds=1
+# avoid-dns=1
+# limit-to-legacy-enctypes=0
+# context-timeout=0
+# rpc-timeout=5
+# keytab-file=/etc/krb5.keytab
+# cred-cache-directory=
+# preferred-realm=
+
+[lockd]
+# port=0
+# udp-port=0
+
+[mountd]
+# debug=0
+# manage-gids=n
+# descriptors=0
+# port=0
+# threads=1
+# reverse-lookup=n
+# state-directory-path=/var/lib/nfs
+# ha-callout=
+
+[nfsdcld]
+# debug=0
+# storagedir=/var/lib/nfs/nfsdcld
+
+[nfsdcltrack]
+# debug=0
+# storagedir=/var/lib/nfs/nfsdcltrack
+
+[nfsd]
+# Hammerspace recommends 128 threads for Tier 0 environments
+threads={{ nfs_threads | default(128) }}
+
+# UDP is typically not needed
+# udp=n
+
+# TCP is default
+# tcp=y
+
+# NFS version settings per Hammerspace recommendations
+vers3={{ nfs_vers3 | default('y') }}
+# vers4=y
+vers4.0={{ nfs_vers4_0 | default('n') }}
+vers4.1={{ nfs_vers4_1 | default('n') }}
+vers4.2={{ nfs_vers4_2 | default('y') }}
+
+# RDMA settings - enable if using RDMA-capable NICs
+# Requires OEM drivers for Intel or Broadcom NICs (not inbox drivers)
+rdma={{ nfs_rdma_enabled | default('n') }}
+{% if nfs_rdma_enabled | default('n') == 'y' %}
+rdma-port={{ nfs_rdma_port | default(20049) }}
+{% endif %}
+
+[statd]
+# debug=0
+# port=0
+# outgoing-port=0
+# name=
+# state-directory-path=/var/lib/nfs/statd
+# ha-callout=
+# no-notify=0
+
+[sm-notify]
+# debug=0
+# force=0
+# retry-time=900
+# outgoing-port=
+# outgoing-addr=
+# lift-grace=y
+
+[svcgssd]
+# principal=

@@ -1,0 +1,67 @@
+---
+# Default variables for precheck role
+# Based on Hammerspace Tier 0 Deployment Guide v1.0
+
+# ============================================================================
+# NVMe Drive Count Validation
+# ============================================================================
+
+# Expected number of NVMe drives (set to 0 or comment out to disable check)
+# Example: For 8 data drives + 1 boot drive = 9
+# expected_nvme_count: 9
+
+# Set to true to fail playbook if drive count doesn't match
+enforce_drive_count: false
+
+# ============================================================================
+# Drive Mount Status
+# ============================================================================
+
+# Set to true to fail if non-boot NVMe drives are already mounted/in-use
+fail_on_drives_in_use: true
+
+# ============================================================================
+# NUMA Balance
+# ============================================================================
+
+# Set to true to warn if NUMA nodes have different numbers of NVMe drives
+warn_on_numa_imbalance: true
+
+# ============================================================================
+# 4K Sector Size (Hammerspace Recommendation)
+# ============================================================================
+
+# Expected sector size in bytes (Hammerspace recommends 4096)
+expected_sector_size: 4096
+
+# Set to true to fail if drives don't have the expected sector size
+require_4k_sectors: false
+
+# Set to true to format drives to 4K sector size (DESTRUCTIVE!)
+format_nvme_to_4k: false
+
+# Safety confirmation string - must be exactly this to allow formatting
+# nvme_format_confirm: "YES_I_UNDERSTAND_THIS_IS_DESTRUCTIVE"
+
+# ============================================================================
+# MTU / Jumbo Frames
+# ============================================================================
+
+# Expected MTU for jumbo frames
+expected_mtu: 9000
+
+# Ping size for MTU test (MTU - 28 bytes for ICMP overhead)
+mtu_ping_size: 8972
+
+# Network targets to test (should include Hammerspace Anvil IPs and other nodes)
+network_test_targets: []
+
+# Set to true to fail playbook if MTU tests fail
+enforce_mtu_test: false
+
+# ============================================================================
+# Package Requirements
+# ============================================================================
+
+# Set to true to fail if required packages are not installed
+fail_on_missing_packages: true

@@ -1,0 +1,103 @@
+---
+# Create a Hammerspace share
+# Called from main.yml with share_config variable
+
+- name: "Build share payload for {{ share_config.name }}"
+  ansible.builtin.set_fact:
+    share_payload:
+      name: "{{ share_config.name }}"
+      path: "{{ share_config.path }}"
+      exportOptions: "{{ share_config.export_options | default(default_share_export_options) }}"
+      shareSizeLimit: "{{ share_config.size_limit | default('0') }}"
+      warnUtilizationPercentThreshold: "{{ share_config.warn_threshold | default('90') }}"
+
+- name: "Check if share {{ share_config.name }} already exists"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/shares/{{ share_config.name | urlencode }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: [200, 404]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 60
+  register: share_check
+  failed_when: false
+
+- name: "Create share {{ share_config.name }}"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/shares"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: POST
+    body: "{{ share_payload }}"
+    body_format: json
+    force_basic_auth: true
+    status_code: [202, 400]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 180
+  register: share_create_result
+  when: share_check.status == 404
+
+- name: "Wait for share {{ share_config.name }} creation to complete"
+  ansible.builtin.uri:
+    url: "{{ share_create_result.location }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: 200
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+  register: share_create_status
+  until: share_create_status.json.status == "COMPLETED"
+  retries: 30
+  delay: 2
+  when:
+    - share_create_result.location is defined
+    - share_create_result.status == 202
+
+- name: "Update existing share {{ share_config.name }}"
+  when: share_check.status == 200
+  block:
+    - name: "Get current share details"
+      ansible.builtin.uri:
+        url: "{{ hs_api_url }}/shares/{{ share_config.name | urlencode }}"
+        user: "{{ hammerspace_api_user }}"
+        password: "{{ hammerspace_api_password }}"
+        method: GET
+        force_basic_auth: true
+        status_code: 200
+        validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+      register: current_share
+
+    - name: "Update share {{ share_config.name }}"
+      ansible.builtin.uri:
+        url: "{{ hs_api_url }}/shares/{{ current_share.json.uoid.uuid }}"
+        user: "{{ hammerspace_api_user }}"
+        password: "{{ hammerspace_api_password }}"
+        method: PUT
+        body: "{{ current_share.json | combine(share_payload, recursive=True) }}"
+        body_format: json
+        force_basic_auth: true
+        status_code: 202
+        validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+      register: share_update_result
+      when: hammerspace_update_existing_shares | default(false)
+
+- name: "Display share {{ share_config.name }} status"
+  ansible.builtin.debug:
+    msg: >-
+      Share '{{ share_config.name }}'
+      {% if share_check.status == 200 %}already exists{% elif share_create_result.status is defined and share_create_result.status == 202 %}created successfully{% else %}processed{% endif %}
+
+# Apply share objective if specified in share_config
+- name: "Apply objective to share {{ share_config.name }}"
+  ansible.builtin.include_tasks: share_apply_objective.yml
+  vars:
+    share_objective_config:
+      share_name: "{{ share_config.name }}"
+      objective: "{{ share_config.objective }}"
+      applicability: "{{ share_config.objective_applicability | default('TRUE') }}"
+  when:
+    - share_config.objective is defined
+    - hammerspace_apply_share_objectives | default(false)

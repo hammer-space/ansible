@@ -1,0 +1,336 @@
+---
+# CPU-Optimized RAID Configuration
+# Detects CPU vendor/model and applies best practice settings for NVMe RAID
+
+- name: Get CPU information from /proc/cpuinfo
+  ansible.builtin.shell: |
+    grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs
+  register: cpu_model_raw
+  changed_when: false
+
+- name: Get CPU vendor
+  ansible.builtin.shell: |
+    grep -m1 "vendor_id" /proc/cpuinfo | cut -d: -f2 | xargs
+  register: cpu_vendor_raw
+  changed_when: false
+
+- name: Get number of CPU cores
+  ansible.builtin.shell: |
+    nproc
+  register: cpu_cores_raw
+  changed_when: false
+
+- name: Get number of NUMA nodes
+  ansible.builtin.shell: |
+    lscpu | grep "NUMA node(s)" | awk '{print $3}'
+  register: numa_nodes_raw
+  changed_when: false
+  failed_when: false
+
+- name: Set CPU facts
+  ansible.builtin.set_fact:
+    detected_cpu_model: "{{ cpu_model_raw.stdout }}"
+    detected_cpu_vendor: "{{ cpu_vendor_raw.stdout }}"
+    detected_cpu_cores: "{{ cpu_cores_raw.stdout | int }}"
+    detected_numa_nodes: "{{ numa_nodes_raw.stdout | default('1') | int }}"
+
+- name: Get CPU architecture
+  ansible.builtin.shell: |
+    uname -m
+  register: cpu_arch_raw
+  changed_when: false
+
+- name: Set CPU architecture fact
+  ansible.builtin.set_fact:
+    detected_cpu_arch: "{{ cpu_arch_raw.stdout | trim }}"
+
+- name: Detect CPU vendor profile
+  ansible.builtin.set_fact:
+    detected_cpu_profile: >-
+      {%- if 'EPYC' in detected_cpu_model and ('9' in detected_cpu_model or 'Genoa' in detected_cpu_model) -%}
+        amd_epyc_genoa
+      {%- elif 'EPYC' in detected_cpu_model -%}
+        amd_epyc
+      {%- elif 'Xeon' in detected_cpu_model and ('Sapphire' in detected_cpu_model or '4th Gen' in detected_cpu_model) -%}
+        intel_xeon_sapphire
+      {%- elif 'Xeon' in detected_cpu_model -%}
+        intel_xeon
+      {%- elif 'Neoverse' in detected_cpu_model and 'V2' in detected_cpu_model -%}
+        arm_neoverse_v2
+      {%- elif 'Neoverse' in detected_cpu_model -%}
+        arm_neoverse
+      {%- elif 'Ampere' in detected_cpu_model or 'Altra' in detected_cpu_model -%}
+        arm_ampere_altra
+      {%- elif 'Grace' in detected_cpu_model -%}
+        arm_nvidia_grace
+      {%- elif 'Graviton3' in detected_cpu_model or 'graviton3' in detected_cpu_model -%}
+        arm_graviton3
+      {%- elif 'Graviton' in detected_cpu_model or 'graviton' in detected_cpu_model -%}
+        arm_graviton2
+      {%- elif detected_cpu_arch == 'aarch64' -%}
+        arm_generic
+      {%- elif 'AuthenticAMD' in detected_cpu_vendor -%}
+        amd_generic
+      {%- elif 'GenuineIntel' in detected_cpu_vendor -%}
+        intel_generic
+      {%- else -%}
+        generic
+      {%- endif -%}
+
+- name: Display detected CPU information
+  ansible.builtin.debug:
+    msg: |
+      CPU Detection Results:
+      ============================================
+      Model: {{ detected_cpu_model }}
+      Vendor: {{ detected_cpu_vendor }}
+      Architecture: {{ detected_cpu_arch }}
+      Cores: {{ detected_cpu_cores }}
+      NUMA Nodes: {{ detected_numa_nodes }}
+      Detected Profile: {{ detected_cpu_profile }}
+      OCI Processor: {{ oci_processor_description | default('N/A (not from OCI inventory)') }}
+      ============================================
+
+# ============================================================================
+# AMD EPYC Genoa (9004 Series) Optimizations
+# ============================================================================
+- name: Apply AMD EPYC Genoa optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 512
+    cpu_nvme_queue_depth: 1024
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      AMD EPYC Genoa (9004 Series) Best Practices:
+      - RAID chunk size: 512KB (optimal for large sequential I/O)
+      - NUMA-aware RAID: One array per NUMA node
+      - XFS agcount: 512 (Hammerspace recommendation)
+      - I/O scheduler: none (NVMe native multiqueue)
+      - Queue depth: 1024 (high parallelism for many cores)
+      - Recommended: Enable NUMA balancing in kernel
+  when: detected_cpu_profile == 'amd_epyc_genoa'
+
+# ============================================================================
+# AMD EPYC Milan/Rome Optimizations
+# ============================================================================
+- name: Apply AMD EPYC Milan/Rome optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 512
+    cpu_nvme_queue_depth: 512
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      AMD EPYC Milan/Rome Best Practices:
+      - RAID chunk size: 512KB
+      - NUMA-aware RAID: One array per NUMA node
+      - XFS agcount: 512
+      - I/O scheduler: none
+      - Queue depth: 512
+  when: detected_cpu_profile == 'amd_epyc'
+
+# ============================================================================
+# Intel Xeon Sapphire Rapids Optimizations
+# ============================================================================
+- name: Apply Intel Xeon Sapphire Rapids optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 256
+    cpu_nvme_queue_depth: 512
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      Intel Xeon Sapphire Rapids Best Practices:
+      - RAID chunk size: 256KB (balanced for mixed workloads)
+      - NUMA-aware RAID: One array per NUMA node
+      - XFS agcount: 512
+      - I/O scheduler: none (NVMe native multiqueue)
+      - Consider: Intel Volume Management Device (VMD) if available
+  when: detected_cpu_profile == 'intel_xeon_sapphire'
+
+# ============================================================================
+# Intel Xeon (Generic) Optimizations
+# ============================================================================
+- name: Apply Intel Xeon generic optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 256
+    cpu_nvme_queue_depth: 256
+    cpu_nvme_io_scheduler: "mq-deadline"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      Intel Xeon Best Practices:
+      - RAID chunk size: 256KB
+      - NUMA-aware RAID: One array per NUMA node
+      - XFS agcount: 512
+      - I/O scheduler: mq-deadline (for older kernels)
+  when: detected_cpu_profile == 'intel_xeon'
+
+# ============================================================================
+# ARM Neoverse V2 (Graviton4, Grace Superchip) Optimizations
+# ============================================================================
+- name: Apply ARM Neoverse V2 optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 512
+    cpu_nvme_queue_depth: 1024
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      ARM Neoverse V2 Best Practices:
+      - RAID chunk size: 512KB (optimal for large sequential I/O)
+      - NUMA-aware RAID: One array per NUMA node
+      - XFS agcount: 512
+      - I/O scheduler: none (NVMe native multiqueue)
+      - Queue depth: 1024 (high parallelism)
+      - Architecture: aarch64
+  when: detected_cpu_profile == 'arm_neoverse_v2'
+
+# ============================================================================
+# ARM Neoverse N1/V1 (Graviton2/3) Optimizations
+# ============================================================================
+- name: Apply ARM Neoverse optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 512
+    cpu_nvme_queue_depth: 512
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      ARM Neoverse Best Practices:
+      - RAID chunk size: 512KB
+      - NUMA-aware RAID: One array per NUMA node
+      - XFS agcount: 512
+      - I/O scheduler: none
+      - Queue depth: 512
+      - Architecture: aarch64
+  when: detected_cpu_profile in ['arm_neoverse', 'arm_graviton2', 'arm_graviton3']
+
+# ============================================================================
+# Ampere Altra / Altra Max Optimizations
+# ============================================================================
+- name: Apply Ampere Altra optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 512
+    cpu_nvme_queue_depth: 1024
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      Ampere Altra/Altra Max Best Practices:
+      - RAID chunk size: 512KB (optimal for high-bandwidth workloads)
+      - NUMA-aware RAID: One array per NUMA node (up to 2 sockets)
+      - XFS agcount: 512
+      - I/O scheduler: none (NVMe native multiqueue)
+      - Queue depth: 1024 (128 cores per socket)
+      - Architecture: aarch64
+  when: detected_cpu_profile == 'arm_ampere_altra'
+
+# ============================================================================
+# NVIDIA Grace Optimizations
+# ============================================================================
+- name: Apply NVIDIA Grace optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 512
+    cpu_nvme_queue_depth: 1024
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      NVIDIA Grace Best Practices:
+      - RAID chunk size: 512KB (optimized for GPU workloads)
+      - NUMA-aware RAID: Align with NVLink/PCIe topology
+      - XFS agcount: 512
+      - I/O scheduler: none (NVMe native multiqueue)
+      - Queue depth: 1024 (72 cores, high parallelism)
+      - Consider: NVMe proximity to GPU for DGX/HGX systems
+      - Architecture: aarch64
+  when: detected_cpu_profile == 'arm_nvidia_grace'
+
+# ============================================================================
+# ARM Generic Fallback
+# ============================================================================
+- name: Apply ARM generic optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 512
+    cpu_nvme_queue_depth: 512
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      ARM Generic Best Practices:
+      - RAID chunk size: 512KB
+      - NUMA-aware RAID if multiple NUMA nodes
+      - XFS agcount: 512
+      - I/O scheduler: none
+      - Architecture: aarch64
+  when: detected_cpu_profile == 'arm_generic'
+
+# ============================================================================
+# Generic Fallback (x86/other)
+# ============================================================================
+- name: Apply generic optimizations
+  ansible.builtin.set_fact:
+    cpu_raid_chunk_size: 512
+    cpu_nvme_queue_depth: 256
+    cpu_nvme_io_scheduler: "none"
+    cpu_xfs_agcount: 512
+    cpu_raid_layout: "numa"
+    cpu_optimization_notes: |
+      Generic Best Practices:
+      - RAID chunk size: 512KB
+      - NUMA-aware RAID if multiple NUMA nodes
+      - XFS agcount: 512
+      - I/O scheduler: none
+  when: detected_cpu_profile in ['amd_generic', 'intel_generic', 'generic']
+
+# ============================================================================
+# Apply Settings (with user override capability)
+# ============================================================================
+- name: Set final RAID parameters (user overrides take precedence)
+  ansible.builtin.set_fact:
+    raid_chunk_size: "{{ raid_chunk_size | default(cpu_raid_chunk_size) }}"
+    nvme_queue_depth: "{{ nvme_queue_depth | default(cpu_nvme_queue_depth) }}"
+    nvme_io_scheduler: "{{ nvme_io_scheduler | default(cpu_nvme_io_scheduler) }}"
+    xfs_agcount: "{{ xfs_agcount | default(cpu_xfs_agcount) }}"
+
+- name: Display applied optimizations
+  ansible.builtin.debug:
+    msg: |
+      CPU-Optimized RAID Configuration:
+      ============================================
+      {{ cpu_optimization_notes }}
+      Applied Settings:
+        RAID Chunk Size: {{ raid_chunk_size }}KB
+        NVMe Queue Depth: {{ nvme_queue_depth }}
+        I/O Scheduler: {{ nvme_io_scheduler }}
+        XFS agcount: {{ xfs_agcount }}
+      ============================================
+
+      Note: User-defined values in vars/main.yml override auto-detected settings.
+
+# ============================================================================
+# Apply NVMe Tuning
+# ============================================================================
+- name: Set NVMe I/O scheduler
+  ansible.builtin.shell: |
+    for nvme in /sys/block/nvme*/queue/scheduler; do
+      if [ -f "$nvme" ]; then
+        echo "{{ nvme_io_scheduler }}" > "$nvme" 2>/dev/null || true
+      fi
+    done
+  changed_when: false
+  failed_when: false
+  when: nvme_io_scheduler is defined
+
+- name: Set NVMe queue depth
+  ansible.builtin.shell: |
+    for nvme in /sys/block/nvme*/queue/nr_requests; do
+      if [ -f "$nvme" ]; then
+        echo "{{ nvme_queue_depth }}" > "$nvme" 2>/dev/null || true
+      fi
+    done
+  changed_when: false
+  failed_when: false
+  when: nvme_queue_depth is defined
