@@ -1,5 +1,0 @@
----
-# Debian/Ubuntu firewall variables
-
-firewall_packages:
-  - ufw

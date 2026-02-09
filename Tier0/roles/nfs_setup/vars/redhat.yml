@@ -1,8 +1,0 @@
----
-# RedHat/Rocky/CentOS NFS variables
-
-nfs_packages:
-  - nfs-utils
-  - rpcbind
-
-nfs_service: nfs-server
