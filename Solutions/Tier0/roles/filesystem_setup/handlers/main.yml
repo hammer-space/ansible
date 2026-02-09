@@ -1,0 +1,6 @@
+---
+# Handlers for filesystem_setup role
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true

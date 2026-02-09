@@ -1,0 +1,647 @@
+---
+# Main variables file for Hammerspace Tier 0 / LSS storage and NFS setup
+# Based on Hammerspace Tier 0 Deployment Guide v1.0
+# Customize these values for your environment
+
+# ============================================================================
+# RAID Configuration
+# ============================================================================
+
+# Set to false to skip RAID setup and use individual drives
+# Note: If projected volume count > 1000, RAID configuration is recommended
+use_raid: true
+
+# XFS allocation group count for mkfs.xfs (optional)
+# Hammerspace recommends agcount=512 for optimal performance
+# Comment out or remove to use mkfs.xfs default (auto-calculated based on device size)
+xfs_agcount: 512
+
+# ============================================================================
+# Dynamic NVMe Discovery (Recommended)
+# ============================================================================
+# When enabled, NVMe drives are automatically discovered and grouped by NUMA node
+# The boot device is automatically excluded from RAID configuration
+
+use_dynamic_discovery: true
+
+# RAID level for dynamically discovered arrays (0, 1, 5, 10)
+raid_level: 0
+
+# Base path for mount points (arrays mount as /hammerspace/hsvol0, hsvol1, etc.)
+mount_base_path: /hammerspace
+
+# ============================================================================
+# RAID Array Sizing Options
+# ============================================================================
+# Control how drives are grouped into RAID arrays
+
+# Maximum drives per RAID array (0 = unlimited, use all drives per NUMA node)
+# Examples:
+#   0  - One RAID per NUMA node with all drives (default)
+#   4  - Split into arrays of 4 drives each
+#   8  - Split into arrays of 8 drives each
+raid_max_drives_per_array: 0
+
+# Minimum drives required to create a RAID array
+# Arrays with fewer drives will be skipped (useful for uneven NUMA distribution)
+raid_min_drives_per_array: 2
+
+# RAID grouping strategy
+# Options:
+#   numa     - Group by NUMA node, then split by max_drives (default)
+#   single   - Single RAID array across all drives (ignore NUMA)
+#   per_drive - Each drive as separate mount (no RAID)
+raid_grouping_strategy: numa
+
+# Power of 2 alignment for drive count
+# When true, rounds down drive count to nearest power of 2 (2, 4, 8, 16...)
+# Recommended for RAID 0 performance
+raid_power_of_2_drives: false
+
+# How to handle leftover drives that don't fit in arrays
+# (applies when using max_drives_per_array or power_of_2_drives)
+# Options:
+#   skip     - Ignore leftover drives, don't include in any array (default)
+#   separate - Create a separate smaller array for leftovers
+#   add_last - Add leftover drives to the last array (uneven array size)
+#   individual - Mount leftover drives individually (no RAID)
+raid_leftover_drives: skip
+
+# ============================================================================
+# NVMe Device Exclusion
+# ============================================================================
+# Exclude specific NVMe devices from RAID configuration
+# Boot device is always excluded automatically
+
+# Option 1: Exclude by device name (e.g., nvme0n1, nvme1n1)
+nvme_exclude_devices: []
+  # - nvme0n1    # Exclude specific device
+  # - nvme1n1
+
+# Option 2: Exclude by device path (e.g., /dev/nvme0n1)
+nvme_exclude_paths: []
+  # - /dev/nvme0n1
+  # - /dev/nvme1n1
+
+# Option 3: Exclude by serial number (useful for consistent exclusion across reboots)
+nvme_exclude_serials: []
+  # - "S5XXXX0123456789"
+  # - "S5XXXX9876543210"
+
+# Option 4: Exclude by model name (exclude all drives of specific model)
+nvme_exclude_models: []
+  # - "Samsung SSD 980 PRO"
+  # - "Intel Optane"
+
+# Option 5: Exclude by NUMA node (exclude all drives on specific NUMA node)
+nvme_exclude_numa_nodes: []
+  # - 0    # Exclude all NVMe on NUMA node 0
+  # - 1
+
+# Option 6: Exclude by PCIe address (e.g., 0000:03:00.0)
+nvme_exclude_pcie_addresses: []
+  # - "0000:03:00.0"   # Exclude specific PCIe slot
+  # - "0000:04:00.0"
+
+# Option 7: Exclude by PCIe address prefix (exclude all devices on PCIe bus)
+nvme_exclude_pcie_prefixes: []
+  # - "0000:03"   # Exclude all devices on bus 03
+  # - "0000:e"    # Exclude all devices on buses starting with 'e'
+
+# ============================================================================
+# CPU-Optimized RAID Configuration
+# ============================================================================
+# Automatically tune RAID parameters based on CPU vendor best practices
+# Set to true to auto-detect CPU and apply optimized settings
+cpu_optimized_raid: true
+
+# Manual override: Set specific CPU vendor profile
+# Options: auto, amd_epyc, amd_epyc_genoa, intel_xeon, intel_xeon_sapphire
+# cpu_vendor_profile: auto
+
+# ---- AMD EPYC Optimizations (Genoa/Milan/Rome) ----
+# - NUMA-aware RAID grouping (one array per NUMA node)
+# - Chunk size 512K for large sequential I/O
+# - Queue depth optimized for high core count
+#
+# ---- Intel Xeon Optimizations (Sapphire Rapids/Ice Lake) ----
+# - NUMA-aware RAID grouping
+# - Chunk size 256K-512K depending on workload
+# - I/O scheduler tuning for Intel NVMe
+
+# RAID chunk size in KB (auto-tuned if cpu_optimized_raid: true)
+# AMD EPYC: 512 (optimal for high-bandwidth workloads)
+# Intel Xeon: 256 or 512
+# raid_chunk_size: 512
+
+# NVMe queue depth (auto-tuned based on CPU cores)
+# nvme_queue_depth: 1024
+
+# I/O scheduler (auto-selected based on CPU/NVMe combination)
+# Options: none, mq-deadline, kyber
+# nvme_io_scheduler: none
+
+# ============================================================================
+# Manual RAID Configuration (Alternative to Dynamic Discovery)
+# ============================================================================
+# Set use_dynamic_discovery: false to use manual configuration below
+# Tips from Hammerspace:
+# - Use RAID set sizes that are a power of 2
+# - Build RAID sets on NUMA-local NVMe where possible
+# - Default chunk size of 512KiB works for most deployments
+
+# Example manual configuration (uncomment if use_dynamic_discovery: false):
+# raid_arrays:
+#   - name: md0
+#     device: /dev/md0
+#     level: 0
+#     drives:
+#       - /dev/nvme0n1
+#       - /dev/nvme1n1
+#       - /dev/nvme2n1
+#       - /dev/nvme3n1
+#
+#   - name: md1
+#     device: /dev/md1
+#     level: 0
+#     drives:
+#       - /dev/nvme4n1
+#       - /dev/nvme5n1
+#       - /dev/nvme6n1
+#       - /dev/nvme7n1
+
+# ============================================================================
+# Mount Points and Filesystems
+# ============================================================================
+# Note: When use_dynamic_discovery: true, mount_points are auto-generated
+# based on discovered NUMA-grouped RAID arrays
+
+# Manual mount points (used when use_dynamic_discovery: false):
+# mount_points:
+#   - path: /hammerspace/hsvol0
+#     device: /dev/md0
+#     fstype: xfs
+#     label: hammerspace-hsvol0
+#     mount_opts: defaults,nofail,discard
+
+# ============================================================================
+# Hammerspace Cluster Integration (API)
+# ============================================================================
+# Configure these settings to automatically register this node and its
+# volumes with a Hammerspace cluster via the Anvil REST API.
+# Reference: https://github.com/hammer-space/ansible
+
+# Anvil management IP (public IP for API access)
+hammerspace_api_host: "10.0.10.15"
+
+# API credentials (admin role required)
+hammerspace_api_user: "admin"
+hammerspace_api_password: "Hammer.123!!"
+
+# Skip SSL certificate validation (set to true for self-signed certs)
+hammerspace_api_validate_certs: false
+
+# Node name in Hammerspace (defaults to inventory_hostname)
+# Use AZ prefix for availability zones: "AZ1:tier0-node01"
+# hammerspace_node_name: "{{ inventory_hostname }}"
+
+# Node IP for Hammerspace (defaults to ansible_default_ipv4.address)
+# hammerspace_node_ip: "{{ ansible_default_ipv4.address }}"
+
+# Automatically add discovered volumes to Hammerspace
+hammerspace_add_volumes: true
+
+# Volume threshold settings (per Tier 0 Deployment Guide)
+# High threshold (utilizationThreshold): triggers data evacuation
+# Value is decimal (0.98 = 98%)
+hammerspace_volume_high_threshold: 0.98
+
+# Low threshold (utilizationEvacuationThreshold): target after evacuation
+# Value is decimal (0.90 = 90%)
+hammerspace_volume_low_threshold: 0.90
+
+# Volume protection settings
+# onlineDelay: seconds before volume goes suspected (--max-suspected-time)
+hammerspace_volume_online_delay: 0
+
+# unavailableStateAvailabilityMultiplier: availability drop behavior
+# 0 = enabled (--availability-drop-enabled) - availability drops to 0 when unavailable
+# 1 = disabled (--availability-drop-disabled) - availability unchanged when unavailable
+hammerspace_volume_unavailable_multiplier: 0
+
+# availability and durability levels
+hammerspace_volume_availability: 2
+hammerspace_volume_durability: 3
+
+# ============================================================================
+# Volume Naming and AZ Prefix Configuration
+# ============================================================================
+# AZ prefix for volume naming (format: "AZ1:" for multi-AZ deployments)
+# Volume name format: [az_prefix]node_name::path
+# Example with prefix: "AZ1:tier0-node-01::/hammerspace/hsvol0"
+# Example without prefix: "tier0-node-01::/hammerspace/hsvol0"
+#
+# OCI Fault Domain Auto-Mapping:
+#   FAULT-DOMAIN-1 -> "AZ1:"
+#   FAULT-DOMAIN-2 -> "AZ2:"
+#   FAULT-DOMAIN-3 -> "AZ3:"
+#
+# Enable AZ prefix in volume names
+hammerspace_volume_az_prefix_enabled: false
+
+# AZ prefix mode (used when hammerspace_volume_az_prefix_enabled: true)
+# Options:
+#   ""      - No prefix (disabled)
+#   "auto"  - Derive from OCI fault domain (FAULT-DOMAIN-1 -> AZ1:)
+#   "AZ1:"  - Static prefix for all nodes
+hammerspace_volume_az_prefix_mode: ""
+
+# Direct override (ignores above settings if defined)
+# hammerspace_volume_az_prefix: "AZ1:"
+
+# Create placement objectives for volumes (recommended for automated tiering)
+hammerspace_create_placement_objectives: true
+
+# Skip performance test when adding volumes (faster deployment)
+hammerspace_skip_performance_test: true
+
+# Additional IP addresses for volume access (optional)
+# hammerspace_additional_ips:
+#   - "10.0.1.100"
+#   - "10.0.1.101"
+
+# IP addresses to exclude from volume access (optional)
+# hammerspace_excluded_ips:
+#   - "10.0.1.200"
+
+# Create Hammerspace shares (optional)
+hammerspace_create_shares: false
+
+# Example shares configuration (uncomment if hammerspace_create_shares: true)
+# hammerspace_shares:
+#   - name: checkpoints
+#     path: /checkpoints
+#     export_options:
+#       - subnet: "10.200.104.0/24"
+#         accessPermissions: "RW"
+#         rootSquash: true
+#     objective: "availability-3-nines"  # Optional: apply share objective
+#   - name: models
+#     path: /models
+#     export_options:
+#       - subnet: "*"
+#         accessPermissions: "RW"
+#         rootSquash: false
+
+# ============================================================================
+# Task Queue Throttling (from Hammerspace Engineering)
+# ============================================================================
+# Prevents overwhelming the cluster with too many simultaneous API operations
+# When the queue exceeds max_queued_tasks, operations pause until it drops
+# below min_queued_tasks
+
+hammerspace_task_queue_throttle: true
+hammerspace_min_queued_tasks: 5      # Resume when queue is below this
+hammerspace_max_queued_tasks: 10     # Throttle when queue exceeds this
+hammerspace_task_queue_retries: 100  # Max retries (100 x 10s = ~16 min)
+hammerspace_task_queue_delay: 10     # Delay between retries (seconds)
+
+# ============================================================================
+# Availability Zone Mapping (from Hammerspace Engineering)
+# ============================================================================
+# Enable to parse AZ from node name (format: "AZ1:node-name")
+# Useful for multi-AZ deployments
+# Auto-detects AZ from OCI fault domain (FAULT-DOMAIN-1 -> AZ1, etc.)
+
+hammerspace_enable_az_mapping: false
+hammerspace_apply_az_labels: false
+hammerspace_default_az: "AZ1"
+
+# Example: Set node name with AZ prefix
+# hammerspace_node_name: "AZ1:tier0-node-01"
+
+# ============================================================================
+# Volume Groups (from Hammerspace Engineering)
+# ============================================================================
+# Create volume groups for organizing volumes by AZ or location
+
+hammerspace_create_volume_groups: false
+# hammerspace_volume_groups:
+#   - name: "tier0-az1-volumes"
+#     location_pattern: "AZ1:*"
+#   - name: "tier0-az2-volumes"
+#     location_pattern: "AZ2:*"
+
+# ============================================================================
+# Share Objectives (from Hammerspace Engineering)
+# ============================================================================
+# Apply availability/durability objectives to shares
+# Available objectives: availability-3-nines, availability-4-nines,
+#                      performance-high, durability-high
+
+hammerspace_apply_share_objectives: false
+# hammerspace_share_objectives:
+#   - share_name: "checkpoints"
+#     objective: "availability-3-nines"
+#     applicability: "TRUE"
+
+# ============================================================================
+# S3/Object Storage Integration (from Hammerspace Engineering)
+# ============================================================================
+# Add S3 storage nodes and object storage volumes to Hammerspace
+
+hammerspace_add_s3_nodes: false
+hammerspace_add_object_volumes: false
+hammerspace_create_s3_server: false
+hammerspace_create_s3_users: false
+
+# S3 node configuration (AWS S3 or S3-compatible)
+# hammerspace_s3_nodes:
+#   - name: "aws-archive"
+#     region: "us-west-2"
+#     access_key_id: "{{ vault_s3_access_key }}"
+#     secret_access_key: "{{ vault_s3_secret_key }}"
+#     # Optional settings:
+#     # endpoint: "s3.us-west-2.amazonaws.com"  # For non-AWS S3
+#     # signing_type: "S3_V4_SIGNING"
+
+# Object storage volumes (S3 buckets)
+# hammerspace_object_volumes:
+#   - name: "archive-vol"
+#     node_name: "aws-archive"
+#     bucket_name: "my-archive-bucket"
+#     prefix: "hammerspace/"
+#     shared: true
+#     compression: "NO_COMPRESSION"
+
+# S3 server for S3 protocol access (optional)
+# hammerspace_s3_server:
+#   name: "internal-s3"
+#   port: 9000
+#   tls_enabled: false
+#   enabled: true
+
+# S3 users for S3 server (optional)
+# hammerspace_s3_users:
+#   - name: "app-user"
+#     access_key_id: "{{ vault_app_s3_key }}"
+#     secret_access_key: "{{ vault_app_s3_secret }}"
+#     enabled: true
+
+# ============================================================================
+# Cluster Configuration (from Hammerspace Engineering)
+# ============================================================================
+# Configure DNS, Active Directory, site name, location, and monitoring
+
+hammerspace_update_dns: false
+hammerspace_join_ad: false
+hammerspace_update_site_name: false
+hammerspace_set_location: false
+hammerspace_enable_prometheus: false
+
+# DNS configuration
+# hammerspace_dns_config:
+#   primary_server: "10.0.0.53"
+#   secondary_server: "10.0.0.54"
+#   search_domains:
+#     - "example.com"
+#     - "corp.example.com"
+
+# Active Directory configuration
+# hammerspace_ad_config:
+#   domain: "corp.example.com"
+#   username: "{{ vault_ad_username }}"
+#   password: "{{ vault_ad_password }}"
+#   ou: "OU=Servers,DC=corp,DC=example,DC=com"
+
+# Site name configuration
+# hammerspace_site_config:
+#   name: "datacenter-east"
+
+# Physical location configuration
+# hammerspace_location_config:
+#   datacenter: "DC-EAST"
+#   room: "Server Room A"
+#   row: "R1"
+#   rack: "Rack-01"
+#   position: "U1"
+
+# Prometheus monitoring configuration
+# hammerspace_prometheus_config:
+#   port: 9100
+
+# ============================================================================
+# NFS Configuration (Hammerspace Tier 0 Specific)
+# ============================================================================
+
+# NFS server thread count - Hammerspace recommends 128 threads
+nfs_threads: 128
+
+# NFS version settings per Hammerspace recommendations
+nfs_vers3: "y"
+nfs_vers4_0: "n"
+nfs_vers4_1: "n"
+nfs_vers4_2: "y"
+
+# RDMA settings (enable if using RDMA-capable NICs)
+nfs_rdma_enabled: "y"
+nfs_rdma_port: 20049
+
+# Hammerspace Anvil/DSX node IPs (require no_root_squash)
+# These are your Hammerspace management nodes
+hammerspace_nodes:
+  - "10.0.10.15"  # Anvil cluster management IP
+  # Add additional Hammerspace node IPs as needed
+
+# Mover/DI node IPs - these need no_root_squash access
+# Include IPs for:
+#   - DSX nodes (if used - they include mover functionality)
+#   - Standalone Linux servers running DI RPM or container
+mover_nodes:
+  - "10.0.12.242"  # Example: DSX node or standalone DI server
+
+# Client subnets (use root_squash for security)
+client_subnets:
+  - "0.0.0.0/0"
+
+# Hammerspace recommended export options
+# For Hammerspace nodes: rw,no_root_squash,sync,secure,mp,no_subtree_check
+# For clients: rw,root_squash,sync,secure,mp,no_subtree_check
+hammerspace_export_opts: "rw,no_root_squash,sync,secure,mp,no_subtree_check"
+client_export_opts: "rw,root_squash,sync,secure,mp,no_subtree_check"
+
+# NFS exports configuration
+# When use_dynamic_discovery: true, exports are auto-generated for all discovered mount points
+# using hammerspace_nodes, mover_nodes, and client_subnets defined above
+
+# Manual NFS exports (used when use_dynamic_discovery: false):
+# nfs_exports:
+#   - path: /hammerspace/hsvol0
+#     clients:
+#       - host: "10.1.2.3"
+#         options: "rw,sync,no_subtree_check,no_root_squash,secure,mp"
+#       - host: "10.200.104.0/24"
+#         options: "rw,sync,no_subtree_check,root_squash,secure,mp"
+
+# ============================================================================
+# Firewall Configuration
+# ============================================================================
+
+# Ports to open for NFS
+# Standard ports - may need adjustment based on /etc/nfs.conf
+nfs_ports:
+  - port: 111
+    proto: tcp
+    service: portmapper
+  - port: 111
+    proto: udp
+    service: portmapper
+  - port: 2049
+    proto: tcp
+    service: nfs
+  - port: 2049
+    proto: udp
+    service: nfs
+  - port: 20048
+    proto: tcp
+    service: mountd
+  - port: 20048
+    proto: udp
+    service: mountd
+  - port: 20049
+    proto: tcp
+    service: nfs-rdma
+
+# For RHEL/Rocky/CentOS - use firewalld services instead of ports
+firewalld_services:
+  - nfs
+  - rpc-bind
+  - mountd
+
+# ============================================================================
+# Mount Point Protection (systemd guards)
+# ============================================================================
+# Protects mount points from accidental unmounting using systemd guard services
+# Based on Hammerspace "Protecting Linux Mount Points with systemd" guide
+
+# Enable mount point protection (guard services + auto-remount watchdog)
+hammerspace_mount_protection: true
+
+# Guard service keeps a process with cwd on mount point to prevent unmount
+hammerspace_mount_guard_enabled: true
+
+# Auto-remount watchdog checks and remounts if accidentally unmounted
+hammerspace_remount_watchdog_enabled: true
+
+# Watchdog check interval (how often to verify mounts)
+hammerspace_remount_watchdog_interval: "1min"
+
+# systemd automount timeout for device availability
+hammerspace_automount_timeout: 10
+
+# ============================================================================
+# Safety Settings
+# ============================================================================
+# Flush iptables on first connection to prevent connectivity issues
+# This clears any existing REJECT rules that might block NFS traffic
+flush_iptables: true
+
+# Set to true to skip confirmation prompts (use with caution!)
+skip_confirmation: false
+
+# Set to true to force recreation of existing arrays (DESTRUCTIVE!)
+force_raid_recreate: false
+
+# Set to true to force filesystem recreation (DESTRUCTIVE!)
+force_fs_recreate: false
+
+# ============================================================================
+# Pre-Setup Validation Settings (Health Checks)
+# ============================================================================
+# These checks run before any configuration to validate the environment
+# per Hammerspace Tier 0 Deployment Guide recommendations
+
+# --- NVMe Drive Count ---
+# Expected number of NVMe drives (including boot drive)
+# Set to 0 or comment out to skip this check
+# Example: 8 data drives + 1 boot drive = 9
+# expected_nvme_count: 9
+
+# Set to true to fail playbook if drive count doesn't match
+enforce_drive_count: false
+
+# --- Drive Status ---
+# Set to true to fail if non-boot NVMe drives are already mounted/in RAID/LVM
+# Set to false when re-running after RAID is already created
+fail_on_drives_in_use: false
+
+# --- NUMA Balance ---
+# Warn if NUMA nodes have different numbers of NVMe drives
+# Imbalanced NUMA can impact performance
+warn_on_numa_imbalance: true
+
+# --- 4K Sector Size (Hammerspace Recommendation) ---
+# Per Tier 0 Guide Page 14, 4096-byte sectors are recommended
+expected_sector_size: 4096
+
+# Set to true to fail if drives don't have 4K sector size
+require_4k_sectors: false
+
+# Set to true to format drives to 4K (DESTRUCTIVE - erases all data!)
+format_nvme_to_4k: false
+
+# Safety confirmation - must match exactly to allow formatting
+# Uncomment and set this to enable NVMe formatting:
+# nvme_format_confirm: "YES_I_UNDERSTAND_THIS_IS_DESTRUCTIVE"
+
+# --- MTU/Jumbo Frames ---
+# Hammerspace recommends MTU 1500-9000, switches should be 9216
+expected_mtu: 9000
+
+# Ping size for MTU test (MTU - 28 bytes for ICMP overhead)
+mtu_ping_size: 8972
+
+# Set to true to fail playbook if MTU tests fail
+enforce_mtu_test: false
+
+# --- Network Test Targets ---
+# IPs to test jumbo frame connectivity (should include all cluster nodes)
+network_test_targets:
+  - "10.0.2.222"  # Anvil management IP
+  # Add other Tier 0/LSS nodes to test cross-node connectivity:
+  # - "10.200.100.101"  # tier0-node-01
+  # - "10.200.100.102"  # tier0-node-02
+
+# --- iperf Bandwidth Test (Optional) ---
+# Test network bandwidth between Tier 0 instances and Hammerspace nodes
+iperf_test_enabled: false
+
+# iperf version: "iperf3" (recommended) or "iperf" (legacy)
+# iperf3: Uses JSON output, port 5201, more accurate for high-speed networks
+# iperf:  Uses text output, port 5001, legacy support
+iperf_version: "iperf3"
+
+# iperf server targets (IP addresses with iperf server running)
+# Start server on target:
+#   iperf3: iperf3 -s -D  (port 5201)
+#   iperf:  iperf -s -D   (port 5001)
+iperf_test_targets: []
+  # - "10.0.13.213"  # Anvil node with iperf server
+  # - "10.0.0.93"    # DSX/Mover node with iperf server
+
+# iperf test duration in seconds
+iperf_test_duration: 10
+
+# iperf test parallel streams (use 64 for 200Gbps networks)
+iperf_test_parallel: 64
+
+# Minimum expected bandwidth in Mbits/sec (warn if below this)
+# 50Gbps = 50000 Mbits/sec, set minimum to 40000 (80% threshold)
+iperf_min_bandwidth_mbps: 40000
+
+# Fail playbook if bandwidth is below minimum
+iperf_enforce_bandwidth: false
+
+# --- Package Requirements ---
+# Set to true to fail if required packages (mdadm, xfs, nvme-cli) are missing
+fail_on_missing_packages: true

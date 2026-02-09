@@ -1,0 +1,73 @@
+---
+# Add Amazon S3 Storage System Node
+# Called from main.yml with s3_node_config variable
+# Reference: hs_ops add_object_storage_system_amazon_s3.yml
+
+- name: "Wait for task queue before adding S3 node {{ s3_node_config.name }}"
+  ansible.builtin.include_tasks: ../task_queue_wait.yml
+  when: hammerspace_task_queue_throttle | default(true)
+
+- name: "Build S3 node payload for {{ s3_node_config.name }}"
+  ansible.builtin.set_fact:
+    s3_node_payload:
+      _type: "NODE"
+      name: "{{ s3_node_config.name }}"
+      nodeType: "AMAZON_S3"
+      mgmtNodeCredentials:
+        username: "{{ s3_node_config.access_key_id }}"
+        password: "{{ s3_node_config.secret_access_key }}"
+        cert: ""
+      endpoint: "{{ s3_node_config.endpoint | default(omit) }}"
+      trustCertificate: "false"
+      useVirtualHostNaming: "{{ s3_node_config.virtual_host_naming | default('false') }}"
+      s3SigningType: "{{ s3_node_config.signing_type | default('S3_V4_SIGNING') }}"
+      proxyInfo: "{{ s3_node_config.proxy | default(omit) }}"
+
+- name: "Check if S3 node {{ s3_node_config.name }} already exists"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/nodes/{{ s3_node_config.name | urlencode }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: [200, 404]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 60
+  register: s3_node_check
+  failed_when: false
+
+- name: "Add S3 node {{ s3_node_config.name }}"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/nodes"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: POST
+    body: "{{ s3_node_payload }}"
+    body_format: json
+    force_basic_auth: true
+    status_code: 202
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 180
+  register: s3_node_add_result
+  when: s3_node_check.status == 404
+
+- name: "Wait for S3 node add to complete"
+  ansible.builtin.uri:
+    url: "{{ s3_node_add_result.location }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: 200
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+  register: s3_node_add_status
+  until: s3_node_add_status.json.status == "COMPLETED"
+  retries: 30
+  delay: 10
+  when: s3_node_add_result.location is defined
+
+- name: "Display S3 node {{ s3_node_config.name }} status"
+  ansible.builtin.debug:
+    msg: >-
+      S3 Node '{{ s3_node_config.name }}'
+      {% if s3_node_check.status == 200 %}already exists{% else %}added successfully{% endif %}

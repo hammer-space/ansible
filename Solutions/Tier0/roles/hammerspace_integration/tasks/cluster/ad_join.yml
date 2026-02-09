@@ -1,0 +1,72 @@
+---
+# Join Active Directory Domain
+# Called from main.yml with ad_config variable
+# Reference: hs_ops ad_join.yml
+
+- name: "Get current AD configuration"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/ad"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: [200, 404]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 60
+  register: current_ad
+  failed_when: false
+  retries: 20
+  delay: 5
+  until: current_ad.status in [200, 404]
+
+- name: "Build AD join payload"
+  ansible.builtin.set_fact:
+    ad_payload:
+      domain: "{{ ad_config.domain }}"
+      username: "{{ ad_config.username }}"
+      password: "{{ ad_config.password }}"
+      organizationalUnit: "{{ ad_config.ou | default('') }}"
+      enabled: true
+
+- name: "Check if already joined to AD"
+  ansible.builtin.set_fact:
+    ad_already_joined: "{{ current_ad.json[0].joined | default(false) if current_ad.json is defined and current_ad.json | length > 0 else false }}"
+
+- name: "Join Active Directory domain {{ ad_config.domain }}"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/ad/{{ current_ad.json[0].uoid.uuid }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: PUT
+    body: "{{ current_ad.json[0] | combine(ad_payload, recursive=True) }}"
+    body_format: json
+    force_basic_auth: true
+    status_code: [200, 202]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 300
+  register: ad_join_result
+  when:
+    - not ad_already_joined
+    - current_ad.json is defined
+    - current_ad.json | length > 0
+
+- name: "Wait for AD join to complete"
+  ansible.builtin.uri:
+    url: "{{ ad_join_result.location }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: 200
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+  register: ad_join_status
+  until: ad_join_status.json.status == "COMPLETED"
+  retries: 60
+  delay: 10
+  when: ad_join_result.location is defined
+
+- name: "Display AD join status"
+  ansible.builtin.debug:
+    msg: >-
+      Active Directory:
+      {% if ad_already_joined %}already joined to {{ ad_config.domain }}{% else %}joined to {{ ad_config.domain }}{% endif %}

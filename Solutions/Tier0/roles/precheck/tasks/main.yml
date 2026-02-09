@@ -1,0 +1,548 @@
+---
+# Pre-setup validation role - validates environment per Hammerspace Tier 0 requirements
+# Based on Hammerspace Tier 0 Deployment Guide v1.0
+
+# ============================================================================
+# Initialize variables for --check mode compatibility
+# ============================================================================
+
+- name: Initialize precheck variables
+  ansible.builtin.set_fact:
+    nvme_count: 0
+    nvme_in_use: []
+    numa_device_counts: {}
+    nvme_sector_info: []
+    drives_needing_4k_format: []
+    mtu_results: []
+    missing_packages: []
+
+# ============================================================================
+# NVMe Drive Count Validation
+# ============================================================================
+
+- name: Count total NVMe namespaces
+  ansible.builtin.shell: |
+    ls -1 /dev/nvme*n1 2>/dev/null | wc -l
+  register: nvme_count_raw
+  changed_when: false
+
+- name: Set NVMe count fact
+  ansible.builtin.set_fact:
+    nvme_count: "{{ nvme_count_raw.stdout | int }}"
+
+- name: Validate expected NVMe drive count
+  ansible.builtin.assert:
+    that:
+      - nvme_count | int >= expected_nvme_count | int
+    fail_msg: |
+      FAILED: Expected {{ expected_nvme_count }} NVMe drives but found {{ nvme_count }}.
+      Check hardware or update expected_nvme_count in vars/main.yml.
+    success_msg: "NVMe drive count OK: {{ nvme_count }} drives found (expected: {{ expected_nvme_count }})"
+  when:
+    - expected_nvme_count is defined
+    - expected_nvme_count | int > 0
+    - enforce_drive_count | default(false)
+
+- name: Warn if drive count doesn't match expected
+  ansible.builtin.debug:
+    msg: |
+      WARNING: Expected {{ expected_nvme_count }} NVMe drives but found {{ nvme_count }}.
+      Set enforce_drive_count: true to fail on mismatch.
+  when:
+    - expected_nvme_count is defined
+    - expected_nvme_count | int > 0
+    - nvme_count | int != expected_nvme_count | int
+    - not (enforce_drive_count | default(false))
+
+# ============================================================================
+# Drive Mount Status Check (ensure drives are not already in use)
+# ============================================================================
+
+- name: Get list of currently mounted devices
+  ansible.builtin.shell: |
+    mount | grep -E '^/dev/nvme' | awk '{print $1}' | sed 's/p[0-9]*$//' | sort -u
+  register: mounted_nvme_raw
+  changed_when: false
+  failed_when: false
+
+- name: Get list of NVMe devices in use by mdadm
+  ansible.builtin.shell: |
+    cat /proc/mdstat 2>/dev/null | grep -oE 'nvme[0-9]+n[0-9]+' | sed 's/^/\/dev\//' | sort -u
+  register: mdadm_nvme_raw
+  changed_when: false
+  failed_when: false
+
+- name: Get list of NVMe devices with LVM
+  ansible.builtin.shell: |
+    pvs --noheadings -o pv_name 2>/dev/null | grep nvme | awk '{print $1}' | sed 's/p[0-9]*$//' | sort -u
+  register: lvm_nvme_raw
+  changed_when: false
+  failed_when: false
+
+- name: Combine all in-use NVMe devices
+  ansible.builtin.set_fact:
+    nvme_in_use: "{{ (mounted_nvme_raw.stdout_lines | default([])) + (mdadm_nvme_raw.stdout_lines | default([])) + (lvm_nvme_raw.stdout_lines | default([])) | unique }}"
+
+- name: Identify boot device for exclusion
+  ansible.builtin.shell: |
+    lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1
+  register: boot_device_check
+  changed_when: false
+
+- name: Set boot device for comparison
+  ansible.builtin.set_fact:
+    boot_nvme_device: "/dev/{{ boot_device_check.stdout | trim }}n1"
+  when: boot_device_check.stdout | trim is match('^nvme')
+
+- name: Filter out boot device from in-use list
+  ansible.builtin.set_fact:
+    nvme_in_use_non_boot: "{{ nvme_in_use | reject('search', boot_device_check.stdout | trim) | list }}"
+
+- name: Display NVMe devices currently in use
+  ansible.builtin.debug:
+    msg: |
+      NVMe devices currently in use (excluding boot):
+      {% if nvme_in_use_non_boot | length > 0 %}
+      {% for dev in nvme_in_use_non_boot %}
+        - {{ dev }}
+      {% endfor %}
+      {% else %}
+        None - all NVMe devices are available for configuration
+      {% endif %}
+
+- name: Fail if NVMe drives are already in use
+  ansible.builtin.fail:
+    msg: |
+      ERROR: The following NVMe devices are already in use:
+      {{ nvme_in_use_non_boot | join(', ') }}
+
+      These drives must be unmounted/removed from RAID/LVM before proceeding.
+      Set force_raid_recreate: true and force_fs_recreate: true to override (DESTRUCTIVE!).
+  when:
+    - nvme_in_use_non_boot | length > 0
+    - not (force_raid_recreate | default(false))
+    - fail_on_drives_in_use | default(true)
+
+# ============================================================================
+# NUMA Node Balance Check
+# ============================================================================
+
+- name: Gather NUMA node information for NVMe devices
+  ansible.builtin.shell: |
+    for dev in /dev/nvme*n1; do
+      if [ -b "$dev" ]; then
+        name=$(basename "$dev" | sed 's/n1$//')
+        numa=$(cat /sys/class/nvme/$name/device/numa_node 2>/dev/null || echo "-1")
+        echo "$name:$numa"
+      fi
+    done
+  register: numa_info_raw
+  changed_when: false
+
+- name: Build NUMA device count
+  ansible.builtin.set_fact:
+    numa_device_counts: {}
+
+- name: Count devices per NUMA node (excluding boot)
+  ansible.builtin.set_fact:
+    numa_device_counts: >-
+      {{
+        numa_device_counts | combine({
+          item.split(':')[1]: (numa_device_counts[item.split(':')[1]] | default(0) | int) + 1
+        })
+      }}
+  loop: "{{ numa_info_raw.stdout_lines }}"
+  when:
+    - item | length > 0
+    - item.split(':')[0] != (boot_device_check.stdout | trim)
+
+- name: Display NUMA balance status
+  ansible.builtin.debug:
+    msg: |
+      NUMA Node Balance:
+      {% for numa, count in numa_device_counts.items() %}
+        NUMA {{ numa }}: {{ count }} drives
+      {% endfor %}
+
+      {% set counts = numa_device_counts.values() | list %}
+      {% if counts | length > 1 and counts | max != counts | min %}
+      WARNING: NUMA nodes are imbalanced!
+      Max: {{ counts | max }} drives, Min: {{ counts | min }} drives
+      This may impact performance. Consider balancing drives across NUMA nodes.
+      {% else %}
+      NUMA balance: OK ({{ counts | first | default(0) }} drives per node)
+      {% endif %}
+
+- name: Warn on NUMA imbalance
+  ansible.builtin.debug:
+    msg: |
+      WARNING: NUMA node imbalance detected!
+      For optimal performance, each NUMA node should have the same number of NVMe drives.
+      Current distribution: {{ numa_device_counts }}
+  when:
+    - numa_device_counts | length > 1
+    - (numa_device_counts.values() | list | max) != (numa_device_counts.values() | list | min)
+    - warn_on_numa_imbalance | default(true)
+
+# ============================================================================
+# 4K Sector Size Validation (Hammerspace recommends 4096 bytes)
+# ============================================================================
+
+- name: Check NVMe sector sizes (physical and logical)
+  ansible.builtin.shell: |
+    for dev in /dev/nvme*n1; do
+      if [ -b "$dev" ]; then
+        name=$(basename "$dev")
+        logical=$(cat /sys/block/$name/queue/logical_block_size 2>/dev/null || echo "unknown")
+        physical=$(cat /sys/block/$name/queue/physical_block_size 2>/dev/null || echo "unknown")
+        echo "$dev:$logical:$physical"
+      fi
+    done
+  register: sector_size_raw
+  changed_when: false
+
+- name: Parse sector size information
+  ansible.builtin.set_fact:
+    nvme_sector_info: >-
+      {{
+        nvme_sector_info | default([]) + [{
+          'device': item.split(':')[0],
+          'logical_block_size': item.split(':')[1] | int,
+          'physical_block_size': item.split(':')[2] | int
+        }]
+      }}
+  loop: "{{ sector_size_raw.stdout_lines }}"
+  when: item | length > 0
+
+- name: Identify drives not using recommended 4K sector size
+  ansible.builtin.set_fact:
+    drives_needing_4k_format: "{{ nvme_sector_info | selectattr('logical_block_size', 'ne', expected_sector_size | default(4096)) | list }}"
+
+- name: Display NVMe sector sizes
+  ansible.builtin.debug:
+    msg: |
+      NVMe Sector Size Check (Hammerspace recommends {{ expected_sector_size | default(4096) }} bytes):
+      ============================================
+      {% for drive in nvme_sector_info | default([]) %}
+      {{ drive.device }}:
+        Logical block size: {{ drive.logical_block_size }} bytes {% if drive.logical_block_size != (expected_sector_size | default(4096)) %}[NOT OPTIMAL]{% else %}[OK]{% endif %}
+        Physical block size: {{ drive.physical_block_size }} bytes
+      {% endfor %}
+      ============================================
+      {% if drives_needing_4k_format | length > 0 %}
+
+      WARNING: {{ drives_needing_4k_format | length }} drive(s) not using {{ expected_sector_size | default(4096) }}-byte sectors:
+      {% for drive in drives_needing_4k_format %}
+        - {{ drive.device }} (currently {{ drive.logical_block_size }} bytes)
+      {% endfor %}
+
+      To format drives to 4K sectors, set:
+        format_nvme_to_4k: true
+        nvme_format_confirm: "YES_I_UNDERSTAND_THIS_IS_DESTRUCTIVE"
+      {% else %}
+      All drives using recommended {{ expected_sector_size | default(4096) }}-byte sector size.
+      {% endif %}
+
+- name: Fail if 4K sector size is required but not present
+  ansible.builtin.fail:
+    msg: |
+      ERROR: Drives not using {{ expected_sector_size | default(4096) }}-byte sector size:
+      {{ drives_needing_4k_format | map(attribute='device') | join(', ') }}
+
+      Set require_4k_sectors: false to allow 512-byte sectors, or
+      Set format_nvme_to_4k: true with nvme_format_confirm to format drives.
+  when:
+    - drives_needing_4k_format | length > 0
+    - require_4k_sectors | default(false)
+    - boot_nvme_device is not defined or (drives_needing_4k_format | map(attribute='device') | reject('equalto', boot_nvme_device) | list | length > 0)
+
+# ============================================================================
+# Optional: NVMe 4K Format (DESTRUCTIVE - requires explicit confirmation)
+# ============================================================================
+
+- name: Format NVMe drives to 4K sector size
+  when:
+    - format_nvme_to_4k | default(false)
+    - nvme_format_confirm | default('') == "YES_I_UNDERSTAND_THIS_IS_DESTRUCTIVE"
+    - drives_needing_4k_format | length > 0
+  block:
+    - name: Confirm NVMe format operation
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          WARNING: DESTRUCTIVE OPERATION
+          ============================================
+          About to format the following drives to {{ expected_sector_size | default(4096) }}-byte sectors:
+          {% for drive in drives_needing_4k_format %}
+            - {{ drive.device }}
+          {% endfor %}
+
+          ALL DATA ON THESE DRIVES WILL BE LOST!
+          ============================================
+
+    - name: Get NVMe namespace ID for formatting
+      ansible.builtin.shell: |
+        nvme id-ns {{ item.device }} -o json 2>/dev/null | grep -o '"nsid":[0-9]*' | cut -d: -f2 || echo "1"
+      register: nvme_nsid
+      loop: "{{ drives_needing_4k_format }}"
+      loop_control:
+        label: "{{ item.device }}"
+      when: item.device != (boot_nvme_device | default(''))
+      changed_when: false
+
+    - name: Check supported LBA formats
+      ansible.builtin.shell: |
+        nvme id-ns {{ item.device }} -o json 2>/dev/null | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        for i, lba in enumerate(data.get('lbafs', [])):
+            ds = lba.get('ds', 0)
+            size = 2**ds if ds > 0 else 0
+            print(f'{i}:{size}')
+        " 2>/dev/null || echo "0:512"
+      register: nvme_lba_formats
+      loop: "{{ drives_needing_4k_format }}"
+      loop_control:
+        label: "{{ item.device }}"
+      when: item.device != (boot_nvme_device | default(''))
+      changed_when: false
+
+    - name: Format NVMe drives to 4K (lbaf with 4096 bytes)
+      ansible.builtin.shell: |
+        # Find the LBA format index for 4096 bytes
+        lbaf_index=$(nvme id-ns {{ item.item.device }} -o json 2>/dev/null | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        for i, lba in enumerate(data.get('lbafs', [])):
+            ds = lba.get('ds', 0)
+            size = 2**ds if ds > 0 else 0
+            if size == {{ expected_sector_size | default(4096) }}:
+                print(i)
+                sys.exit(0)
+        print('-1')
+        " 2>/dev/null)
+
+        if [ "$lbaf_index" = "-1" ]; then
+          echo "ERROR: Drive does not support {{ expected_sector_size | default(4096) }}-byte sectors"
+          exit 1
+        fi
+
+        # Format the drive
+        nvme format {{ item.item.device | regex_replace('n[0-9]+$', '') }} -l $lbaf_index -n 1
+      register: nvme_format_result
+      loop: "{{ nvme_lba_formats.results }}"
+      loop_control:
+        label: "{{ item.item.device }}"
+      when:
+        - item.item.device != (boot_nvme_device | default(''))
+        - item.stdout is defined
+        - (":" ~ (expected_sector_size | default(4096) | string)) in item.stdout
+      changed_when: nvme_format_result.rc == 0
+
+    - name: Display format results
+      ansible.builtin.debug:
+        msg: |
+          NVMe format results:
+          {% for result in nvme_format_result.results | default([]) %}
+          {% if result.changed | default(false) %}
+          {{ result.item.item.device }}: Formatted to {{ expected_sector_size | default(4096) }}-byte sectors
+          {% elif result.skipped | default(false) %}
+          {{ result.item.item.device }}: Skipped (4K not supported or boot device)
+          {% endif %}
+          {% endfor %}
+
+# ============================================================================
+# MTU / Jumbo Frame Validation
+# ============================================================================
+
+- name: Check MTU settings on network interfaces
+  ansible.builtin.shell: |
+    ip link show | grep -E "^[0-9]+:" | while read line; do
+      iface=$(echo "$line" | awk -F: '{print $2}' | tr -d ' ')
+      mtu=$(echo "$line" | grep -oE 'mtu [0-9]+' | awk '{print $2}')
+      state=$(echo "$line" | grep -oE 'state [A-Z]+' | awk '{print $2}')
+      if [ -n "$mtu" ] && [ "$state" = "UP" ]; then
+        echo "$iface:$mtu:$state"
+      fi
+    done
+  register: mtu_settings
+  changed_when: false
+
+- name: Display MTU settings
+  ansible.builtin.debug:
+    msg: |
+      Network Interface MTU Settings:
+      ============================================
+      {% for line in mtu_settings.stdout_lines %}
+      {% set parts = line.split(':') %}
+      {{ parts[0] }}: MTU {{ parts[1] }} ({{ parts[2] }}) {% if parts[1] | int < (expected_mtu | default(9000)) %}[BELOW RECOMMENDED]{% else %}[OK]{% endif %}
+      {% endfor %}
+      ============================================
+      Hammerspace recommends MTU {{ expected_mtu | default(9000) }} for nodes, 9216 for switches
+
+- name: Test jumbo frame connectivity to test targets
+  ansible.builtin.command: "ping -M do -s {{ mtu_ping_size | default(8972) }} -c 3 -W 2 {{ item }}"
+  loop: "{{ network_test_targets | default([]) }}"
+  register: ping_results
+  changed_when: false
+  failed_when: false
+  when: network_test_targets is defined and network_test_targets | length > 0
+
+- name: Display jumbo frame test results
+  ansible.builtin.debug:
+    msg: |
+      Jumbo Frame Connectivity Tests (MTU {{ expected_mtu | default(9000) }}):
+      ============================================
+      {% for item in ping_results.results | default([]) %}
+      {{ item.item }}: {% if item.rc == 0 %}PASS{% else %}FAIL - Check MTU configuration{% endif %}
+      {% endfor %}
+      {% if ping_results.results | default([]) | selectattr('rc', 'ne', 0) | list | length > 0 %}
+
+      WARNING: Some jumbo frame tests failed. Ensure:
+        - All network switches have MTU 9216 or higher
+        - All interfaces in the path support jumbo frames
+        - No firewall is blocking ICMP
+      {% endif %}
+      ============================================
+  when: ping_results.results is defined
+
+- name: Fail if MTU test fails and enforced
+  ansible.builtin.fail:
+    msg: |
+      ERROR: Jumbo frame test failed to: {{ ping_results.results | selectattr('rc', 'ne', 0) | map(attribute='item') | join(', ') }}
+
+      Set enforce_mtu_test: false to continue despite MTU issues.
+  when:
+    - ping_results.results is defined
+    - ping_results.results | selectattr('rc', 'ne', 0) | list | length > 0
+    - enforce_mtu_test | default(false)
+
+# ============================================================================
+# Package Installation
+# ============================================================================
+
+- name: Define required packages (Debian/Ubuntu)
+  ansible.builtin.set_fact:
+    required_packages:
+      - mdadm
+      - xfsprogs
+      - parted
+      - nfs-kernel-server
+      - nvme-cli
+  when: ansible_os_family == "Debian"
+
+- name: Define required packages (RedHat/Rocky/CentOS)
+  ansible.builtin.set_fact:
+    required_packages:
+      - mdadm
+      - xfsprogs
+      - parted
+      - nfs-utils
+      - nvme-cli
+  when: ansible_os_family == "RedHat"
+
+- name: Install required packages (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: "{{ required_packages }}"
+    state: present
+    update_cache: true
+  when: ansible_os_family == "Debian"
+
+- name: Install required packages (RedHat/Rocky/CentOS)
+  ansible.builtin.dnf:
+    name: "{{ required_packages }}"
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Verify required commands are available
+  ansible.builtin.command: "which {{ item }}"
+  loop:
+    - mdadm
+    - mkfs.xfs
+    - parted
+    - exportfs
+    - nvme
+  register: package_check
+  changed_when: false
+  failed_when: false
+
+- name: Report package status
+  ansible.builtin.debug:
+    msg: |
+      Package availability:
+      {% for item in package_check.results %}
+      {{ item.item }}: {% if item.rc == 0 %}OK{% else %}MISSING{% endif %}
+      {% endfor %}
+
+# ============================================================================
+# Existing Configuration Checks
+# ============================================================================
+
+- name: Check for existing mdadm configuration
+  ansible.builtin.stat:
+    path: /etc/mdadm/mdadm.conf
+  register: mdadm_conf
+
+- name: Display existing mdadm configuration status
+  ansible.builtin.debug:
+    msg: "Existing mdadm.conf found at /etc/mdadm/mdadm.conf - will be updated"
+  when: mdadm_conf.stat.exists
+
+- name: Check current NFS exports
+  ansible.builtin.command: exportfs -v
+  register: current_exports
+  changed_when: false
+  failed_when: false
+
+- name: Display current NFS exports
+  ansible.builtin.debug:
+    msg: |
+      Current NFS exports:
+      {{ current_exports.stdout | default('None configured') }}
+  when: current_exports.rc == 0
+
+# ============================================================================
+# Validation Summary
+# ============================================================================
+
+# ============================================================================
+# Optional: iperf Bandwidth Test
+# ============================================================================
+
+- name: Include iperf bandwidth test
+  ansible.builtin.include_tasks: iperf_test.yml
+  when:
+    - iperf_test_enabled | default(false)
+    - iperf_test_targets | default([]) | length > 0
+
+- name: Validation summary
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+      PRE-SETUP VALIDATION SUMMARY
+      ============================================
+      NVMe Drives:
+        - Total found: {{ nvme_count }}
+        - Expected: {{ expected_nvme_count | default('not specified') }}
+        - In use (non-boot): {{ nvme_in_use_non_boot | length }}
+        - Boot device: {{ boot_device_check.stdout | trim | default('unknown') }}
+
+      NUMA Balance:
+        {% for numa, count in numa_device_counts.items() %}
+        - NUMA {{ numa }}: {{ count }} drives
+        {% endfor %}
+        - Status: {% if numa_device_counts | length <= 1 or (numa_device_counts.values() | list | max) == (numa_device_counts.values() | list | min) %}BALANCED{% else %}IMBALANCED{% endif %}
+
+      Sector Size:
+        - Expected: {{ expected_sector_size | default(4096) }} bytes
+        - Drives needing format: {{ drives_needing_4k_format | length }}
+
+      Network:
+        - MTU tests: {% if ping_results.results is defined %}{{ ping_results.results | selectattr('rc', 'equalto', 0) | list | length }}/{{ ping_results.results | length }} passed{% else %}not configured{% endif %}
+
+      Packages:
+        - Missing: {{ package_check.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list | join(', ') | default('none') }}
+      ============================================
+
+      Review the output above for any warnings before proceeding.
+      ============================================

@@ -1,0 +1,268 @@
+---
+# Hammerspace Integration Role - Register node, volumes, and shares via API
+# Extended with engineering team features
+# Based on https://github.com/hammer-space/ansible
+
+- name: Validate Hammerspace API configuration
+  ansible.builtin.assert:
+    that:
+      - hammerspace_api_host is defined
+      - hammerspace_api_user is defined
+      - hammerspace_api_password is defined
+    fail_msg: "Hammerspace API configuration missing. Set hammerspace_api_host, hammerspace_api_user, hammerspace_api_password"
+
+- name: Set API base URL
+  ansible.builtin.set_fact:
+    hs_api_url: "https://{{ hammerspace_api_host }}:8443/mgmt/v1.2/rest"
+
+# =============================================================================
+# Cluster Configuration (Optional - run first)
+# =============================================================================
+
+- name: Update DNS configuration
+  ansible.builtin.include_tasks: cluster/dns_update.yml
+  vars:
+    dns_config: "{{ hammerspace_dns_config }}"
+  when:
+    - hammerspace_update_dns | default(false)
+    - hammerspace_dns_config is defined
+
+- name: Join Active Directory
+  ansible.builtin.include_tasks: cluster/ad_join.yml
+  vars:
+    ad_config: "{{ hammerspace_ad_config }}"
+  when:
+    - hammerspace_join_ad | default(false)
+    - hammerspace_ad_config is defined
+
+- name: Update site name
+  ansible.builtin.include_tasks: cluster/change_site_name.yml
+  vars:
+    site_config: "{{ hammerspace_site_config }}"
+  when:
+    - hammerspace_update_site_name | default(false)
+    - hammerspace_site_config is defined
+
+- name: Set cluster location
+  ansible.builtin.include_tasks: cluster/set_location.yml
+  vars:
+    location_config: "{{ hammerspace_location_config }}"
+  when:
+    - hammerspace_set_location | default(false)
+    - hammerspace_location_config is defined
+
+- name: Enable Prometheus exporters
+  ansible.builtin.include_tasks: cluster/prometheus_enable.yml
+  vars:
+    prometheus_config: "{{ hammerspace_prometheus_config | default({}) }}"
+  when: hammerspace_enable_prometheus | default(false)
+
+# =============================================================================
+# S3/Object Storage Integration (Optional)
+# =============================================================================
+
+- name: Add S3 storage nodes
+  ansible.builtin.include_tasks: s3/add_s3_node.yml
+  loop: "{{ hammerspace_s3_nodes | default([]) }}"
+  loop_control:
+    loop_var: s3_node_config
+    label: "{{ s3_node_config.name }}"
+  when:
+    - hammerspace_add_s3_nodes | default(false)
+    - hammerspace_s3_nodes is defined
+    - hammerspace_s3_nodes | length > 0
+
+- name: Add object storage volumes
+  ansible.builtin.include_tasks: s3/add_object_storage_volume.yml
+  loop: "{{ hammerspace_object_volumes | default([]) }}"
+  loop_control:
+    loop_var: object_volume_config
+    label: "{{ object_volume_config.name | default(object_volume_config.bucket_name) }}"
+  when:
+    - hammerspace_add_object_volumes | default(false)
+    - hammerspace_object_volumes is defined
+    - hammerspace_object_volumes | length > 0
+
+- name: Create S3 server
+  ansible.builtin.include_tasks: s3/create_s3_server.yml
+  vars:
+    s3_server_config: "{{ hammerspace_s3_server }}"
+  when:
+    - hammerspace_create_s3_server | default(false)
+    - hammerspace_s3_server is defined
+
+- name: Create S3 users
+  ansible.builtin.include_tasks: s3/create_s3_user.yml
+  loop: "{{ hammerspace_s3_users | default([]) }}"
+  loop_control:
+    loop_var: s3_user_config
+    label: "{{ s3_user_config.name }}"
+  when:
+    - hammerspace_create_s3_users | default(false)
+    - hammerspace_s3_users is defined
+    - hammerspace_s3_users | length > 0
+
+# =============================================================================
+# Add Storage System (Node)
+# =============================================================================
+
+- name: Set node name and IP
+  ansible.builtin.set_fact:
+    hs_node_name: "{{ hammerspace_node_name | default(inventory_hostname) }}"
+    hs_node_ip: "{{ hammerspace_node_ip | default(ansible_default_ipv4.address) }}"
+
+# =============================================================================
+# AZ Mapping (Optional - before node registration)
+# =============================================================================
+
+- name: Configure AZ mapping
+  ansible.builtin.include_tasks: az_map.yml
+  when: hammerspace_enable_az_mapping | default(false)
+
+# =============================================================================
+# Node Registration
+# =============================================================================
+
+- name: Build storage system payload
+  ansible.builtin.set_fact:
+    storage_system_payload:
+      name: "{{ hs_node_name }}"
+      nodeType: "OTHER"
+      mgmtIpAddress:
+        address: "{{ hs_node_ip }}"
+      _type: "NODE"
+
+- name: Check if storage system already exists
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/nodes/{{ hs_node_name | urlencode }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: [200, 404]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 60
+  register: node_check
+  failed_when: false
+
+- name: Add storage system to Hammerspace cluster
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/nodes?ip={{ hs_node_ip }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: POST
+    body: "{{ storage_system_payload }}"
+    body_format: json
+    force_basic_auth: true
+    status_code: 202
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 180
+  register: node_add_result
+  when: node_check.status | default(404) == 404
+
+- name: Wait for storage system add to complete
+  ansible.builtin.uri:
+    url: "{{ node_add_result.location }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: 200
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+  register: node_add_status
+  until: node_add_status.json.status == "COMPLETED"
+  retries: 30
+  delay: 10
+  when: node_add_result.location is defined
+
+- name: Display storage system status
+  ansible.builtin.debug:
+    msg: >-
+      Storage system '{{ hs_node_name }}' ({{ hs_node_ip }})
+      {% if node_check.status | default(0) == 200 %}already exists{% else %}added successfully{% endif %}
+
+# =============================================================================
+# Volume Groups (Optional - before volumes)
+# =============================================================================
+
+- name: Create volume groups
+  ansible.builtin.include_tasks: volume_group_create.yml
+  loop: "{{ hammerspace_volume_groups | default([]) }}"
+  loop_control:
+    loop_var: volume_group_config
+    label: "{{ volume_group_config.name }}"
+  when:
+    - hammerspace_create_volume_groups | default(false)
+    - hammerspace_volume_groups is defined
+    - hammerspace_volume_groups | length > 0
+
+# =============================================================================
+# Add Storage Volumes
+# =============================================================================
+
+- name: Add storage volumes to Hammerspace
+  ansible.builtin.include_tasks: add_volume.yml
+  loop: "{{ mount_points }}"
+  loop_control:
+    loop_var: volume_config
+    label: "{{ volume_config.path }}"
+  when: hammerspace_add_volumes | default(true)
+
+# =============================================================================
+# Create Shares (Optional)
+# =============================================================================
+
+- name: Create Hammerspace shares
+  ansible.builtin.include_tasks: create_share.yml
+  loop: "{{ hammerspace_shares | default([]) }}"
+  loop_control:
+    loop_var: share_config
+    label: "{{ share_config.name }}"
+  when:
+    - hammerspace_create_shares | default(false)
+    - hammerspace_shares is defined
+    - hammerspace_shares | length > 0
+
+# =============================================================================
+# Apply Share Objectives (Optional - after shares)
+# =============================================================================
+
+- name: Apply share objectives
+  ansible.builtin.include_tasks: share_apply_objective.yml
+  loop: "{{ hammerspace_share_objectives | default([]) }}"
+  loop_control:
+    loop_var: share_objective_config
+    label: "{{ share_objective_config.share_name }}"
+  when:
+    - hammerspace_apply_share_objectives | default(false)
+    - hammerspace_share_objectives is defined
+    - hammerspace_share_objectives | length > 0
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+- name: Display Hammerspace integration summary
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+      HAMMERSPACE INTEGRATION COMPLETE
+      ============================================
+      Anvil API: {{ hammerspace_api_host }}
+      Storage System: {{ hs_node_name }}
+      Node IP: {{ hs_node_ip }}
+      Volumes Added: {{ mount_points | length }}
+
+      Features Enabled:
+        - Task Queue Throttling: {{ hammerspace_task_queue_throttle | default(true) }}
+        - AZ Mapping: {{ hammerspace_enable_az_mapping | default(false) }}
+        - Volume Groups: {{ hammerspace_create_volume_groups | default(false) }}
+        - Share Objectives: {{ hammerspace_apply_share_objectives | default(false) }}
+        - S3 Nodes: {{ hammerspace_add_s3_nodes | default(false) }}
+        - Prometheus: {{ hammerspace_enable_prometheus | default(false) }}
+
+      Verify in Hammerspace GUI or CLI:
+        anvil> node-list
+        anvil> volume-list
+        anvil> share-list
+      ============================================

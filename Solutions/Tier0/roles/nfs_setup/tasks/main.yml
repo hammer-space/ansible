@@ -1,0 +1,307 @@
+---
+# NFS setup role - main tasks
+# Configured per Hammerspace Tier 0 Deployment Guide recommendations
+
+- name: Include OS-specific variables
+  ansible.builtin.include_vars: "{{ item }}"
+  with_first_found:
+    - "{{ ansible_distribution | lower }}-{{ ansible_distribution_major_version }}.yml"
+    - "{{ ansible_distribution | lower }}.yml"
+    - "{{ ansible_os_family | lower }}.yml"
+    - "default.yml"
+
+- name: Install NFS server packages
+  ansible.builtin.package:
+    name: "{{ nfs_packages }}"
+    state: present
+
+# ============================================================================
+# sunrpc module configuration for NUMA-aware thread pooling
+# ============================================================================
+
+- name: Check current sunrpc pool_mode setting
+  ansible.builtin.shell: |
+    cat /sys/module/sunrpc/parameters/pool_mode 2>/dev/null || echo "not_loaded"
+  register: sunrpc_pool_mode_before
+  changed_when: false
+
+- name: Configure sunrpc module pool_mode=pernode
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/sunrpc.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Configure sunrpc to use per-NUMA-node thread pools for optimal performance
+      options sunrpc pool_mode=pernode
+  register: sunrpc_conf_changed
+
+- name: Ensure sunrpc module is loaded
+  community.general.modprobe:
+    name: sunrpc
+    state: present
+
+- name: Reload sunrpc module by restarting NFS services
+  when:
+    - sunrpc_pool_mode_before.stdout != "pernode"
+    - sunrpc_pool_mode_before.stdout != "not_loaded"
+    - not (node_already_in_hammerspace | default(false))
+  block:
+    - name: Stop NFS server service
+      ansible.builtin.shell: |
+        systemctl stop nfs-server 2>/dev/null || \
+        systemctl stop nfs-kernel-server 2>/dev/null || \
+        service nfs-kernel-server stop 2>/dev/null || \
+        service nfs stop 2>/dev/null || true
+      changed_when: true
+
+    - name: Stop rpcbind service
+      ansible.builtin.systemd:
+        name: rpcbind
+        state: stopped
+      ignore_errors: true
+
+    - name: Unload NFS and sunrpc modules
+      ansible.builtin.shell: |
+        # Unload in dependency order
+        modprobe -r nfsd 2>/dev/null || true
+        modprobe -r nfs 2>/dev/null || true
+        modprobe -r nfsv4 2>/dev/null || true
+        modprobe -r nfsv3 2>/dev/null || true
+        modprobe -r lockd 2>/dev/null || true
+        modprobe -r grace 2>/dev/null || true
+        modprobe -r sunrpc 2>/dev/null || true
+        # Verify sunrpc is unloaded
+        if lsmod | grep -q "^sunrpc"; then
+          echo "sunrpc still loaded - may have active mounts"
+          exit 1
+        fi
+        echo "sunrpc unloaded successfully"
+      register: sunrpc_unload
+      changed_when: true
+      failed_when: false
+
+    - name: Reload sunrpc module with new parameters
+      community.general.modprobe:
+        name: sunrpc
+        state: present
+      when: sunrpc_unload.rc == 0
+
+    - name: Start rpcbind service
+      ansible.builtin.systemd:
+        name: rpcbind
+        state: started
+
+    - name: Start NFS server service
+      ansible.builtin.shell: |
+        systemctl start nfs-server 2>/dev/null || \
+        systemctl start nfs-kernel-server 2>/dev/null || \
+        service nfs-kernel-server start 2>/dev/null || \
+        service nfs start 2>/dev/null
+      changed_when: true
+
+- name: Skip sunrpc reload (node already in Hammerspace)
+  ansible.builtin.debug:
+    msg: "Skipping sunrpc module reload - node is already registered in Hammerspace (avoiding NFS service disruption)"
+  when:
+    - sunrpc_pool_mode_before.stdout != "pernode"
+    - sunrpc_pool_mode_before.stdout != "not_loaded"
+    - node_already_in_hammerspace | default(false)
+
+- name: Verify sunrpc pool_mode setting
+  ansible.builtin.shell: |
+    cat /sys/module/sunrpc/parameters/pool_mode 2>/dev/null || echo "unknown"
+  register: sunrpc_pool_mode
+  changed_when: false
+
+- name: Display sunrpc pool_mode status
+  ansible.builtin.debug:
+    msg: |
+      sunrpc pool_mode: {{ sunrpc_pool_mode.stdout }}
+      {% if sunrpc_pool_mode.stdout == 'pernode' %}
+      Status: OK - pernode mode is active
+      {% elif sunrpc_unload is defined and sunrpc_unload.rc != 0 %}
+      Status: REBOOT REQUIRED - sunrpc module is in use (check for active NFS mounts)
+      {% else %}
+      Status: Configuration saved - will apply on next service restart or reboot
+      {% endif %}
+
+- name: Check existing NFS configuration
+  ansible.builtin.stat:
+    path: /etc/nfs.conf
+  register: nfs_conf_stat
+
+- name: Backup existing nfs.conf
+  ansible.builtin.copy:
+    src: /etc/nfs.conf
+    dest: /etc/nfs.conf.backup.{{ ansible_date_time.iso8601_basic_short }}
+    remote_src: true
+    mode: '0644'
+  when: nfs_conf_stat.stat.exists
+
+- name: Deploy Hammerspace-recommended nfs.conf
+  ansible.builtin.template:
+    src: nfs.conf.j2
+    dest: /etc/nfs.conf
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  notify:
+    - Restart NFS server
+
+- name: Check for custom NFS configuration directory
+  ansible.builtin.file:
+    path: /etc/nfs.conf.d
+    state: directory
+    mode: '0755'
+
+- name: Check for custom NFS configuration files
+  ansible.builtin.find:
+    paths: /etc/nfs.conf.d
+    patterns: "*.conf"
+  register: nfs_conf_d_files
+
+# ============================================================================
+# NFS udev rules for read-ahead optimization
+# Reference: https://access.redhat.com/solutions/407263
+# ============================================================================
+
+- name: Deploy NFS udev rules for read-ahead optimization
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/99-nfs.rules
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      #
+      # Suggested rule from https://access.redhat.com/solutions/407263
+      #
+      SUBSYSTEM=="bdi", ACTION=="add|change", PROGRAM="/bin/awk -v bdi=$kernel 'BEGIN{ret=1} {if ($4 == bdi) {ret=0}} END{exit ret}' /proc/fs/nfsfs/volumes", ATTR{read_ahead_kb}="1024"
+  notify:
+    - Reload udev rules
+
+# ============================================================================
+# NVMe read-ahead service for Samsung drives
+# ============================================================================
+
+- name: Deploy set-readahead.sh script to /usr/local/bin
+  ansible.builtin.copy:
+    src: set-readahead.sh
+    dest: /usr/local/bin/set-readahead.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Deploy set-readahead systemd service
+  ansible.builtin.copy:
+    src: set-readahead.service
+    dest: /etc/systemd/system/set-readahead.service
+    owner: root
+    group: root
+    mode: '0644'
+  register: set_readahead_service
+
+- name: Reload systemd daemon for set-readahead service
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: set_readahead_service.changed
+
+- name: Check if set-readahead service file exists
+  ansible.builtin.stat:
+    path: /etc/systemd/system/set-readahead.service
+  register: set_readahead_service_file
+
+- name: Enable and start set-readahead service
+  ansible.builtin.systemd:
+    name: set-readahead
+    enabled: true
+    state: started
+  when: set_readahead_service_file.stat.exists
+
+- name: Display custom NFS configs found
+  ansible.builtin.debug:
+    msg: "Custom NFS configs: {{ nfs_conf_d_files.files | map(attribute='path') | list }}"
+  when: nfs_conf_d_files.files is defined and nfs_conf_d_files.files | length > 0
+
+- name: Read NFS port configuration for verification
+  ansible.builtin.shell: |
+    grep -r "port\|Port" /etc/nfs.conf /etc/nfs.conf.d/ 2>/dev/null || true
+  register: nfs_port_config
+  changed_when: false
+
+- name: Display non-default port configuration if found
+  ansible.builtin.debug:
+    msg: "NFS port configuration found: {{ nfs_port_config.stdout_lines }}"
+  when: nfs_port_config.stdout | length > 0
+
+- name: Backup existing exports file
+  ansible.builtin.copy:
+    src: /etc/exports
+    dest: /etc/exports.backup.{{ ansible_date_time.iso8601_basic_short }}
+    remote_src: true
+    mode: '0644'
+  when: ansible_check_mode is not defined or not ansible_check_mode
+  failed_when: false
+
+- name: Generate /etc/exports from template
+  ansible.builtin.template:
+    src: exports.j2
+    dest: /etc/exports
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  notify:
+    - Reload NFS exports
+
+- name: Enable rpcbind service
+  ansible.builtin.systemd:
+    name: rpcbind
+    enabled: true
+    state: started
+
+- name: Enable NFS server service
+  ansible.builtin.systemd:
+    name: "{{ nfs_service }}"
+    enabled: true
+    state: started
+
+- name: Export NFS shares
+  ansible.builtin.command: exportfs -ra
+  changed_when: true
+
+- name: Verify NFS exports
+  ansible.builtin.command: exportfs -v
+  register: exportfs_output
+  changed_when: false
+
+- name: Display active NFS exports
+  ansible.builtin.debug:
+    var: exportfs_output.stdout_lines
+
+- name: Check showmount functionality
+  ansible.builtin.command: showmount -e localhost
+  register: showmount_output
+  changed_when: false
+  failed_when: false
+
+- name: Display showmount output
+  ansible.builtin.debug:
+    var: showmount_output.stdout_lines
+  when: showmount_output.rc == 0
+
+- name: Warn if showmount is disabled
+  ansible.builtin.debug:
+    msg: "WARNING: showmount appears to be disabled or not working - ensure it is not disabled in your configuration"
+  when: showmount_output.rc != 0
+
+- name: Get RPC info for verification
+  ansible.builtin.command: rpcinfo -p
+  register: rpcinfo_output
+  changed_when: false
+  failed_when: false
+
+- name: Display RPC services
+  ansible.builtin.debug:
+    var: rpcinfo_output.stdout_lines

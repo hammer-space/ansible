@@ -1,0 +1,60 @@
+---
+# Create S3 Server for object storage protocol access
+# Called from main.yml with s3_server_config variable
+# Reference: hs_ops s3_server_create.yml
+
+- name: "Build S3 server payload for {{ s3_server_config.name }}"
+  ansible.builtin.set_fact:
+    s3_server_payload:
+      _type: "S3_SERVER"
+      name: "{{ s3_server_config.name }}"
+      enabled: "{{ s3_server_config.enabled | default(true) }}"
+      port: "{{ s3_server_config.port | default(9000) }}"
+      tlsEnabled: "{{ s3_server_config.tls_enabled | default(false) }}"
+
+- name: "Check if S3 server already exists"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/s3server"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: [200, 404]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 60
+  register: s3_server_check
+  failed_when: false
+
+- name: "Create S3 server {{ s3_server_config.name }}"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/s3server"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: POST
+    body: "{{ s3_server_payload }}"
+    body_format: json
+    force_basic_auth: true
+    status_code: [200, 201, 202]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 180
+  register: s3_server_create_result
+  when: s3_server_check.status == 404 or s3_server_check.json is not defined or s3_server_check.json | length == 0
+
+- name: "Wait for S3 server creation to complete"
+  ansible.builtin.uri:
+    url: "{{ s3_server_create_result.location }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: 200
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+  register: s3_server_status
+  until: s3_server_status.json.status == "COMPLETED"
+  retries: 30
+  delay: 5
+  when: s3_server_create_result.location is defined
+
+- name: "Display S3 server status"
+  ansible.builtin.debug:
+    msg: "S3 Server '{{ s3_server_config.name }}' configured on port {{ s3_server_config.port | default(9000) }}"
