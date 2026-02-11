@@ -1,6 +1,6 @@
 # Ansible Automation for Hammerspace Tier 0 / LSS Storage Setup
 
-This Ansible project automates the setup of RAID arrays, filesystems, NFS exports, and firewall configuration for **Hammerspace Tier 0** and **Linux Storage Server (LSS)** deployments, based on the [Hammerspace Tier 0 Deployment Guide v1.0](https://hammerspace.com).
+This Ansible project automates the setup of RAID arrays, filesystems, NFS exports, and firewall configuration for **Hammerspace Tier 0** and **Linux Storage Server (LSS)** deployments, based on the [Hammerspace Tier 0 Deployment Guide v1.0]([https://hammerspace.com](https://supportportal.hammerspace.com/s/article/Deploy-Tier-0)).
 
 ## What is Tier 0?
 
@@ -1741,9 +1741,9 @@ For step-by-step deployment instructions, see **[DEPLOYMENT_GUIDE.md](DEPLOYMENT
 
 ## References
 
-- [Hammerspace Tier 0 Deployment Guide](https://hammerspace.com)
+- [Hammerspace Tier 0 Deployment Guide](https://supportportal.hammerspace.com/s/article/Deploy-Tier-0)
 - [Hammerspace Ansible Examples](https://github.com/hammer-space/ansible)
-- [Hammerspace Objectives Guide](https://hammerspace.com)
+- [Hammerspace Objectives Guide](https://supportportal.hammerspace.com/s/article/How-to-Configure-Hammerspace-Objectives)
 - [Hammerspace Toolkit (HSTK)](https://github.com/hammer-space/hstk)
 - [Hammerspace Grafana Dashboards](https://github.com/hammer-space/grafana-dashboards)
 
