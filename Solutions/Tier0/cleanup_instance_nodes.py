@@ -33,6 +33,7 @@ import requests
 import urllib.parse
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any
 
 # Disable SSL warnings for self-signed certificates
@@ -67,14 +68,18 @@ class HammerspaceClient:
         return response.json()
 
     def delete_storage_volume(self, volume_name: str) -> bool:
-        """Delete a storage volume by name."""
+        """Delete a storage volume and wait until it is fully removed from Hammerspace."""
         encoded_name = urllib.parse.quote(volume_name, safe='')
         response = self._request("DELETE", f"storage-volumes/{encoded_name}")
 
         if response.status_code in [200, 202, 204]:
-            # Wait for task completion if async
+            # Wait for async task if present
             if response.status_code == 202 and 'location' in response.headers:
                 self._wait_for_task(response.headers['location'])
+            # Verify the volume is actually gone from Hammerspace
+            if not self.wait_for_volume_deletion(volume_name):
+                print(f"  Volume '{volume_name}' still present after delete request")
+                return False
             return True
         elif response.status_code == 404:
             print(f"  Volume '{volume_name}' not found (already deleted?)")
@@ -99,10 +104,31 @@ class HammerspaceClient:
             print(f"  Failed to delete node '{node_name}': {response.status_code} - {response.text}")
             return False
 
-    def _wait_for_task(self, task_url: str, timeout: int = 120, interval: int = 5):
+    def get_storage_volume(self, volume_name: str) -> Dict[str, Any] | None:
+        """Get a single storage volume by name. Returns None if not found."""
+        encoded_name = urllib.parse.quote(volume_name, safe='')
+        response = self._request("GET", f"storage-volumes/{encoded_name}")
+        if response.status_code == 200:
+            return response.json()
+        return None
+
+    def wait_for_volume_deletion(self, volume_name: str, interval: int = 5) -> bool:
+        """Wait until a volume is fully deleted (no longer exists or not in Executing state)."""
+        while True:
+            vol = self.get_storage_volume(volume_name)
+            if vol is None:
+                return True
+            status = vol.get('operationalStatus', '')
+            if status == 'Executing':
+                print(f"    Volume '{volume_name}' still Executing, waiting...")
+                time.sleep(interval)
+            else:
+                # Volume exists but not executing - deletion may have failed
+                return False
+
+    def _wait_for_task(self, task_url: str, interval: int = 5):
         """Wait for an async task to complete."""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        while True:
             response = self.session.get(task_url)
             if response.status_code == 200:
                 task_status = response.json().get('status', '')
@@ -112,8 +138,6 @@ class HammerspaceClient:
                     print(f"  Task failed with status: {task_status}")
                     return False
             time.sleep(interval)
-        print(f"  Task timed out after {timeout} seconds")
-        return False
 
 
 def find_instance_nodes(nodes: List[Dict[str, Any]], prefix: str = None, contains: str = None,
@@ -213,6 +237,8 @@ Examples:
 
     parser.add_argument('--dry-run', action='store_true', help='Show what would be deleted without actually deleting')
     parser.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompt')
+    parser.add_argument('--parallel', type=int, default=1, metavar='N',
+                        help='Number of parallel volume deletions (default: 1)')
 
     args = parser.parse_args()
 
@@ -313,38 +339,69 @@ Examples:
 
     # Delete volumes first
     print("\n" + "="*60)
-    print("PHASE 1: Deleting volumes...")
+    print(f"PHASE 1: Deleting volumes (parallel: {args.parallel})...")
     print("="*60)
 
     deleted_volumes = 0
     failed_volumes = 0
+    # Track volume deletion failures per node
+    node_volume_failures = {node.get('name'): 0 for node in instance_nodes}
 
+    # Collect all volumes into a flat list with their node name
+    all_volume_tasks = []
     for node_name, volumes in node_volumes.items():
-        if volumes:
-            print(f"\nDeleting volumes for node '{node_name}':")
-            for volume in volumes:
-                vol_name = volume.get('name')
-                print(f"  Deleting volume: {vol_name}...")
-                if client.delete_storage_volume(vol_name):
+        for volume in volumes:
+            all_volume_tasks.append((node_name, volume))
+
+    if args.parallel > 1 and all_volume_tasks:
+        def _delete_volume(task):
+            node_name, volume = task
+            vol_name = volume.get('name')
+            print(f"  [{node_name}] Deleting volume: {vol_name}...")
+            success = client.delete_storage_volume(vol_name)
+            if success:
+                print(f"  [{node_name}] ✓ Deleted: {vol_name}")
+            return node_name, success
+
+        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            futures = {executor.submit(_delete_volume, task): task for task in all_volume_tasks}
+            for future in as_completed(futures):
+                node_name, success = future.result()
+                if success:
                     deleted_volumes += 1
-                    print(f"  ✓ Deleted: {vol_name}")
                 else:
                     failed_volumes += 1
-                time.sleep(1)  # Small delay between deletions
+                    node_volume_failures[node_name] += 1
+    else:
+        for node_name, volume in all_volume_tasks:
+            vol_name = volume.get('name')
+            print(f"  [{node_name}] Deleting volume: {vol_name}...")
+            if client.delete_storage_volume(vol_name):
+                deleted_volumes += 1
+                print(f"  [{node_name}] ✓ Deleted: {vol_name}")
+            else:
+                failed_volumes += 1
+                node_volume_failures[node_name] += 1
 
     print(f"\nVolume deletion complete: {deleted_volumes} deleted, {failed_volumes} failed")
 
-    # Delete nodes
+    # Delete nodes (only if all volumes were fully removed)
     print("\n" + "="*60)
     print("PHASE 2: Deleting nodes...")
     print("="*60)
 
     deleted_nodes = 0
     failed_nodes = 0
+    skipped_nodes = 0
 
     for node in instance_nodes:
         node_name = node.get('name')
         node_uuid = node.get('uoid', {}).get('uuid')
+
+        if node_volume_failures.get(node_name, 0) > 0:
+            print(f"\n  Skipping node '{node_name}': not all volumes were removed")
+            skipped_nodes += 1
+            continue
 
         if not node_uuid:
             print(f"  Skipping node '{node_name}': no UUID found")
@@ -359,16 +416,16 @@ Examples:
             failed_nodes += 1
         time.sleep(1)  # Small delay between deletions
 
-    print(f"\nNode deletion complete: {deleted_nodes} deleted, {failed_nodes} failed")
+    print(f"\nNode deletion complete: {deleted_nodes} deleted, {failed_nodes} failed, {skipped_nodes} skipped")
 
     # Summary
     print("\n" + "="*60)
     print("SUMMARY")
     print("="*60)
     print(f"Volumes: {deleted_volumes} deleted, {failed_volumes} failed")
-    print(f"Nodes:   {deleted_nodes} deleted, {failed_nodes} failed")
+    print(f"Nodes:   {deleted_nodes} deleted, {failed_nodes} failed, {skipped_nodes} skipped")
 
-    if failed_volumes > 0 or failed_nodes > 0:
+    if failed_volumes > 0 or failed_nodes > 0 or skipped_nodes > 0:
         sys.exit(1)
 
 

@@ -1,6 +1,6 @@
 # Ansible Automation for Hammerspace Tier 0 / LSS Storage Setup
 
-This Ansible project automates the setup of RAID arrays, filesystems, NFS exports, and firewall configuration for **Hammerspace Tier 0** and **Linux Storage Server (LSS)** deployments, based on the [Hammerspace Tier 0 Deployment Guide v1.0]([https://hammerspace.com](https://supportportal.hammerspace.com/s/article/Deploy-Tier-0)).
+This Ansible project automates the setup of RAID arrays, filesystems, NFS exports, and firewall configuration for **Hammerspace Tier 0** and **Linux Storage Server (LSS)** deployments, based on the [Hammerspace Tier 0 Deployment Guide v1.0](https://hammerspace.com).
 
 ## What is Tier 0?
 
@@ -1694,6 +1694,8 @@ pip3 install google-auth requests
 
 Removes nodes and their volumes from Hammerspace. Use before terminating instances.
 
+**Safety behavior:** Each volume deletion is a blocking operation — the script waits indefinitely for Hammerspace to fully remove the volume before proceeding to the next one. With `--parallel N`, N volumes are deleted concurrently, each worker waiting for its volume to be fully gone before picking up the next. A node is only deleted after all its volumes are confirmed removed; if any volume fails, the node is skipped.
+
 ```bash
 # List all nodes
 python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password 'xxx' --list-nodes
@@ -1706,7 +1708,12 @@ python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password 'xxx
 python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password 'xxx' \
   --node bu-test-01 --node bu-test-02
 
+# Parallel volume deletion (5 at a time)
+python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --contains "bu-test" --parallel 5
+
 # Filter options: --prefix, --contains, --pattern (regex), --node (specific names)
+# --parallel N: delete N volumes concurrently (default: 1)
 ```
 
 ### assign_az_to_volumes.py
@@ -1741,9 +1748,9 @@ For step-by-step deployment instructions, see **[DEPLOYMENT_GUIDE.md](DEPLOYMENT
 
 ## References
 
-- [Hammerspace Tier 0 Deployment Guide](https://supportportal.hammerspace.com/s/article/Deploy-Tier-0)
+- [Hammerspace Tier 0 Deployment Guide](https://hammerspace.com)
 - [Hammerspace Ansible Examples](https://github.com/hammer-space/ansible)
-- [Hammerspace Objectives Guide](https://supportportal.hammerspace.com/s/article/How-to-Configure-Hammerspace-Objectives)
+- [Hammerspace Objectives Guide](https://hammerspace.com)
 - [Hammerspace Toolkit (HSTK)](https://github.com/hammer-space/hstk)
 - [Hammerspace Grafana Dashboards](https://github.com/hammer-space/grafana-dashboards)
 

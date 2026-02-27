@@ -796,22 +796,37 @@ python3 cleanup_instance_nodes.py \
   --password 'your-password'
 ```
 
-**Step 3: Confirm deletion**
+**Step 3: Execute cleanup (with parallel volume deletion)**
+```bash
+python3 cleanup_instance_nodes.py \
+  --host 10.241.0.105 \
+  --user admin \
+  --password 'your-password' \
+  --parallel 5
+```
+
+**Example output:**
 ```
 Type 'yes' to confirm deletion: yes
 
-PHASE 1: Deleting volumes...
-  ✓ Deleted: AZ1:instance20260127011850::/hammerspace/hsvol0
+PHASE 1: Deleting volumes (parallel: 5)...
+  [instance20260127011850] Deleting volume: AZ1:instance20260127011850::/hammerspace/hsvol0...
+    Volume 'AZ1:instance20260127011850::/hammerspace/hsvol0' still Executing, waiting...
+  [instance20260127011850] ✓ Deleted: AZ1:instance20260127011850::/hammerspace/hsvol0
+  [instance20260127011851] ✓ Deleted: AZ1:instance20260127011851::/hammerspace/hsvol0
   ...
 
 PHASE 2: Deleting nodes...
   ✓ Deleted: instance20260127011850
+  ✓ Deleted: instance20260127011851
   ...
 
 SUMMARY
 Volumes: 20 deleted, 0 failed
-Nodes:   10 deleted, 0 failed
+Nodes:   10 deleted, 0 failed, 0 skipped
 ```
+
+> **Note:** Each volume deletion is a blocking operation — the script waits indefinitely for Hammerspace to fully remove the volume before the worker picks up the next one. With `--parallel 5`, up to 5 volumes are deleted concurrently. If any volume fails to delete, the corresponding node is skipped to prevent data loss.
 
 ### 12.2 Cleanup Options
 
@@ -825,6 +840,7 @@ Nodes:   10 deleted, 0 failed
 | `--contains` | Match nodes containing string |
 | `--pattern` | Match nodes using regex pattern |
 | `--node NAME` | Match specific node name (repeatable) |
+| `--parallel N` | Delete N volumes concurrently, each waiting for full removal (default: 1) |
 | `--dry-run` | Show what would be deleted without deleting |
 | `--yes`, `-y` | Skip confirmation prompt |
 
@@ -872,12 +888,21 @@ python3 cleanup_instance_nodes.py \
   --node bu-test-02 \
   --dry-run
 
+# Parallel volume deletion (5 at a time)
+python3 cleanup_instance_nodes.py \
+  --host 10.241.0.105 \
+  --user admin \
+  --password 'xxx' \
+  --contains "test" \
+  --parallel 5
+
 # Skip confirmation (for automation)
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
   --password 'xxx' \
   --contains "test" \
+  --parallel 5 \
   --yes
 ```
 
@@ -942,6 +967,7 @@ python3 cleanup_instance_nodes.py \
 | List all nodes | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --list-nodes` |
 | Cleanup (dry run) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name" --dry-run` |
 | Cleanup (execute) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name"` |
+| Cleanup (parallel) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name" --parallel 5` |
 
 ---
 
