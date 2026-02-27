@@ -59,12 +59,12 @@
       accessType: "{{ volume_config.access_type | default('READ_WRITE') }}"
       additionalAddresses: "{{ hammerspace_additional_ips | default([]) }}"
       excludedIpAddresses: "{{ hammerspace_excluded_ips | default([]) }}"
+      maxSuspectedSeconds: "{{ hammerspace_volume_max_suspected_seconds | default(0) }}"
       storageCapabilities:
         performance:
           utilizationThreshold: "{{ hammerspace_volume_high_threshold | default(0.98) }}"
           utilizationEvacuationThreshold: "{{ hammerspace_volume_low_threshold | default(0.90) }}"
         protection:
-          onlineDelay: "{{ hammerspace_volume_online_delay | default(0) }}"
           unavailableStateAvailabilityMultiplier: "{{ hammerspace_volume_unavailable_multiplier | default(1) }}"
           availability: "{{ hammerspace_volume_availability | default(2) }}"
           durability: "{{ hammerspace_volume_durability | default(3) }}"

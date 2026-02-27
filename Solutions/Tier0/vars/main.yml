@@ -221,8 +221,10 @@ hammerspace_volume_high_threshold: 0.98
 hammerspace_volume_low_threshold: 0.90
 
 # Volume protection settings
-# onlineDelay: seconds before volume goes suspected (--max-suspected-time)
-hammerspace_volume_online_delay: 0
+# maxSuspectedSeconds: seconds before volume goes from suspected to unavailable (--max-suspected-time)
+# This is a top-level volume field, NOT under storageCapabilities.protection
+# Note: onlineDelay (under protection) is for object storage volumes only
+hammerspace_volume_max_suspected_seconds: 0
 
 # unavailableStateAvailabilityMultiplier: availability drop behavior
 # 0 = enabled (--availability-drop-enabled) - availability drops to 0 when unavailable
