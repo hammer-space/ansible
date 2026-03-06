@@ -39,6 +39,11 @@ Examples:
     # Report only - generate CSV without modifying volumes
     python3 assign_az_to_volumes.py --host 10.1.2.3 --user admin --password 'Hammer.123!!' \\
         --gpu-fabric-file gpu_fabric_data.txt --report-only
+
+    # Force a specific GPU fabric to a specific AZ (e.g., replacing an old fabric with a new one)
+    python3 assign_az_to_volumes.py --host 10.1.2.3 --user admin --password 'Hammer.123!!' \\
+        --gpu-fabric-file gpu_fabric_data.txt \\
+        --az-map "ocid1.computegpumemoryfabric.oc1...newid=AZ3"
 """
 
 import argparse
@@ -128,14 +133,17 @@ class GpuFabricMapper:
         self.fabric_to_az = {}
         self.next_az = 1
 
-    def learn_from_existing(self, existing_mappings: Dict[str, str]):
+    def learn_from_existing(self, existing_mappings: Dict[str, str], override: bool = False):
         """Learn GPU fabric to AZ mappings from existing volume names.
 
         Args:
             existing_mappings: Dict of {gpu_fabric_ocid: az_string} (e.g., {"ocid1...": "AZ1"})
+            override: If True, overwrite existing mappings. If False, skip already-mapped fabrics.
         """
         for gpu_fabric_ocid, az in existing_mappings.items():
             if gpu_fabric_ocid and az:
+                if not override and gpu_fabric_ocid in self.fabric_to_az:
+                    continue
                 self.fabric_to_az[gpu_fabric_ocid] = az
                 # Extract the AZ number and update next_az if needed
                 match = re.match(r'AZ(\d+)', az)
@@ -408,6 +416,9 @@ def main():
     parser.add_argument('--lifecycle-state', default='RUNNING', help='Filter by lifecycle state (default: RUNNING)')
     parser.add_argument('--az-source', default='gpu_fabric', choices=['gpu_fabric', 'fault_domain'],
                         help='Source for AZ mapping: gpu_fabric (default) or fault_domain')
+    parser.add_argument('--az-map', action='append', dest='az_maps', metavar='FABRIC_OCID=AZ#',
+                        help='Explicitly map a GPU fabric OCID to an AZ (e.g., "ocid1...=AZ3"). '
+                             'Can be used multiple times. Overrides learned and auto-assigned mappings.')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be changed without making changes')
     parser.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompt')
     parser.add_argument('--report-only', action='store_true', help='Only generate instance report, do not modify volumes')
@@ -417,6 +428,22 @@ def main():
 
     # Get instance data from GPU fabric file or OCI API
     gpu_fabric_mapper = GpuFabricMapper()
+
+    # Apply explicit --az-map mappings first (highest priority)
+    if args.az_maps:
+        explicit_mappings = {}
+        for mapping in args.az_maps:
+            if '=' not in mapping:
+                print(f"ERROR: Invalid --az-map format: '{mapping}'. Expected FABRIC_OCID=AZ#")
+                sys.exit(1)
+            fabric_ocid, az = mapping.rsplit('=', 1)
+            if not re.match(r'^AZ\d+$', az):
+                print(f"ERROR: Invalid AZ format: '{az}'. Expected AZ followed by a number (e.g., AZ3)")
+                sys.exit(1)
+            explicit_mappings[fabric_ocid] = az
+            print(f"  Explicit mapping: {az} -> ...{fabric_ocid[-12:]}")
+        gpu_fabric_mapper.learn_from_existing(explicit_mappings, override=True)
+        print(f"  Applied {len(explicit_mappings)} explicit AZ mapping(s)\n")
 
     if args.gpu_fabric_file:
         # Use GPU fabric mapping file

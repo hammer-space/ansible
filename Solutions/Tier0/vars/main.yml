@@ -334,6 +334,14 @@ hammerspace_create_volume_groups: false
 #   - name: "tier0-az2-volumes"
 #     location_pattern: "AZ2:*"
 
+# Add volumes to existing volume groups (after volumes are added)
+# Use this to add newly created volumes to already-defined volume groups
+# hammerspace_volume_group_members:
+#   - volume_name: "AZ1:tier0-node-01::/hammerspace/hsvol0"
+#     group_name: "tier0-az1-volumes"
+#   - volume_name: "AZ1:tier0-node-01::/hammerspace/hsvol1"
+#     group_name: "tier0-az1-volumes"
+
 # ============================================================================
 # Share Objectives (from Hammerspace Engineering)
 # ============================================================================

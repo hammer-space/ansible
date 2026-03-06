@@ -535,7 +535,64 @@ python3 assign_az_to_volumes.py \
   --report-only
 ```
 
-### 9.5 Alternative: Fault Domain-Based AZ
+**Force a specific GPU fabric to a specific AZ (`--az-map`):**
+
+Use `--az-map` to explicitly map a GPU fabric OCID to an AZ. This is useful when replacing an old GPU fabric with a new one and you want the new fabric to take over the same AZ number. Can be used multiple times. Explicit mappings override both learned and auto-assigned mappings.
+
+```bash
+# Dry run
+python3 assign_az_to_volumes.py \
+  --host 10.241.0.105 \
+  --user admin \
+  --password 'your-password' \
+  --gpu-fabric-file gpu_fabric_data.txt \
+  --az-map "ocid1.computegpumemoryfabric.oc1...newid=AZ3" \
+  --dry-run
+
+# Multiple explicit mappings
+python3 assign_az_to_volumes.py \
+  --host 10.241.0.105 \
+  --user admin \
+  --password 'your-password' \
+  --gpu-fabric-file gpu_fabric_data.txt \
+  --az-map "ocid1...fabric_a=AZ3" \
+  --az-map "ocid1...fabric_b=AZ5"
+```
+
+### 9.5 Replacing a GPU Fabric AZ
+
+When you need to replace an old GPU fabric (and its nodes) with a new one while keeping the same AZ number:
+
+```bash
+# 1. Check current AZ assignments
+python3 assign_az_to_volumes.py \
+  --host 10.241.0.105 --user admin --password 'your-password' \
+  --gpu-fabric-file gpu_fabric_data.txt --report-only
+
+# 2. Collect GPU fabric for new replacement nodes
+ansible-playbook collect_gpu_fabric.yml -i inventory.oci.yml \
+  --limit "new-instance1,new-instance2,..."
+# Note the new GPU fabric OCID from gpu_fabric_data.txt
+
+# 3. Clean up old nodes and volumes from Hammerspace
+python3 cleanup_instance_nodes.py \
+  --host 10.241.0.105 --user admin --password 'your-password' \
+  --node old-instance1 --node old-instance2 \
+  --parallel 5
+
+# 4. Deploy new nodes
+ansible-playbook site.yml -i inventory.oci.yml \
+  --limit "new-instance1,new-instance2,..."
+
+# 5. Assign the old AZ number to the new GPU fabric
+python3 assign_az_to_volumes.py \
+  --host 10.241.0.105 --user admin --password 'your-password' \
+  --gpu-fabric-file gpu_fabric_data.txt \
+  --az-map "ocid1.computegpumemoryfabric.oc1...new_fabric_id=AZ3" \
+  --dry-run
+```
+
+### 9.6 Alternative: Fault Domain-Based AZ
 
 For non-GPU instances or simpler deployments, use OCI Fault Domains instead:
 
@@ -553,7 +610,7 @@ compose:
   hammerspace_volume_az_prefix: fault_domain | regex_replace('FAULT-DOMAIN-', 'AZ') ~ ":"
 ```
 
-### 9.6 Verify AZ Assignment
+### 9.7 Verify AZ Assignment
 
 **Check volume names in Hammerspace:**
 ```bash
@@ -573,7 +630,7 @@ AZ2:instance20260127011852::/hammerspace/hsvol0
 AZ3:instance20260127011853::/hammerspace/hsvol0
 ```
 
-### 9.7 AZ Best Practices
+### 9.8 AZ Best Practices
 
 | Recommendation | Description |
 |----------------|-------------|
@@ -964,10 +1021,19 @@ python3 cleanup_instance_nodes.py \
 | Verify NFS | `ansible-playbook verify_nfs.yml -i inventory.oci.yml` |
 | Collect GPU fabric | `ansible-playbook collect_gpu_fabric.yml -i inventory.oci.yml` |
 | Assign AZ to volumes | `python3 assign_az_to_volumes.py --host <IP> --gpu-fabric-file gpu_fabric_data.txt` |
+| Assign AZ (explicit) | `python3 assign_az_to_volumes.py --host <IP> --gpu-fabric-file gpu_fabric_data.txt --az-map "FABRIC_OCID=AZ3"` |
 | List all nodes | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --list-nodes` |
 | Cleanup (dry run) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name" --dry-run` |
 | Cleanup (execute) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name"` |
 | Cleanup (parallel) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name" --parallel 5` |
+| Avail-drop check | `python3 set_availability_drop.py --host <IP> --user admin --password 'xxx' --node <NAME> --check` |
+| Avail-drop disable (pre-RMA) | `python3 set_availability_drop.py --host <IP> --user admin --password 'xxx' --node <NAME> --disable` |
+| Avail-drop enable (post-RMA) | `python3 set_availability_drop.py --host <IP> --user admin --password 'xxx' --node <NAME> --enable` |
+| Health check (post-restart) | `python3 set_availability_drop.py --host <IP> --user admin --password 'xxx' --node <NAME> --health-check` |
+| Add volumes to group | `python3 add_volumes_to_group.py --host <IP> --user admin --password 'xxx' --group "group-name" --instances-file tier0_instances_limit` |
+| List volume group members | `python3 add_volumes_to_group.py --host <IP> --user admin --password 'xxx' --group "group-name" --list` |
+| Rename OCI instances (pattern) | `python3 rename_oci_instances_az.py --host <IP> --user admin --password 'xxx' --compartment-id <OCID> --name-pattern "^instance2026"` |
+| Rename OCI instances (file) | `python3 rename_oci_instances_az.py --host <IP> --user admin --password 'xxx' --compartment-id <OCID> --instances-file tier0_instances_limit` |
 
 ---
 

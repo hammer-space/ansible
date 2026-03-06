@@ -19,6 +19,8 @@
   ansible.builtin.systemd:
     name: rpcbind
     state: restarted
+  async: 120
+  poll: 10
   ignore_errors: true
   listen: "Restart NFS server"
   when: not (node_already_in_hammerspace | default(false))
@@ -30,6 +32,8 @@
     service nfs-kernel-server restart 2>/dev/null || \
     service nfs restart 2>/dev/null || \
     echo "NFS restart attempted"
+  async: 120
+  poll: 10
   register: nfs_restart_result
   changed_when: true
   failed_when: false

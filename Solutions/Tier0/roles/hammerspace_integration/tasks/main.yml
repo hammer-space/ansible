@@ -209,6 +209,20 @@
   when: hammerspace_add_volumes | default(true)
 
 # =============================================================================
+# Add Volumes to Volume Groups (after volumes are added)
+# =============================================================================
+
+- name: Add volumes to existing volume groups
+  ansible.builtin.include_tasks: volume_group_add_volume.yml
+  loop: "{{ hammerspace_volume_group_members | default([]) }}"
+  loop_control:
+    loop_var: volume_group_update
+    label: "{{ volume_group_update.volume_name }} -> {{ volume_group_update.group_name }}"
+  when:
+    - hammerspace_volume_group_members is defined
+    - hammerspace_volume_group_members | length > 0
+
+# =============================================================================
 # Create Shares (Optional)
 # =============================================================================
 

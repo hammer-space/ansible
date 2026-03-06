@@ -27,10 +27,12 @@ Tier 0 transforms existing local NVMe storage on GPU servers into ultra-fast, pe
 - **Node Registration**: Automatically registers storage servers via Anvil REST API
 - **Volume Management**: Adds storage volumes with configurable thresholds and protection settings
 - **Task Queue Throttling**: Prevents API overload by monitoring queued tasks (configurable min/max thresholds)
-- **Volume Groups**: Creates volume groups for organizing volumes by AZ or location
+- **Volume Groups**: Creates volume groups and adds volumes to existing groups
 - **Share Management**: Creates shares with configurable export options
 - **Share Objectives**: Applies availability/durability objectives to shares
 - **AZ Mapping**: Parses availability zone from node names and applies labels
+- **OCI Instance Renaming**: Renames OCI instances with AZ prefix from Hammerspace volume data
+- **Availability-Drop Management**: Pre-shutdown/post-maintenance availability-drop control for RMA workflows
 
 ### S3/Object Storage
 - **S3 Node Integration**: Add AWS S3 or S3-compatible storage nodes
@@ -70,9 +72,13 @@ ansible-storage-setup/
 ├── deploy_new_instances.sh  # Automated deployment script
 ├── verify_nfs.yml           # NFS verification playbook
 ├── collect_gpu_fabric.yml   # Collect GPU fabric data from instances
-├── cleanup_instance_nodes.py # Remove nodes/volumes from Hammerspace
-├── assign_az_to_volumes.py  # Assign AZ prefix based on GPU fabric
-├── DEPLOYMENT_GUIDE.md      # Step-by-step deployment guide for OCI
+├── cleanup_instance_nodes.py  # Remove nodes/volumes from Hammerspace
+├── assign_az_to_volumes.py   # Assign AZ prefix based on GPU fabric
+├── set_availability_drop.py  # Set availability-drop for maintenance/RMA
+├── add_volumes_to_group.py   # Add volumes to existing volume groups
+├── rename_oci_instances_az.py # Rename OCI instances with AZ prefix
+├── tier0_instances_limit     # Instance name list for targeted operations
+├── DEPLOYMENT_GUIDE.md       # Step-by-step deployment guide for OCI
 ├── vars/
 │   └── main.yml             # Main variables (customize this!)
 └── roles/
@@ -89,7 +95,8 @@ ansible-storage-setup/
         │   ├── add_volume.yml       # Add storage volumes
         │   ├── create_share.yml     # Create shares
         │   ├── task_queue_wait.yml  # API throttling
-        │   ├── volume_group_create.yml  # Volume groups
+        │   ├── volume_group_create.yml  # Create volume groups
+        │   ├── volume_group_add_volume.yml # Add volumes to existing groups
         │   ├── az_map.yml           # AZ label mapping
         │   ├── share_apply_objective.yml  # Share objectives
         │   ├── s3/                  # S3/Object storage tasks
@@ -1731,6 +1738,86 @@ python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password 'xxx' 
 # Apply AZ prefixes
 python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password 'xxx' \
   --gpu-fabric-file gpu_fabric_data.txt
+
+# Force a specific GPU fabric to a specific AZ (e.g., replacing an old fabric)
+python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --gpu-fabric-file gpu_fabric_data.txt \
+  --az-map "ocid1.computegpumemoryfabric.oc1...newid=AZ3" --dry-run
+
+# --az-map: explicitly map FABRIC_OCID=AZ# (repeatable, overrides auto-assignment)
+```
+
+### set_availability_drop.py
+
+Sets availability-drop on Hammerspace volumes for planned maintenance or RMA. Disabling availability-drop before shutdown keeps volumes registered (but offline) so they rejoin automatically when the instance comes back.
+
+```bash
+# Check current status for specific nodes
+python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --node instance20260303192653 --node instance20260303192654 --check
+
+# Disable availability-drop before shutdown (pre-RMA)
+python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --node instance20260303192653 --disable --dry-run
+
+# Re-enable after maintenance
+python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --node instance20260303192653 --enable
+
+# Post-restart health check (nodes + volumes + events)
+python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --node instance20260303192653 --health-check
+
+# Filter options: --node, --prefix, --contains, --pattern (regex), --all-nodes
+```
+
+### add_volumes_to_group.py
+
+Adds volumes to an existing Hammerspace volume group for instances listed in a file.
+
+```bash
+# Dry run - see what would be added
+python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --group "tier0-az1-volumes" --instances-file tier0_instances_limit --dry-run
+
+# Filter by AZ prefix (only AZ1 volumes)
+python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --group "tier0-az1-volumes" --instances-file tier0_instances_limit --az AZ1
+
+# Apply changes
+python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --group "tier0-az1-volumes" --instances-file tier0_instances_limit --yes
+
+# List current volume group members
+python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --group "tier0-az1-volumes" --list
+```
+
+### rename_oci_instances_az.py
+
+Renames OCI instance display names by prepending their Hammerspace AZ prefix (e.g., `instance20260303192653` → `AZ3_instance20260303192653`). AZ is determined from Hammerspace volume names.
+
+```bash
+# Using regex pattern to match OCI instances (dry run)
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --compartment-id <OCID> --name-pattern "^instance2026" --dry-run
+
+# Using instances file
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --compartment-id <OCID> --instances-file tier0_instances_limit --dry-run
+
+# Apply renames
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --compartment-id <OCID> --name-pattern "^instance2026" --yes
+
+# Skip instances already renamed with AZ prefix
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --compartment-id <OCID> --name-pattern "^instance2026" --skip-existing
+
+# Both: file + pattern (union of both)
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+  --compartment-id <OCID> --instances-file tier0_instances_limit \
+  --name-pattern "^instance2026030319" --dry-run
 ```
 
 ### collect_gpu_fabric.yml

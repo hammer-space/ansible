@@ -53,6 +53,8 @@
         systemctl stop nfs-kernel-server 2>/dev/null || \
         service nfs-kernel-server stop 2>/dev/null || \
         service nfs stop 2>/dev/null || true
+      async: 120
+      poll: 10
       changed_when: true
 
     - name: Stop rpcbind service
@@ -98,6 +100,8 @@
         systemctl start nfs-kernel-server 2>/dev/null || \
         service nfs-kernel-server start 2>/dev/null || \
         service nfs start 2>/dev/null
+      async: 120
+      poll: 10
       changed_when: true
 
 - name: Skip sunrpc reload (node already in Hammerspace)
