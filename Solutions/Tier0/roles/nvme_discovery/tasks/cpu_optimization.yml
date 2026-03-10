@@ -311,7 +311,7 @@
       Note: User-defined values in vars/main.yml override auto-detected settings.
 
 # ============================================================================
-# Apply NVMe Tuning
+# Apply NVMe Tuning (only for NVMe devices)
 # ============================================================================
 - name: Set NVMe I/O scheduler
   ansible.builtin.shell: |
@@ -322,7 +322,9 @@
     done
   changed_when: false
   failed_when: false
-  when: nvme_io_scheduler is defined
+  when:
+    - nvme_io_scheduler is defined
+    - storage_type | default('nvme') in ['nvme', 'all']
 
 - name: Set NVMe queue depth
   ansible.builtin.shell: |
@@ -333,4 +335,40 @@
     done
   changed_when: false
   failed_when: false
-  when: nvme_queue_depth is defined
+  when:
+    - nvme_queue_depth is defined
+    - storage_type | default('nvme') in ['nvme', 'all']
+
+# ============================================================================
+# Apply SCSI/SATA Tuning (only for HDD/SSD/SCSI devices)
+# ============================================================================
+- name: Set SCSI/SATA I/O scheduler (mq-deadline for HDD, none for SSD)
+  ansible.builtin.shell: |
+    for dev in /sys/block/sd*/queue/scheduler; do
+      if [ -f "$dev" ]; then
+        rota_file=$(dirname "$dev")/../queue/rotational
+        rota=$(cat "$(dirname "$dev")/rotational" 2>/dev/null || echo "1")
+        if [ "$rota" = "1" ]; then
+          echo "mq-deadline" > "$dev" 2>/dev/null || true
+        else
+          echo "none" > "$dev" 2>/dev/null || true
+        fi
+      fi
+    done
+  changed_when: false
+  failed_when: false
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Set SCSI/SATA read-ahead for HDD
+  ansible.builtin.shell: |
+    for dev in /sys/block/sd*/queue/read_ahead_kb; do
+      if [ -f "$dev" ]; then
+        rota=$(cat "$(dirname "$dev")/rotational" 2>/dev/null || echo "1")
+        if [ "$rota" = "1" ]; then
+          echo "4096" > "$dev" 2>/dev/null || true
+        fi
+      fi
+    done
+  changed_when: false
+  failed_when: false
+  when: storage_type | default('nvme') in ['hdd', 'scsi', 'all']

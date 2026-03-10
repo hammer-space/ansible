@@ -97,7 +97,7 @@
 
 - name: "Set volume exists flag"
   ansible.builtin.set_fact:
-    volume_already_exists: "{{ volume_check.status == 200 }}"
+    volume_already_exists: "{{ (volume_check.status | default(0)) == 200 }}"
 
 - name: "Add storage volume {{ volume_config.path }}"
   ansible.builtin.uri:

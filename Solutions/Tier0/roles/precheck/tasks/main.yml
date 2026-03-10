@@ -9,7 +9,8 @@
 - name: Initialize precheck variables
   ansible.builtin.set_fact:
     nvme_count: 0
-    nvme_in_use: []
+    scsi_count: 0
+    drives_in_use: []
     numa_device_counts: {}
     nvme_sector_info: []
     drives_needing_4k_format: []
@@ -17,7 +18,20 @@
     missing_packages: []
 
 # ============================================================================
-# NVMe Drive Count Validation
+# Hardware RAID Detection
+# ============================================================================
+
+- name: Set hardware RAID mode for precheck
+  ansible.builtin.set_fact:
+    _precheck_hw_raid: "{{ (hw_raid_devices is defined and hw_raid_devices | length > 0 and not (use_raid | default(true))) | bool }}"
+
+- name: Display hardware RAID precheck mode
+  ansible.builtin.debug:
+    msg: "Hardware RAID mode detected - skipping drive discovery, NUMA, and sector size checks"
+  when: _precheck_hw_raid
+
+# ============================================================================
+# Drive Count Validation (skipped for HW RAID)
 # ============================================================================
 
 - name: Count total NVMe namespaces
@@ -25,10 +39,16 @@
     ls -1 /dev/nvme*n1 2>/dev/null | wc -l
   register: nvme_count_raw
   changed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
 
 - name: Set NVMe count fact
   ansible.builtin.set_fact:
-    nvme_count: "{{ nvme_count_raw.stdout | int }}"
+    nvme_count: "{{ nvme_count_raw.stdout | default('0') | int }}"
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
 
 - name: Validate expected NVMe drive count
   ansible.builtin.assert:
@@ -39,31 +59,71 @@
       Check hardware or update expected_nvme_count in vars/main.yml.
     success_msg: "NVMe drive count OK: {{ nvme_count }} drives found (expected: {{ expected_nvme_count }})"
   when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
     - expected_nvme_count is defined
     - expected_nvme_count | int > 0
     - enforce_drive_count | default(false)
 
-- name: Warn if drive count doesn't match expected
+- name: Warn if NVMe drive count doesn't match expected
   ansible.builtin.debug:
     msg: |
       WARNING: Expected {{ expected_nvme_count }} NVMe drives but found {{ nvme_count }}.
       Set enforce_drive_count: true to fail on mismatch.
   when:
+    - storage_type | default('nvme') in ['nvme', 'all']
     - expected_nvme_count is defined
     - expected_nvme_count | int > 0
     - nvme_count | int != expected_nvme_count | int
     - not (enforce_drive_count | default(false))
 
+- name: Count total SCSI/SATA block devices
+  ansible.builtin.shell: |
+    lsblk -dno NAME,TYPE 2>/dev/null | grep -c ' disk' || echo "0"
+  register: scsi_count_raw
+  changed_when: false
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Set SCSI count fact
+  ansible.builtin.set_fact:
+    scsi_count: "{{ scsi_count_raw.stdout | default('0') | int }}"
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Validate expected SCSI/SATA drive count
+  ansible.builtin.assert:
+    that:
+      - scsi_count | int >= expected_scsi_count | int
+    fail_msg: |
+      FAILED: Expected {{ expected_scsi_count }} SCSI/SATA drives but found {{ scsi_count }}.
+      Check hardware or update expected_scsi_count in vars/main.yml.
+    success_msg: "SCSI/SATA drive count OK: {{ scsi_count }} drives found (expected: {{ expected_scsi_count }})"
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+    - expected_scsi_count is defined
+    - expected_scsi_count | int > 0
+    - enforce_drive_count | default(false)
+
 # ============================================================================
 # Drive Mount Status Check (ensure drives are not already in use)
 # ============================================================================
 
-- name: Get list of currently mounted devices
+- name: Identify boot device for exclusion
+  ansible.builtin.shell: |
+    lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1
+  register: boot_device_check
+  changed_when: false
+  when: not _precheck_hw_raid
+
+- name: Get list of currently mounted NVMe devices
   ansible.builtin.shell: |
     mount | grep -E '^/dev/nvme' | awk '{print $1}' | sed 's/p[0-9]*$//' | sort -u
   register: mounted_nvme_raw
   changed_when: false
   failed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
 
 - name: Get list of NVMe devices in use by mdadm
   ansible.builtin.shell: |
@@ -71,6 +131,9 @@
   register: mdadm_nvme_raw
   changed_when: false
   failed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
 
 - name: Get list of NVMe devices with LVM
   ansible.builtin.shell: |
@@ -78,48 +141,88 @@
   register: lvm_nvme_raw
   changed_when: false
   failed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
 
-- name: Combine all in-use NVMe devices
-  ansible.builtin.set_fact:
-    nvme_in_use: "{{ (mounted_nvme_raw.stdout_lines | default([])) + (mdadm_nvme_raw.stdout_lines | default([])) + (lvm_nvme_raw.stdout_lines | default([])) | unique }}"
-
-- name: Identify boot device for exclusion
+- name: Get list of currently mounted SCSI/SATA devices
   ansible.builtin.shell: |
-    lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1
-  register: boot_device_check
+    mount | grep -E '^/dev/sd' | awk '{print $1}' | sed 's/[0-9]*$//' | sort -u
+  register: mounted_scsi_raw
   changed_when: false
+  failed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Get list of SCSI/SATA devices in use by mdadm
+  ansible.builtin.shell: |
+    cat /proc/mdstat 2>/dev/null | grep -oE 'sd[a-z]+' | sed 's/^/\/dev\//' | sort -u
+  register: mdadm_scsi_raw
+  changed_when: false
+  failed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Get list of SCSI/SATA devices with LVM
+  ansible.builtin.shell: |
+    pvs --noheadings -o pv_name 2>/dev/null | grep '/dev/sd' | awk '{print $1}' | sed 's/[0-9]*$//' | sort -u
+  register: lvm_scsi_raw
+  changed_when: false
+  failed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Combine all in-use devices
+  ansible.builtin.set_fact:
+    drives_in_use: >-
+      {{ (mounted_nvme_raw.stdout_lines | default([]))
+       + (mdadm_nvme_raw.stdout_lines | default([]))
+       + (lvm_nvme_raw.stdout_lines | default([]))
+       + (mounted_scsi_raw.stdout_lines | default([]))
+       + (mdadm_scsi_raw.stdout_lines | default([]))
+       + (lvm_scsi_raw.stdout_lines | default([]))
+       | unique }}
+  when: not _precheck_hw_raid
 
 - name: Set boot device for comparison
   ansible.builtin.set_fact:
     boot_nvme_device: "/dev/{{ boot_device_check.stdout | trim }}n1"
-  when: boot_device_check.stdout | trim is match('^nvme')
+  when:
+    - not _precheck_hw_raid
+    - boot_device_check.stdout | default('') | trim is match('^nvme')
 
 - name: Filter out boot device from in-use list
   ansible.builtin.set_fact:
-    nvme_in_use_non_boot: "{{ nvme_in_use | reject('search', boot_device_check.stdout | trim) | list }}"
+    drives_in_use_non_boot: "{{ drives_in_use | reject('search', boot_device_check.stdout | trim) | list }}"
+  when: not _precheck_hw_raid
 
-- name: Display NVMe devices currently in use
+- name: Display devices currently in use
   ansible.builtin.debug:
     msg: |
-      NVMe devices currently in use (excluding boot):
-      {% if nvme_in_use_non_boot | length > 0 %}
-      {% for dev in nvme_in_use_non_boot %}
+      Storage devices currently in use (excluding boot):
+      {% if drives_in_use_non_boot | length > 0 %}
+      {% for dev in drives_in_use_non_boot %}
         - {{ dev }}
       {% endfor %}
       {% else %}
-        None - all NVMe devices are available for configuration
+        None - all devices are available for configuration
       {% endif %}
+  when: not _precheck_hw_raid
 
-- name: Fail if NVMe drives are already in use
+- name: Fail if drives are already in use
   ansible.builtin.fail:
     msg: |
-      ERROR: The following NVMe devices are already in use:
-      {{ nvme_in_use_non_boot | join(', ') }}
+      ERROR: The following devices are already in use:
+      {{ drives_in_use_non_boot | join(', ') }}
 
       These drives must be unmounted/removed from RAID/LVM before proceeding.
       Set force_raid_recreate: true and force_fs_recreate: true to override (DESTRUCTIVE!).
   when:
-    - nvme_in_use_non_boot | length > 0
+    - not _precheck_hw_raid
+    - drives_in_use_non_boot | length > 0
     - not (force_raid_recreate | default(false))
     - fail_on_drives_in_use | default(true)
 
@@ -138,10 +241,37 @@
     done
   register: numa_info_raw
   changed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
+
+- name: Gather NUMA node information for SCSI/SATA devices
+  ansible.builtin.shell: |
+    for dev in /sys/block/sd*; do
+      if [ -d "$dev" ]; then
+        name=$(basename "$dev")
+        size=$(cat "$dev/size" 2>/dev/null || echo "0")
+        if [ "$size" != "0" ] && [ -b "/dev/$name" ]; then
+          numa=$(cat "$dev/device/numa_node" 2>/dev/null || echo "-1")
+          echo "$name:$numa"
+        fi
+      fi
+    done
+  register: scsi_numa_info_raw
+  changed_when: false
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Combine NUMA info from all device types
+  ansible.builtin.set_fact:
+    combined_numa_info: "{{ (numa_info_raw.stdout_lines | default([])) + (scsi_numa_info_raw.stdout_lines | default([])) }}"
+  when: not _precheck_hw_raid
 
 - name: Build NUMA device count
   ansible.builtin.set_fact:
     numa_device_counts: {}
+  when: not _precheck_hw_raid
 
 - name: Count devices per NUMA node (excluding boot)
   ansible.builtin.set_fact:
@@ -151,8 +281,9 @@
           item.split(':')[1]: (numa_device_counts[item.split(':')[1]] | default(0) | int) + 1
         })
       }}
-  loop: "{{ numa_info_raw.stdout_lines }}"
+  loop: "{{ combined_numa_info | default([]) }}"
   when:
+    - not _precheck_hw_raid
     - item | length > 0
     - item.split(':')[0] != (boot_device_check.stdout | trim)
 
@@ -172,14 +303,16 @@
       {% else %}
       NUMA balance: OK ({{ counts | first | default(0) }} drives per node)
       {% endif %}
+  when: not _precheck_hw_raid
 
 - name: Warn on NUMA imbalance
   ansible.builtin.debug:
     msg: |
       WARNING: NUMA node imbalance detected!
-      For optimal performance, each NUMA node should have the same number of NVMe drives.
+      For optimal performance, each NUMA node should have the same number of drives.
       Current distribution: {{ numa_device_counts }}
   when:
+    - not _precheck_hw_raid
     - numa_device_counts | length > 1
     - (numa_device_counts.values() | list | max) != (numa_device_counts.values() | list | min)
     - warn_on_numa_imbalance | default(true)
@@ -189,6 +322,9 @@
 # ============================================================================
 
 - name: Check NVMe sector sizes (physical and logical)
+  when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
   ansible.builtin.shell: |
     for dev in /dev/nvme*n1; do
       if [ -b "$dev" ]; then
@@ -211,14 +347,18 @@
           'physical_block_size': item.split(':')[2] | int
         }]
       }}
-  loop: "{{ sector_size_raw.stdout_lines }}"
-  when: item | length > 0
+  loop: "{{ sector_size_raw.stdout_lines | default([]) }}"
+  when:
+    - not _precheck_hw_raid
+    - item | length > 0
 
 - name: Identify drives not using recommended 4K sector size
   ansible.builtin.set_fact:
     drives_needing_4k_format: "{{ nvme_sector_info | selectattr('logical_block_size', 'ne', expected_sector_size | default(4096)) | list }}"
+  when: not _precheck_hw_raid
 
 - name: Display NVMe sector sizes
+  when: not _precheck_hw_raid
   ansible.builtin.debug:
     msg: |
       NVMe Sector Size Check (Hammerspace recommends {{ expected_sector_size | default(4096) }} bytes):
@@ -252,6 +392,7 @@
       Set require_4k_sectors: false to allow 512-byte sectors, or
       Set format_nvme_to_4k: true with nvme_format_confirm to format drives.
   when:
+    - not _precheck_hw_raid
     - drives_needing_4k_format | length > 0
     - require_4k_sectors | default(false)
     - boot_nvme_device is not defined or (drives_needing_4k_format | map(attribute='device') | reject('equalto', boot_nvme_device) | list | length > 0)
@@ -262,6 +403,8 @@
 
 - name: Format NVMe drives to 4K sector size
   when:
+    - not _precheck_hw_raid
+    - storage_type | default('nvme') in ['nvme', 'all']
     - format_nvme_to_4k | default(false)
     - nvme_format_confirm | default('') == "YES_I_UNDERSTAND_THIS_IS_DESTRUCTIVE"
     - drives_needing_4k_format | length > 0
@@ -423,22 +566,20 @@
 
 - name: Define required packages (Debian/Ubuntu)
   ansible.builtin.set_fact:
-    required_packages:
-      - mdadm
-      - xfsprogs
-      - parted
-      - nfs-kernel-server
-      - nvme-cli
+    required_packages: >-
+      {{ ([] if _precheck_hw_raid else ['mdadm'])
+       + ['xfsprogs', 'parted', 'nfs-kernel-server']
+       + (['nvme-cli'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['nvme', 'all']) else [])
+       + (['smartmontools', 'hdparm'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']) else []) }}
   when: ansible_os_family == "Debian"
 
 - name: Define required packages (RedHat/Rocky/CentOS)
   ansible.builtin.set_fact:
-    required_packages:
-      - mdadm
-      - xfsprogs
-      - parted
-      - nfs-utils
-      - nvme-cli
+    required_packages: >-
+      {{ ([] if _precheck_hw_raid else ['mdadm'])
+       + ['xfsprogs', 'parted', 'nfs-utils']
+       + (['nvme-cli'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['nvme', 'all']) else [])
+       + (['smartmontools', 'hdparm'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']) else []) }}
   when: ansible_os_family == "RedHat"
 
 - name: Install required packages (Debian/Ubuntu)
@@ -454,14 +595,16 @@
     state: present
   when: ansible_os_family == "RedHat"
 
+- name: Build required commands list
+  ansible.builtin.set_fact:
+    required_commands: >-
+      {{ ([] if _precheck_hw_raid else ['mdadm'])
+       + ['mkfs.xfs', 'parted', 'exportfs']
+       + (['nvme'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['nvme', 'all']) else []) }}
+
 - name: Verify required commands are available
   ansible.builtin.command: "which {{ item }}"
-  loop:
-    - mdadm
-    - mkfs.xfs
-    - parted
-    - exportfs
-    - nvme
+  loop: "{{ required_commands }}"
   register: package_check
   changed_when: false
   failed_when: false
@@ -482,11 +625,15 @@
   ansible.builtin.stat:
     path: /etc/mdadm/mdadm.conf
   register: mdadm_conf
+  when: not _precheck_hw_raid
 
 - name: Display existing mdadm configuration status
   ansible.builtin.debug:
     msg: "Existing mdadm.conf found at /etc/mdadm/mdadm.conf - will be updated"
-  when: mdadm_conf.stat.exists
+  when:
+    - not _precheck_hw_raid
+    - mdadm_conf.stat is defined
+    - mdadm_conf.stat.exists
 
 - name: Check current NFS exports
   ansible.builtin.command: exportfs -v
@@ -515,16 +662,42 @@
     - iperf_test_enabled | default(false)
     - iperf_test_targets | default([]) | length > 0
 
+- name: Validation summary (HW RAID mode)
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+      PRE-SETUP VALIDATION SUMMARY (HW RAID MODE)
+      ============================================
+      Mode: Hardware RAID (software RAID skipped)
+      HW RAID Devices: {{ hw_raid_devices | join(', ') }}
+
+      Network:
+        - MTU tests: {% if ping_results.results is defined %}{{ ping_results.results | selectattr('rc', 'equalto', 0) | list | length }}/{{ ping_results.results | length }} passed{% else %}not configured{% endif %}
+
+      Packages:
+        - Missing: {{ package_check.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list | join(', ') | default('none') }}
+      ============================================
+  when: _precheck_hw_raid
+
 - name: Validation summary
   ansible.builtin.debug:
     msg: |
       ============================================
       PRE-SETUP VALIDATION SUMMARY
       ============================================
+      Storage Type: {{ storage_type | default('nvme') }}
+      {% if storage_type | default('nvme') in ['nvme', 'all'] %}
       NVMe Drives:
         - Total found: {{ nvme_count }}
         - Expected: {{ expected_nvme_count | default('not specified') }}
-        - In use (non-boot): {{ nvme_in_use_non_boot | length }}
+      {% endif %}
+      {% if storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all'] %}
+      SCSI/SATA Drives:
+        - Total found: {{ scsi_count }}
+        - Expected: {{ expected_scsi_count | default('not specified') }}
+      {% endif %}
+      Drives:
+        - In use (non-boot): {{ drives_in_use_non_boot | length }}
         - Boot device: {{ boot_device_check.stdout | trim | default('unknown') }}
 
       NUMA Balance:
@@ -546,3 +719,4 @@
 
       Review the output above for any warnings before proceeding.
       ============================================
+  when: not _precheck_hw_raid

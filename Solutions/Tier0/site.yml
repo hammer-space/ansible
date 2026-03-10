@@ -51,11 +51,11 @@
       when: flush_iptables | default(true)
       ignore_errors: true
 
-    - name: Verify we have the required variables (skip if using dynamic discovery)
+    - name: Verify we have the required variables (skip if using dynamic discovery or HW RAID)
       ansible.builtin.assert:
         that:
-          - raid_arrays is defined or individual_drives is defined or use_dynamic_discovery | default(false)
-          - nfs_exports is defined or use_dynamic_discovery | default(false)
+          - raid_arrays is defined or individual_drives is defined or use_dynamic_discovery | default(false) or hw_raid_devices is defined
+          - nfs_exports is defined or use_dynamic_discovery | default(false) or hw_raid_devices is defined
         fail_msg: "Required variables are not defined. Check vars/main.yml or enable use_dynamic_discovery"
 
     # Check if node is already registered in Hammerspace (to skip NFS restart)
@@ -87,10 +87,11 @@
       when: hammerspace_api_host is defined
 
   roles:
-    # Dynamic NVMe discovery - groups drives by NUMA and excludes boot device
+    # Dynamic storage discovery - groups drives by NUMA and excludes boot device
+    # Supports NVMe, HDD, SSD, and mixed environments (set storage_type in vars)
     - role: nvme_discovery
       when: use_dynamic_discovery | default(false)
-      tags: [discovery, nvme]
+      tags: [discovery, nvme, storage]
 
     - role: precheck
       tags: [precheck, validation]
@@ -137,6 +138,7 @@
         mode: '0644'
       delegate_to: localhost
       run_once: true
+      when: not ansible_check_mode
 
     - name: Append instance data to report
       ansible.builtin.lineinfile:
@@ -144,6 +146,7 @@
         line: "{{ inventory_hostname }},{{ oci_fault_domain | default('N/A') }},{{ converted_az }}"
         mode: '0644'
       delegate_to: localhost
+      when: not ansible_check_mode
 
     - name: Display instance report location
       ansible.builtin.debug:

@@ -7,9 +7,36 @@
 # RAID Configuration
 # ============================================================================
 
-# Set to false to skip RAID setup and use individual drives
+# Set to false to skip software RAID setup (mdadm)
+# Use cases for use_raid: false:
+#   - Hardware RAID controller (define hw_raid_devices below)
+#   - Individual drives without RAID (use raid_grouping_strategy: per_drive)
 # Note: If projected volume count > 1000, RAID configuration is recommended
 use_raid: true
+
+# ============================================================================
+# Hardware RAID Configuration (use when use_raid: false)
+# ============================================================================
+# When the customer has a hardware RAID controller, skip software RAID (mdadm)
+# and define the HW RAID logical volumes directly.
+#
+# Set use_raid: false and define hw_raid_devices to use this mode.
+# The playbook will create filesystems and mount points on these devices
+# without running mdadm.
+#
+# hw_raid_devices:
+#   - /dev/sda        # HW RAID logical volume 1
+#   - /dev/sdb        # HW RAID logical volume 2
+#   - /dev/md126      # HW RAID device (some controllers use /dev/md*)
+#   - /dev/cciss/c0d0 # HP Smart Array
+#   - /dev/dm-0       # Device mapper (some HW RAID)
+#
+# Mount points will be auto-generated as:
+#   /hammerspace/hsvol0 -> /dev/sda
+#   /hammerspace/hsvol1 -> /dev/sdb
+#   etc.
+#
+# The mount_base_path variable controls the base directory.
 
 # XFS allocation group count for mkfs.xfs (optional)
 # Hammerspace recommends agcount=512 for optimal performance
@@ -17,9 +44,21 @@ use_raid: true
 xfs_agcount: 512
 
 # ============================================================================
-# Dynamic NVMe Discovery (Recommended)
+# Storage Device Type
 # ============================================================================
-# When enabled, NVMe drives are automatically discovered and grouped by NUMA node
+# Controls which device types are discovered for RAID/storage configuration
+# Options:
+#   nvme  - NVMe drives only (default, backward compatible)
+#   hdd   - SCSI/SATA HDD only (/dev/sd*, rotational=1)
+#   ssd   - SCSI/SATA SSD only (/dev/sd*, rotational=0)
+#   scsi  - All SCSI/SATA devices (HDD + SSD)
+#   all   - NVMe + SCSI/SATA (mixed environment)
+storage_type: "nvme"
+
+# ============================================================================
+# Dynamic Drive Discovery (Recommended)
+# ============================================================================
+# When enabled, drives are automatically discovered and grouped by NUMA node
 # The boot device is automatically excluded from RAID configuration
 
 use_dynamic_discovery: true
@@ -107,6 +146,34 @@ nvme_exclude_pcie_addresses: []
 nvme_exclude_pcie_prefixes: []
   # - "0000:03"   # Exclude all devices on bus 03
   # - "0000:e"    # Exclude all devices on buses starting with 'e'
+
+# ============================================================================
+# SCSI/SATA Device Exclusion (used when storage_type is hdd/ssd/scsi/all)
+# ============================================================================
+# Exclude specific SCSI/SATA devices from RAID configuration
+# Boot device is always excluded automatically
+
+# Exclude by device name (e.g., sda, sdb)
+scsi_exclude_devices: []
+  # - sda
+  # - sdb
+
+# Exclude by device path (e.g., /dev/sda)
+scsi_exclude_paths: []
+  # - /dev/sda
+  # - /dev/sdb
+
+# Exclude by serial number
+scsi_exclude_serials: []
+  # - "WD-WMXXXXXXX"
+
+# Exclude by model name
+scsi_exclude_models: []
+  # - "VIRTUAL-DISK"
+
+# Expected SCSI/SATA drive count (parallel to expected_nvme_count)
+# Set to 0 or comment out to skip this check
+# expected_scsi_count: 12
 
 # ============================================================================
 # CPU-Optimized RAID Configuration

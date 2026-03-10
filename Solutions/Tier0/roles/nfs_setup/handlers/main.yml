@@ -23,7 +23,9 @@
   poll: 10
   ignore_errors: true
   listen: "Restart NFS server"
-  when: not (node_already_in_hammerspace | default(false))
+  when:
+    - not ansible_check_mode
+    - not (node_already_in_hammerspace | default(false))
 
 - name: Restart NFS service
   ansible.builtin.shell: |
@@ -38,7 +40,9 @@
   changed_when: true
   failed_when: false
   listen: "Restart NFS server"
-  when: not (node_already_in_hammerspace | default(false))
+  when:
+    - not ansible_check_mode
+    - not (node_already_in_hammerspace | default(false))
 
 - name: Verify NFS is running
   ansible.builtin.shell: |

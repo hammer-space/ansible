@@ -18,7 +18,7 @@
 
 - name: "Display current queue depth"
   ansible.builtin.debug:
-    msg: "Current queued tasks: {{ queued_tasks_result.json | length | default(0) }}"
+    msg: "Current queued tasks: {{ queued_tasks_result.json | default([]) | length }}"
   when: hammerspace_debug | default(false)
 
 - name: "Wait for task queue to clear (threshold: {{ hammerspace_max_queued_tasks | default(10) }})"
@@ -32,12 +32,13 @@
     validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
     timeout: 60
   register: task_queue_check
-  until: (task_queue_check.json | length) < (hammerspace_min_queued_tasks | default(5))
+  until: (task_queue_check.json | default([]) | length) < (hammerspace_min_queued_tasks | default(5))
   retries: "{{ hammerspace_task_queue_retries | default(100) }}"
   delay: "{{ hammerspace_task_queue_delay | default(10) }}"
   when:
     - hammerspace_task_queue_throttle | default(true)
-    - (queued_tasks_result.json | length | default(0)) > (hammerspace_max_queued_tasks | default(10))
+    - queued_tasks_result.json is defined
+    - (queued_tasks_result.json | length) > (hammerspace_max_queued_tasks | default(10))
 
 - name: "Check current EXECUTING task count"
   ansible.builtin.uri:
@@ -70,11 +71,12 @@
   when:
     - hammerspace_monitor_executing_tasks | default(false)
     - hammerspace_wait_for_executing | default(false)
-    - (executing_tasks_result.json | length | default(0)) > 0
+    - executing_tasks_result.json is defined
+    - (executing_tasks_result.json | length) > 0
 
 - name: "Display task queue status"
   ansible.builtin.debug:
     msg: >-
-      Task Queue Status - QUEUED: {{ task_queue_check.json | length | default(queued_tasks_result.json | length | default(0)) }},
-      EXECUTING: {{ executing_tasks_result.json | length | default('N/A') }}
+      Task Queue Status - QUEUED: {{ task_queue_check.json | default(queued_tasks_result.json | default([])) | length }},
+      EXECUTING: {{ executing_tasks_result.json | default([]) | length }}
   when: hammerspace_debug | default(false)

@@ -43,6 +43,7 @@
 
 - name: Reload sunrpc module by restarting NFS services
   when:
+    - not ansible_check_mode
     - sunrpc_pool_mode_before.stdout != "pernode"
     - sunrpc_pool_mode_before.stdout != "not_loaded"
     - not (node_already_in_hammerspace | default(false))
@@ -121,10 +122,10 @@
 - name: Display sunrpc pool_mode status
   ansible.builtin.debug:
     msg: |
-      sunrpc pool_mode: {{ sunrpc_pool_mode.stdout }}
-      {% if sunrpc_pool_mode.stdout == 'pernode' %}
+      sunrpc pool_mode: {{ sunrpc_pool_mode.stdout | default('unknown') }}
+      {% if sunrpc_pool_mode.stdout | default('unknown') == 'pernode' %}
       Status: OK - pernode mode is active
-      {% elif sunrpc_unload is defined and sunrpc_unload.rc != 0 %}
+      {% elif sunrpc_unload is defined and sunrpc_unload.rc | default(0) != 0 %}
       Status: REBOOT REQUIRED - sunrpc module is in use (check for active NFS mounts)
       {% else %}
       Status: Configuration saved - will apply on next service restart or reboot
