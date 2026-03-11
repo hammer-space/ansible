@@ -75,17 +75,22 @@
   when: hammerspace_debug | default(false)
 
 - name: "Check if volume {{ volume_config.path }} already exists"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/storage-volumes/{{ volume_name | urlencode }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: [200, 400, 404]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: volume_check
+  ansible.builtin.command:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 60
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/storage-volumes/{{ volume_name | urlencode }}"
+  register: volume_check_raw
+  changed_when: false
   failed_when: false
+  check_mode: false
+
+- name: "Parse volume check result"
+  ansible.builtin.set_fact:
+    volume_check:
+      status: "{{ (volume_check_raw.stdout_lines | default(['0']))[-1] | int }}"
+      json: "{{ ((volume_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n')) | default('{}', true) | from_json }}"
 
 - name: "Debug volume check result"
   ansible.builtin.debug:
@@ -97,47 +102,69 @@
 
 - name: "Set volume exists flag"
   ansible.builtin.set_fact:
-    volume_already_exists: "{{ (volume_check.status | default(0)) == 200 }}"
+    volume_already_exists: "{{ (volume_check.status | int) == 200 }}"
 
 - name: "Add storage volume {{ volume_config.path }}"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/storage-volumes?force=true"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: POST
-    body: "{{ volume_payload }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: [202, 400]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: volume_add_result
-  when: not volume_already_exists
+  ansible.builtin.command:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 180
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X POST -H "Content-Type: application/json"
+      -D /tmp/hs_volume_add_headers_{{ volume_name | hash('md5') }}.txt
+      -d '{{ volume_payload | to_json }}'
+      "{{ hs_api_url }}/storage-volumes?force=true"
+  register: volume_add_raw
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - not volume_already_exists
+
+- name: "Extract location header from volume add response"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_volume_add_headers_{{ volume_name | hash('md5') }}.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: volume_add_location_raw
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - not volume_already_exists
+
+- name: "Parse volume add result"
+  ansible.builtin.set_fact:
+    volume_add_result:
+      status: "{{ (volume_add_raw.stdout_lines | default(['0']))[-1] | int }}"
+      json: "{{ ((volume_add_raw.stdout_lines | default(['{}']))[:-1] | join('\n')) | default('{}', true) | from_json }}"
+      location: "{{ volume_add_location_raw.stdout | default('') }}"
+  when:
+    - not ansible_check_mode
+    - not volume_already_exists
 
 - name: "Check if add failed due to volume already existing"
   ansible.builtin.set_fact:
     volume_already_exists: true
   when:
+    - not ansible_check_mode
     - volume_add_result is defined
-    - volume_add_result.status | default(0) == 400
-    - "'already exists' in (volume_add_result.json | default([]) | string)"
+    - volume_add_result.status | default(0) | int == 400
+    - "'already exists' in (volume_add_result.json | default({}) | string)"
 
 - name: "Wait for volume {{ volume_config.path }} add to complete"
-  ansible.builtin.uri:
-    url: "{{ volume_add_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: volume_add_status
-  until: volume_add_status.json.status == "COMPLETED"
+  ansible.builtin.command:
+    cmd: >-
+      curl -s --max-time 60
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ volume_add_result.location }}"
+  register: volume_add_status_raw
+  changed_when: false
+  until: (volume_add_status_raw.stdout | from_json).status | default('') == "COMPLETED"
   retries: 20
   delay: 5
   when:
+    - not ansible_check_mode
     - not volume_already_exists
-    - volume_add_result.location is defined
+    - volume_add_result is defined
+    - volume_add_result.location | default('') | length > 0
 
 - name: "Display volume {{ volume_config.path }} status"
   ansible.builtin.debug:

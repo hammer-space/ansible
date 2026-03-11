@@ -124,20 +124,7 @@ Install Ansible on your control machine (laptop, workstation, or bastion):
 brew install ansible
 
 # Linux/pip
-# Install Python virtual environment module (Ubuntu/Debian)
-sudo apt install -y python3-venv
-
-# Create virtual environment in home directory (~/.hs_ansilbe)
-python3 -m venv ~/.hs_ansilbe
-
-# Activate the virtual environment (prompt shows (.hs_ansilbe))
-source ~/.hs_ansilbe/bin/activate
-
-# Linux/pip
-pip3 install ansible
-
-# Install Python packages from requirements.txt file
-pip3 install -r requirements.txt
+pip install ansible --break-system-packages
 
 # Install required collections
 ansible-galaxy collection install -r requirements.yml

@@ -110,7 +110,26 @@
 
 - name: Identify boot device for exclusion
   ansible.builtin.shell: |
-    lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1
+    root_source=$(findmnt -n -o SOURCE / 2>/dev/null)
+    if echo "$root_source" | grep -q "mapper\|dm-"; then
+      pv_device=$(pvs --noheadings -o pv_name 2>/dev/null | head -1 | xargs)
+      if [ -n "$pv_device" ]; then
+        base_disk=$(lsblk -no PKNAME "$pv_device" 2>/dev/null | head -1)
+        if [ -z "$base_disk" ]; then
+          base_disk=$(echo "$pv_device" | sed 's|/dev/||' | sed 's/p\?[0-9]*$//')
+        fi
+        echo "$base_disk"
+      else
+        lsblk -no PKNAME "$root_source" 2>/dev/null | head -1
+      fi
+    else
+      parent=$(lsblk -no PKNAME "$root_source" 2>/dev/null | head -1)
+      if [ -n "$parent" ]; then
+        echo "$parent"
+      else
+        echo "$root_source" | sed 's|/dev/||' | sed 's/p\?[0-9]*$//'
+      fi
+    fi
   register: boot_device_check
   changed_when: false
   when: not _precheck_hw_raid

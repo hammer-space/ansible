@@ -564,6 +564,10 @@ client_export_opts: "rw,root_squash,sync,secure,mp,no_subtree_check"
 # Firewall Configuration
 # ============================================================================
 
+# Set to false to skip firewall configuration entirely
+# Useful for environments where firewall is managed externally or not used
+configure_firewall: true
+
 # Ports to open for NFS
 # Standard ports - may need adjustment based on /etc/nfs.conf
 nfs_ports:

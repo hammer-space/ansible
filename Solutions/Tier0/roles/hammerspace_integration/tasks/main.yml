@@ -133,53 +133,79 @@
       _type: "NODE"
 
 - name: Check if storage system already exists
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/nodes/{{ hs_node_name | urlencode }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: [200, 404]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: node_check
+  ansible.builtin.command:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 60
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/nodes/{{ hs_node_name | urlencode }}"
+  register: node_check_raw
+  changed_when: false
   failed_when: false
+  check_mode: false
+
+- name: Parse node check result
+  ansible.builtin.set_fact:
+    node_check:
+      status: "{{ (node_check_raw.stdout_lines | default(['0']))[-1] | int }}"
+      json: "{{ ((node_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n')) | default('{}', true) | from_json }}"
 
 - name: Add storage system to Hammerspace cluster
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/nodes?ip={{ hs_node_ip }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: POST
-    body: "{{ storage_system_payload }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: 202
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: node_add_result
-  when: node_check.status | default(404) == 404
+  ansible.builtin.command:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 180
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X POST -H "Content-Type: application/json"
+      -D /tmp/hs_node_add_headers.txt
+      -d '{{ storage_system_payload | to_json }}'
+      "{{ hs_api_url }}/nodes?ip={{ hs_node_ip }}"
+  register: node_add_raw
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - node_check.status | int == 404
+
+- name: Extract location header from node add response
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_node_add_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: node_add_location_raw
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - node_check.status | int == 404
+
+- name: Parse node add result
+  ansible.builtin.set_fact:
+    node_add_result:
+      status: "{{ (node_add_raw.stdout_lines | default(['0']))[-1] | int }}"
+      location: "{{ node_add_location_raw.stdout | default('') }}"
+  when:
+    - not ansible_check_mode
+    - node_check.status | int == 404
 
 - name: Wait for storage system add to complete
-  ansible.builtin.uri:
-    url: "{{ node_add_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: node_add_status
-  until: node_add_status.json.status == "COMPLETED"
+  ansible.builtin.command:
+    cmd: >-
+      curl -s --max-time 60
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ node_add_result.location }}"
+  register: node_add_status_raw
+  changed_when: false
+  until: (node_add_status_raw.stdout | from_json).status | default('') == "COMPLETED"
   retries: 30
   delay: 10
-  when: node_add_result.location is defined
+  when:
+    - not ansible_check_mode
+    - node_add_result is defined
+    - node_add_result.location | default('') | length > 0
 
 - name: Display storage system status
   ansible.builtin.debug:
     msg: >-
       Storage system '{{ hs_node_name }}' ({{ hs_node_ip }})
-      {% if node_check.status | default(0) == 200 %}already exists{% else %}added successfully{% endif %}
+      {% if node_check.status | int == 200 %}already exists{% else %}added successfully{% endif %}
 
 # =============================================================================
 # Volume Groups (Optional - before volumes)

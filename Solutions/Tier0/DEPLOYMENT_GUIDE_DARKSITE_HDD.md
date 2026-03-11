@@ -613,11 +613,15 @@ ansible-playbook site.yml --tags precheck --ask-become-pass -K
 
 ### 10.1 Dry Run (Recommended First)
 
+> **Note:** `--check` mode skips shell commands, so storage discovery will not work.
+> Use `--tags "discovery,precheck"` instead — these roles are read-only and safe to run.
+
 ```bash
-ansible-playbook site.yml --check
-```
-# If using a non-root user with sudo, pass the become password:
-ansible-playbook site.yml --check --ask-become-pass -K
+# Recommended: run discovery + precheck (read-only, no changes to storage)
+ansible-playbook site.yml --tags "discovery,precheck"
+
+# If using a non-root user with sudo:
+ansible-playbook site.yml --tags "discovery,precheck" --ask-become-pass -K
 ```
 
 ### 10.2 Full Deployment
