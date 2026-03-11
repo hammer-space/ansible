@@ -1,0 +1,78 @@
+---
+# Create Volume Group
+# Called from main.yml with volume_group_config variable
+# Reference: hs_ops volume_group_create.yml
+
+- name: "Wait for task queue before creating volume group {{ volume_group_config.name }}"
+  ansible.builtin.include_tasks: task_queue_wait.yml
+  when: hammerspace_task_queue_throttle | default(true)
+
+- name: "Build volume group payload for {{ volume_group_config.name }}"
+  ansible.builtin.set_fact:
+    volume_group_payload:
+      _type: "VOLUME_GROUP"
+      name: "{{ volume_group_config.name }}"
+      expressions:
+        - operator: "IN"
+          locations: "{{ volume_group_config.volumes | default([]) | map('regex_replace', '^(.*)$', '{\"_type\": \"VOLUME_LOCATION\", \"extendedInfo\": {}, \"storageVolume\": {\"_type\": \"STORAGE_VOLUME\", \"extendedInfo\": {}, \"name\": \"\\1\"}}') | map('from_json') | list }}"
+  when: volume_group_config.volumes is defined
+
+- name: "Build volume group payload with pattern for {{ volume_group_config.name }}"
+  ansible.builtin.set_fact:
+    volume_group_payload:
+      _type: "VOLUME_GROUP"
+      name: "{{ volume_group_config.name }}"
+      expressions:
+        - _type: "EXPRESSION"
+          expressionType: "VOLUME_LOCATION"
+          namePattern: "{{ volume_group_config.location_pattern | default('*') }}"
+  when: volume_group_config.volumes is not defined
+
+- name: "Check if volume group {{ volume_group_config.name }} already exists"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/volume-groups/{{ volume_group_config.name | urlencode }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: [200, 404]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 60
+  register: volume_group_check
+  failed_when: false
+
+- name: "Create volume group {{ volume_group_config.name }}"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/volume-groups"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: POST
+    body: "{{ volume_group_payload }}"
+    body_format: json
+    force_basic_auth: true
+    status_code: [200, 201, 202]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 180
+  register: volume_group_create_result
+  when: volume_group_check.status == 404
+
+- name: "Wait for volume group creation to complete"
+  ansible.builtin.uri:
+    url: "{{ volume_group_create_result.location }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: 200
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+  register: volume_group_status
+  until: volume_group_status.json.status == "COMPLETED"
+  retries: 20
+  delay: 5
+  when: volume_group_create_result.location is defined
+
+- name: "Display volume group {{ volume_group_config.name }} status"
+  ansible.builtin.debug:
+    msg: >-
+      Volume Group '{{ volume_group_config.name }}'
+      {% if volume_group_check.status == 200 %}already exists{% else %}created successfully{% endif %}

@@ -1,0 +1,86 @@
+---
+# Firewall setup role - main tasks
+
+- name: Include OS-specific variables
+  ansible.builtin.include_vars: "{{ item }}"
+  with_first_found:
+    - "{{ ansible_distribution | lower }}-{{ ansible_distribution_major_version }}.yml"
+    - "{{ ansible_distribution | lower }}.yml"
+    - "{{ ansible_os_family | lower }}.yml"
+    - "default.yml"
+
+# Check which firewall tools are actually installed AND working
+- name: Check if firewalld service exists
+  ansible.builtin.stat:
+    path: /usr/lib/systemd/system/firewalld.service
+  register: firewalld_service_file
+
+- name: Check if ufw binary exists
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: ufw_binary
+
+- name: Check alternative ufw path
+  ansible.builtin.stat:
+    path: /usr/bin/ufw
+  register: ufw_binary_alt
+
+- name: Check if iptables binary exists
+  ansible.builtin.stat:
+    path: /usr/sbin/iptables
+  register: iptables_binary
+
+# Detect firewall type based on what's actually available
+- name: Detect firewall type
+  ansible.builtin.set_fact:
+    firewall_type: >-
+      {%- if firewalld_service_file.stat.exists | default(false) -%}
+        firewalld
+      {%- elif ufw_binary.stat.exists | default(false) or ufw_binary_alt.stat.exists | default(false) -%}
+        ufw
+      {%- elif iptables_binary.stat.exists | default(false) -%}
+        iptables
+      {%- else -%}
+        none
+      {%- endif -%}
+
+- name: Display detected firewall type
+  ansible.builtin.debug:
+    msg: |
+      Detected firewall type: {{ firewall_type }}
+      OS family: {{ ansible_os_family }}
+      firewalld service exists: {{ firewalld_service_file.stat.exists | default(false) }}
+      ufw binary exists: {{ ufw_binary.stat.exists | default(false) or ufw_binary_alt.stat.exists | default(false) }}
+      iptables binary exists: {{ iptables_binary.stat.exists | default(false) }}
+
+- name: Include firewalld tasks
+  ansible.builtin.include_tasks: firewalld.yml
+  when: firewall_type == 'firewalld'
+
+- name: Include ufw tasks
+  ansible.builtin.include_tasks: ufw.yml
+  when: firewall_type == 'ufw'
+
+- name: Include iptables tasks
+  ansible.builtin.include_tasks: iptables.yml
+  when: firewall_type == 'iptables'
+
+- name: Skip firewall configuration - no firewall detected
+  ansible.builtin.debug:
+    msg: |
+      No firewall (firewalld, ufw, or iptables) detected.
+      Skipping firewall configuration.
+      Ensure NFS ports are open manually: 111, 2049, 20048, 20049
+  when: firewall_type == 'none'
+
+- name: Get RPC port info for verification
+  ansible.builtin.command: rpcinfo -p
+  register: rpcinfo_output
+  changed_when: false
+  failed_when: false
+
+- name: Display RPC services and ports
+  ansible.builtin.debug:
+    msg: |
+      Current RPC services:
+      {{ rpcinfo_output.stdout }}

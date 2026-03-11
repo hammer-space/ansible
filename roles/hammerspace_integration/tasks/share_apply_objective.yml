@@ -1,0 +1,44 @@
+---
+# Apply Share Objective
+# Called from main.yml or create_share.yml with share_objective_config variable
+# Reference: hs_ops share_apply_objective.yml
+#
+# Available objectives include:
+# - availability-3-nines (99.9% availability)
+# - availability-4-nines (99.99% availability)
+# - performance-high
+# - durability-high
+
+- name: "Apply objective {{ share_objective_config.objective }} to share {{ share_objective_config.share_name }}"
+  ansible.builtin.uri:
+    url: "{{ hs_api_url }}/shares/{{ share_objective_config.share_name | urlencode }}/objective-set?objective-identifier={{ share_objective_config.objective | urlencode }}&applicability={{ share_objective_config.applicability | default('TRUE') | upper }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: POST
+    body: ""
+    force_basic_auth: true
+    status_code: [200, 202]
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: 180
+  register: objective_apply_result
+
+- name: "Wait for objective application to complete"
+  ansible.builtin.uri:
+    url: "{{ objective_apply_result.location }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    method: GET
+    force_basic_auth: true
+    status_code: 200
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+  register: objective_status
+  until: objective_status.json.status == "COMPLETED"
+  retries: 30
+  delay: 5
+  when: objective_apply_result.location is defined
+
+- name: "Display objective application status"
+  ansible.builtin.debug:
+    msg: >-
+      Objective '{{ share_objective_config.objective }}' applied to share '{{ share_objective_config.share_name }}'
+      with applicability={{ share_objective_config.applicability | default('TRUE') }}

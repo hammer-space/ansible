@@ -1,0 +1,12 @@
+[Unit]
+Description=Set Samsung NVMe read-ahead values for optimal performance
+After=local-fs.target
+Before=nfs-server.service nfs-kernel-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/set-readahead.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

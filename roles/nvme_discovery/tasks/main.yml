@@ -1,0 +1,507 @@
+---
+# Storage Discovery Role - Dynamically discover drives and group by NUMA node
+# Supports NVMe, HDD, SSD, and mixed environments
+# Excludes boot drive automatically for safe RAID configuration
+
+- name: Initialize discovery variables
+  ansible.builtin.set_fact:
+    nvme_devices: []
+    scsi_devices: []
+    numa_nodes: []
+    nvme_by_numa: {}
+    discovered_raid_arrays: []
+    discovered_mount_points: []
+    discovered_nfs_exports: []
+    _hs_clients: []
+    _hw_raid_mode: false
+    raid_arrays: "{{ raid_arrays | default([]) }}"
+    mount_points: "{{ mount_points | default([]) }}"
+    nfs_exports: "{{ nfs_exports | default([]) }}"
+
+- name: Display storage type
+  ansible.builtin.debug:
+    msg: "Storage type: {{ storage_type | default('nvme') }}"
+
+# ============================================================================
+# Hardware RAID Mode - Skip discovery, use pre-defined HW RAID devices
+# ============================================================================
+- name: Handle hardware RAID devices (skip software RAID)
+  when:
+    - not (use_raid | default(true))
+    - hw_raid_devices is defined
+    - hw_raid_devices | length > 0
+  block:
+    - name: Display hardware RAID mode
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          HARDWARE RAID MODE
+          ============================================
+          Software RAID (mdadm) will be SKIPPED.
+          Using {{ hw_raid_devices | length }} pre-configured HW RAID device(s):
+          {% for dev in hw_raid_devices %}
+            - {{ dev }}
+          {% endfor %}
+          Mount base path: {{ mount_base_path | default('/hammerspace') }}
+          ============================================
+
+    - name: Verify HW RAID devices exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ hw_raid_devices }}"
+      register: hw_raid_device_checks
+
+    - name: Fail if any HW RAID device does not exist
+      ansible.builtin.fail:
+        msg: "Hardware RAID device {{ item.item }} does not exist! Verify your hw_raid_devices configuration."
+      loop: "{{ hw_raid_device_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: not item.stat.exists
+
+    - name: Build mount points from HW RAID devices
+      ansible.builtin.set_fact:
+        discovered_mount_points: >-
+          {{
+            discovered_mount_points | default([]) + [{
+              'path': mount_base_path | default('/hammerspace') + '/hsvol' + (loop_index | string),
+              'device': item,
+              'fstype': 'xfs',
+              'label': 'hsvol' + (loop_index | string),
+              'mount_opts': 'defaults,nofail',
+              'is_raid': false
+            }]
+          }}
+      loop: "{{ hw_raid_devices }}"
+      loop_control:
+        index_var: loop_index
+
+    - name: Override mount_points with HW RAID configuration
+      ansible.builtin.set_fact:
+        mount_points: "{{ discovered_mount_points }}"
+
+    - name: Initialize NFS client list for HW RAID
+      ansible.builtin.set_fact:
+        _hs_clients: []
+
+    - name: Add Hammerspace nodes to NFS client list (HW RAID)
+      ansible.builtin.set_fact:
+        _hs_clients: "{{ _hs_clients + [{'host': item, 'options': hammerspace_export_opts | default('rw,no_root_squash,sync,secure,mp,no_subtree_check')}] }}"
+      loop: "{{ (hammerspace_nodes | default([])) + (mover_nodes | default([])) }}"
+
+    - name: Add client subnets to NFS client list (HW RAID)
+      ansible.builtin.set_fact:
+        _hs_clients: "{{ _hs_clients + [{'host': item, 'options': client_export_opts | default('rw,root_squash,sync,secure,mp,no_subtree_check')}] }}"
+      loop: "{{ client_subnets | default([]) }}"
+
+    - name: Build NFS exports for HW RAID mount points
+      ansible.builtin.set_fact:
+        discovered_nfs_exports: "{{ discovered_nfs_exports | default([]) + [{'path': item.path, 'clients': _hs_clients}] }}"
+      loop: "{{ discovered_mount_points }}"
+
+    - name: Override nfs_exports with HW RAID configuration
+      ansible.builtin.set_fact:
+        nfs_exports: "{{ discovered_nfs_exports }}"
+      when: discovered_nfs_exports | length > 0
+
+    - name: Set HW RAID mode flag
+      ansible.builtin.set_fact:
+        _hw_raid_mode: true
+
+    - name: Display HW RAID final configuration
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          HW RAID CONFIGURATION COMPLETE
+          ============================================
+          Mount Points:
+          {% for mp in mount_points %}
+            {{ mp.path }} -> {{ mp.device }} ({{ mp.fstype }})
+          {% endfor %}
+
+          NFS Exports: {{ nfs_exports | length }} paths configured
+          ============================================
+
+# ============================================================================
+# CPU-Optimized RAID Configuration
+# ============================================================================
+- name: Include CPU optimization tasks
+  ansible.builtin.include_tasks: cpu_optimization.yml
+  when:
+    - not _hw_raid_mode
+    - cpu_optimized_raid | default(true)
+
+- name: Identify boot device (device containing root filesystem)
+  ansible.builtin.shell: |
+    # Find the root filesystem source device
+    root_source=$(findmnt -n -o SOURCE / 2>/dev/null)
+
+    # Trace through LVM/device-mapper to the physical disk
+    if echo "$root_source" | grep -q "mapper\|dm-"; then
+      # LVM: get the physical volume, then trace to the base disk
+      pv_device=$(pvs --noheadings -o pv_name 2>/dev/null | head -1 | xargs)
+      if [ -n "$pv_device" ]; then
+        # Strip partition number to get base disk (nvme2n1p3 -> nvme2n1, sda3 -> sda)
+        base_disk=$(lsblk -no PKNAME "$pv_device" 2>/dev/null | head -1)
+        if [ -z "$base_disk" ]; then
+          # Fallback: strip partition suffix directly
+          base_disk=$(echo "$pv_device" | sed 's|/dev/||' | sed 's/p\?[0-9]*$//')
+        fi
+        echo "$base_disk"
+      else
+        lsblk -no PKNAME "$root_source" 2>/dev/null | head -1
+      fi
+    else
+      # Direct partition or disk
+      parent=$(lsblk -no PKNAME "$root_source" 2>/dev/null | head -1)
+      if [ -n "$parent" ]; then
+        echo "$parent"
+      else
+        echo "$root_source" | sed 's|/dev/||' | sed 's/p\?[0-9]*$//'
+      fi
+    fi
+  register: boot_device_raw
+  changed_when: false
+  when: not _hw_raid_mode
+
+- name: Set boot device fact
+  ansible.builtin.set_fact:
+    boot_device: "{{ boot_device_raw.stdout | default('') | trim }}"
+  when: not _hw_raid_mode
+
+- name: Display boot device
+  ansible.builtin.debug:
+    msg: "Boot device detected: {{ boot_device }} (will be excluded from RAID)"
+  when: not _hw_raid_mode
+
+# ============================================================================
+# NVMe Discovery (when storage_type is nvme or all)
+# ============================================================================
+- name: Discover NVMe devices
+  when:
+    - not _hw_raid_mode
+    - storage_type | default('nvme') in ['nvme', 'all']
+  block:
+    - name: Discover all NVMe devices with NUMA node, serial, model, and PCIe address
+      ansible.builtin.shell: |
+        for nvme in /sys/class/nvme/nvme*; do
+          if [ -d "$nvme" ]; then
+            name=$(basename "$nvme")
+            numa=$(cat "$nvme/device/numa_node" 2>/dev/null || echo "-1")
+            serial=$(cat "$nvme/serial" 2>/dev/null | xargs || echo "unknown")
+            model=$(cat "$nvme/model" 2>/dev/null | xargs || echo "unknown")
+            pcie=$(cat "$nvme/address" 2>/dev/null | xargs || echo "unknown")
+            if [ -b "/dev/${name}n1" ]; then
+              echo "${name}:${numa}:${serial}:${model}:${pcie}"
+            fi
+          fi
+        done
+      register: nvme_numa_raw
+      changed_when: false
+
+    - name: Initialize excluded devices list
+      ansible.builtin.set_fact:
+        nvme_excluded_devices: []
+
+    - name: Build NVMe device list with full info
+      ansible.builtin.set_fact:
+        nvme_all_devices: >-
+          {{
+            nvme_all_devices | default([]) + [{
+              'name': item.split(':')[0],
+              'device': '/dev/' + item.split(':')[0] + 'n1',
+              'numa': item.split(':')[1] | int,
+              'serial': item.split(':')[2],
+              'model': item.split(':')[3],
+              'pcie_address': ':'.join(item.split(':')[4:])
+            }]
+          }}
+      loop: "{{ nvme_numa_raw.stdout_lines | default([]) }}"
+      when: item | length > 0
+
+    - name: Apply NVMe exclusion rules
+      ansible.builtin.set_fact:
+        nvme_devices: >-
+          {{
+            nvme_all_devices | default([]) | rejectattr('name', 'equalto', boot_device)
+            | rejectattr('name', 'in', nvme_exclude_devices | default([]) | map('regex_replace', 'n1$', '') | list)
+            | rejectattr('device', 'in', nvme_exclude_paths | default([]))
+            | rejectattr('serial', 'in', nvme_exclude_serials | default([]))
+            | rejectattr('numa', 'in', nvme_exclude_numa_nodes | default([]))
+            | rejectattr('pcie_address', 'in', nvme_exclude_pcie_addresses | default([]))
+            | list
+          }}
+
+    - name: Apply NVMe model exclusion
+      ansible.builtin.set_fact:
+        nvme_devices: >-
+          {{
+            nvme_devices | rejectattr('model', 'in', nvme_exclude_models | default([])) | list
+          }}
+      when: nvme_exclude_models | default([]) | length > 0
+
+    - name: Apply NVMe PCIe prefix exclusion
+      ansible.builtin.set_fact:
+        nvme_devices: >-
+          {{
+            nvme_devices | rejectattr('pcie_address', 'match', '^(' + nvme_exclude_pcie_prefixes | join('|') + ')') | list
+          }}
+      when: nvme_exclude_pcie_prefixes | default([]) | length > 0
+
+    - name: Build excluded NVMe devices list for reporting
+      ansible.builtin.set_fact:
+        nvme_excluded_devices: >-
+          {{
+            nvme_all_devices | default([]) | difference(nvme_devices) | list
+          }}
+
+    - name: Display NVMe exclusion information
+      ansible.builtin.debug:
+        msg: |
+          NVMe Exclusion Summary:
+          ============================================
+          Boot device (always excluded): {{ boot_device }}
+          Excluded by device name: {{ nvme_exclude_devices | default([]) | join(', ') | default('none', true) }}
+          Excluded by path: {{ nvme_exclude_paths | default([]) | join(', ') | default('none', true) }}
+          Excluded by serial: {{ nvme_exclude_serials | default([]) | join(', ') | default('none', true) }}
+          Excluded by model: {{ nvme_exclude_models | default([]) | join(', ') | default('none', true) }}
+          Excluded by NUMA node: {{ nvme_exclude_numa_nodes | default([]) | join(', ') | default('none', true) }}
+          Excluded by PCIe address: {{ nvme_exclude_pcie_addresses | default([]) | join(', ') | default('none', true) }}
+          Excluded by PCIe prefix: {{ nvme_exclude_pcie_prefixes | default([]) | join(', ') | default('none', true) }}
+
+          Devices excluded from RAID:
+          {% for dev in nvme_excluded_devices %}
+            - {{ dev.device }} ({{ dev.model }}, Serial: {{ dev.serial }}, NUMA: {{ dev.numa }}, PCIe: {{ dev.pcie_address }})
+          {% endfor %}
+          {% if nvme_excluded_devices | length == 0 %}
+            (none - only boot device excluded)
+          {% endif %}
+          ============================================
+      when: nvme_exclude_devices | default([]) | length > 0 or
+            nvme_exclude_paths | default([]) | length > 0 or
+            nvme_exclude_serials | default([]) | length > 0 or
+            nvme_exclude_models | default([]) | length > 0 or
+            nvme_exclude_numa_nodes | default([]) | length > 0 or
+            nvme_exclude_pcie_addresses | default([]) | length > 0 or
+            nvme_exclude_pcie_prefixes | default([]) | length > 0
+
+    - name: Display NVMe discovery results
+      ansible.builtin.debug:
+        msg: "NVMe discovery: {{ nvme_devices | length }} device(s) found"
+
+# ============================================================================
+# SCSI/SATA Discovery (when storage_type is hdd, ssd, scsi, or all)
+# ============================================================================
+- name: Discover SCSI/SATA devices
+  when:
+    - not _hw_raid_mode
+    - storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+  block:
+    - name: Discover all SCSI/SATA block devices with NUMA, serial, model, and rotational flag
+      ansible.builtin.shell: |
+        for dev in /sys/block/sd*; do
+          if [ -d "$dev" ]; then
+            name=$(basename "$dev")
+            size=$(cat "$dev/size" 2>/dev/null || echo "0")
+            # Skip zero-size devices
+            if [ "$size" = "0" ] || [ ! -b "/dev/$name" ]; then
+              continue
+            fi
+            rota=$(cat "$dev/queue/rotational" 2>/dev/null || echo "1")
+            numa=$(cat "$dev/device/numa_node" 2>/dev/null || echo "-1")
+            serial=$(udevadm info --query=property --name="/dev/$name" 2>/dev/null | grep -m1 'ID_SERIAL_SHORT=' | cut -d= -f2 || echo "unknown")
+            if [ -z "$serial" ]; then serial="unknown"; fi
+            model=$(cat "$dev/device/model" 2>/dev/null | xargs || echo "unknown")
+            echo "${name}:${numa}:${serial}:${model}:${rota}"
+          fi
+        done
+      register: scsi_raw
+      changed_when: false
+
+    - name: Build SCSI device list with full info
+      ansible.builtin.set_fact:
+        scsi_all_devices: >-
+          {{
+            scsi_all_devices | default([]) + [{
+              'name': item.split(':')[0],
+              'device': '/dev/' + item.split(':')[0],
+              'numa': item.split(':')[1] | int,
+              'serial': item.split(':')[2],
+              'model': item.split(':')[3],
+              'pcie_address': 'N/A',
+              'rotational': item.split(':')[4] | int
+            }]
+          }}
+      loop: "{{ scsi_raw.stdout_lines | default([]) }}"
+      when: item | length > 0
+
+    - name: Filter by storage type (HDD only)
+      ansible.builtin.set_fact:
+        scsi_all_devices: "{{ scsi_all_devices | default([]) | selectattr('rotational', 'equalto', 1) | list }}"
+      when: storage_type | default('nvme') == 'hdd'
+
+    - name: Filter by storage type (SSD only)
+      ansible.builtin.set_fact:
+        scsi_all_devices: "{{ scsi_all_devices | default([]) | selectattr('rotational', 'equalto', 0) | list }}"
+      when: storage_type | default('nvme') == 'ssd'
+
+    - name: Apply SCSI exclusion rules
+      ansible.builtin.set_fact:
+        scsi_devices: >-
+          {{
+            scsi_all_devices | default([]) | rejectattr('name', 'equalto', boot_device)
+            | rejectattr('name', 'in', scsi_exclude_devices | default([]))
+            | rejectattr('device', 'in', scsi_exclude_paths | default([]))
+            | rejectattr('serial', 'in', scsi_exclude_serials | default([]))
+            | list
+          }}
+
+    - name: Apply SCSI model exclusion
+      ansible.builtin.set_fact:
+        scsi_devices: >-
+          {{
+            scsi_devices | rejectattr('model', 'in', scsi_exclude_models | default([])) | list
+          }}
+      when: scsi_exclude_models | default([]) | length > 0
+
+    - name: Display SCSI discovery results
+      ansible.builtin.debug:
+        msg: |
+          SCSI/SATA Discovery Results:
+          ============================================
+          Storage type filter: {{ storage_type | default('nvme') }}
+          Boot device (excluded): {{ boot_device }}
+          Total SCSI/SATA devices for RAID: {{ scsi_devices | length }}
+          {% for dev in scsi_devices %}
+            {{ dev.device }}: {{ dev.model }} (Serial: {{ dev.serial }}, NUMA: {{ dev.numa }}, {{ 'HDD' if dev.rotational == 1 else 'SSD' }})
+          {% endfor %}
+          ============================================
+
+# ============================================================================
+# Merge SCSI devices into NVMe device list (unified downstream processing)
+# ============================================================================
+- name: Merge SCSI devices into unified device list
+  ansible.builtin.set_fact:
+    nvme_devices: "{{ (nvme_devices | default([])) + (scsi_devices | default([])) }}"
+  when:
+    - not _hw_raid_mode
+    - storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Get unique NUMA nodes
+  ansible.builtin.set_fact:
+    numa_nodes: "{{ nvme_devices | map(attribute='numa') | unique | sort | list }}"
+  when: not _hw_raid_mode
+
+- name: Group devices by NUMA node
+  ansible.builtin.set_fact:
+    nvme_by_numa: >-
+      {{
+        nvme_by_numa | default({}) | combine({
+          item | string: nvme_devices | selectattr('numa', 'equalto', item) | map(attribute='device') | list
+        })
+      }}
+  loop: "{{ numa_nodes }}"
+  when: not _hw_raid_mode
+
+- name: Display discovered storage configuration
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+      STORAGE DISCOVERY RESULTS
+      ============================================
+      Storage type: {{ storage_type | default('nvme') }}
+      Boot device (excluded): {{ boot_device }}
+      Total devices for RAID: {{ nvme_devices | length }}
+      NUMA nodes detected: {{ numa_nodes | join(', ') }}
+
+      Devices by NUMA node:
+      {% for numa in numa_nodes %}
+      NUMA {{ numa }}: {{ nvme_by_numa[numa | string] | join(', ') }}
+      {% endfor %}
+
+      Device Details:
+      {% for dev in nvme_devices %}
+        {{ dev.device }}: {{ dev.model }} (Serial: {{ dev.serial }}, NUMA: {{ dev.numa }}{% if dev.pcie_address is defined and dev.pcie_address != 'N/A' %}, PCIe: {{ dev.pcie_address }}{% endif %})
+      {% endfor %}
+      ============================================
+  when: not _hw_raid_mode
+
+# ============================================================================
+# Build RAID Arrays (with sizing options)
+# ============================================================================
+- name: Include RAID array building tasks
+  ansible.builtin.include_tasks: build_raid_arrays.yml
+  when: not _hw_raid_mode
+
+- name: Override raid_arrays with discovered configuration
+  ansible.builtin.set_fact:
+    raid_arrays: "{{ discovered_raid_arrays }}"
+  when:
+    - not _hw_raid_mode
+    - use_dynamic_discovery | default(true)
+    - raid_grouping_strategy | default('numa') != 'per_drive'
+
+- name: Override mount_points with discovered configuration
+  ansible.builtin.set_fact:
+    mount_points: "{{ discovered_mount_points }}"
+  when:
+    - not _hw_raid_mode
+    - use_dynamic_discovery | default(true)
+
+- name: Initialize NFS client list
+  ansible.builtin.set_fact:
+    _hs_clients: []
+  when: not _hw_raid_mode
+
+- name: Add Hammerspace nodes to NFS client list
+  ansible.builtin.set_fact:
+    _hs_clients: "{{ _hs_clients + [{'host': item, 'options': hammerspace_export_opts | default('rw,no_root_squash,sync,secure,mp,no_subtree_check')}] }}"
+  loop: "{{ (hammerspace_nodes | default([])) + (mover_nodes | default([])) }}"
+  when: not _hw_raid_mode
+
+- name: Add client subnets to NFS client list
+  ansible.builtin.set_fact:
+    _hs_clients: "{{ _hs_clients + [{'host': item, 'options': client_export_opts | default('rw,root_squash,sync,secure,mp,no_subtree_check')}] }}"
+  loop: "{{ client_subnets | default([]) }}"
+  when: not _hw_raid_mode
+
+- name: Build dynamic NFS exports for discovered mount points
+  ansible.builtin.set_fact:
+    discovered_nfs_exports: "{{ discovered_nfs_exports | default([]) + [{'path': item.path, 'clients': _hs_clients}] }}"
+  loop: "{{ discovered_mount_points }}"
+  when:
+    - not _hw_raid_mode
+    - use_dynamic_discovery | default(true)
+
+- name: Override nfs_exports with discovered configuration
+  ansible.builtin.set_fact:
+    nfs_exports: "{{ discovered_nfs_exports }}"
+  when:
+    - not _hw_raid_mode
+    - use_dynamic_discovery | default(true)
+    - discovered_nfs_exports is defined
+    - discovered_nfs_exports | length > 0
+
+- name: Display final RAID configuration
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+      DYNAMIC RAID CONFIGURATION
+      ============================================
+      {% for array in raid_arrays %}
+      {{ array.name }} ({{ array.device }}):
+        NUMA Node: {{ array.numa_node | default('N/A') }}
+        RAID Level: {{ array.level }}
+        Drives ({{ array.drives | length }}): {{ array.drives | join(', ') }}
+      {% endfor %}
+      ============================================
+
+      Mount Points:
+      {% for mp in mount_points %}
+      {{ mp.path }} -> {{ mp.device }} ({{ mp.fstype }})
+      {% endfor %}
+      ============================================
+
+      NFS Exports: {{ nfs_exports | length }} paths configured
+      ============================================
+  when: not _hw_raid_mode

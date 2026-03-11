@@ -1,0 +1,173 @@
+---
+# Add a storage volume to Hammerspace
+# Called from main.yml with volume_config variable
+#
+# Volume naming convention: [AZ:]nodename::path
+# Example: AZ1:tier0-node-01::/hammerspace/hsvol0
+
+# Check task queue before adding volume (throttling)
+- name: "Wait for task queue before adding {{ volume_config.path }}"
+  ansible.builtin.include_tasks: task_queue_wait.yml
+  when: hammerspace_task_queue_throttle | default(true)
+
+# Compute the effective AZ prefix based on settings
+- name: "Compute AZ prefix for {{ volume_config.path }}"
+  ansible.builtin.set_fact:
+    _effective_az_prefix: >-
+      {%- if hammerspace_volume_az_prefix is defined -%}
+        {{ hammerspace_volume_az_prefix }}
+      {%- elif not (hammerspace_volume_az_prefix_enabled | default(false)) -%}
+
+      {%- elif (hammerspace_volume_az_prefix_mode | default('')) == 'auto' -%}
+        {{ oci_fault_domain | default('') | regex_replace('FAULT-DOMAIN-', 'AZ') }}{{ ':' if oci_fault_domain is defined and oci_fault_domain else '' }}
+      {%- else -%}
+        {{ hammerspace_volume_az_prefix_mode | default('') }}
+      {%- endif -%}
+
+# Build the volume name with optional AZ prefix
+# Note: node_name should NOT include AZ prefix (node is registered without it)
+# Only volume_name includes the AZ prefix per Hammerspace convention: [AZ:]nodename::path
+- name: "Set volume name for {{ volume_config.path }}"
+  ansible.builtin.set_fact:
+    volume_name: "{{ _effective_az_prefix }}{{ hammerspace_node_name | default(inventory_hostname) }}::{{ volume_config.path }}"
+    node_name: "{{ hammerspace_node_name | default(inventory_hostname) }}"
+
+- name: "Build volume payload for {{ volume_config.path }}"
+  ansible.builtin.set_fact:
+    volume_payload:
+      _type: "STORAGE_VOLUME"
+      name: "{{ volume_name }}"
+      logicalVolume:
+        _type: "LOGICAL_VOLUME"
+        name: "{{ volume_config.path }}"
+        node:
+          _type: "NODE"
+          name: "{{ node_name }}"
+        exportPath: "{{ volume_config.path }}"
+        fsType: "THIRD_PARTY"
+        usageType: "DS"
+        ipAddresses:
+          - address: "{{ hammerspace_node_ip | default(ansible_default_ipv4.address) }}"
+            prefixLength: 32
+        createPlacementObjectives: "{{ hammerspace_create_placement_objectives | default(true) }}"
+        skipPerfTest: "{{ hammerspace_skip_performance_test | default(true) }}"
+        isSharedChecked: true
+        isReadOnlyChecked: false
+      node:
+        _type: "NODE"
+        name: "{{ node_name }}"
+      accessType: "{{ volume_config.access_type | default('READ_WRITE') }}"
+      additionalAddresses: "{{ hammerspace_additional_ips | default([]) }}"
+      excludedIpAddresses: "{{ hammerspace_excluded_ips | default([]) }}"
+      maxSuspectedSeconds: "{{ hammerspace_volume_max_suspected_seconds | default(0) }}"
+      storageCapabilities:
+        performance:
+          utilizationThreshold: "{{ hammerspace_volume_high_threshold | default(0.98) }}"
+          utilizationEvacuationThreshold: "{{ hammerspace_volume_low_threshold | default(0.90) }}"
+        protection:
+          unavailableStateAvailabilityMultiplier: "{{ hammerspace_volume_unavailable_multiplier | default(1) }}"
+          availability: "{{ hammerspace_volume_availability | default(2) }}"
+          durability: "{{ hammerspace_volume_durability | default(3) }}"
+
+- name: "Debug volume payload"
+  ansible.builtin.debug:
+    var: volume_payload
+  when: hammerspace_debug | default(false)
+
+- name: "Check if volume {{ volume_config.path }} already exists"
+  ansible.builtin.command:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 60
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/storage-volumes/{{ volume_name | urlencode }}"
+  register: volume_check_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Parse volume check result"
+  ansible.builtin.set_fact:
+    volume_check:
+      status: "{{ (volume_check_raw.stdout_lines | default(['0']))[-1] | int }}"
+      json: "{{ ((volume_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n')) | default('{}', true) | from_json }}"
+
+- name: "Debug volume check result"
+  ansible.builtin.debug:
+    msg: |
+      Volume check for '{{ volume_name }}':
+      Status: {{ volume_check.status | default('undefined') }}
+      URL: {{ hs_api_url }}/storage-volumes/{{ volume_name | urlencode }}
+  when: hammerspace_debug | default(false)
+
+- name: "Set volume exists flag"
+  ansible.builtin.set_fact:
+    volume_already_exists: "{{ (volume_check.status | int) == 200 }}"
+
+- name: "Add storage volume {{ volume_config.path }}"
+  ansible.builtin.command:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 180
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X POST -H "Content-Type: application/json"
+      -D /tmp/hs_volume_add_headers_{{ volume_name | hash('md5') }}.txt
+      -d '{{ volume_payload | to_json }}'
+      "{{ hs_api_url }}/storage-volumes?force=true"
+  register: volume_add_raw
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - not volume_already_exists
+
+- name: "Extract location header from volume add response"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_volume_add_headers_{{ volume_name | hash('md5') }}.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: volume_add_location_raw
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - not volume_already_exists
+
+- name: "Parse volume add result"
+  ansible.builtin.set_fact:
+    volume_add_result:
+      status: "{{ (volume_add_raw.stdout_lines | default(['0']))[-1] | int }}"
+      json: "{{ ((volume_add_raw.stdout_lines | default(['{}']))[:-1] | join('\n')) | default('{}', true) | from_json }}"
+      location: "{{ volume_add_location_raw.stdout | default('') }}"
+  when:
+    - not ansible_check_mode
+    - not volume_already_exists
+
+- name: "Check if add failed due to volume already existing"
+  ansible.builtin.set_fact:
+    volume_already_exists: true
+  when:
+    - not ansible_check_mode
+    - volume_add_result is defined
+    - volume_add_result.status | default(0) | int == 400
+    - "'already exists' in (volume_add_result.json | default({}) | string)"
+
+- name: "Wait for volume {{ volume_config.path }} add to complete"
+  ansible.builtin.command:
+    cmd: >-
+      curl -s --max-time 60
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ volume_add_result.location }}"
+  register: volume_add_status_raw
+  changed_when: false
+  until: (volume_add_status_raw.stdout | from_json).status | default('') == "COMPLETED"
+  retries: 20
+  delay: 5
+  when:
+    - not ansible_check_mode
+    - not volume_already_exists
+    - volume_add_result is defined
+    - volume_add_result.location | default('') | length > 0
+
+- name: "Display volume {{ volume_config.path }} status"
+  ansible.builtin.debug:
+    msg: >-
+      Volume '{{ volume_name }}'
+      {% if volume_already_exists %}already exists (skipped){% else %}added successfully{% endif %}

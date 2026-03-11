@@ -1,0 +1,19 @@
+---
+# Install with: ansible-galaxy collection install -r requirements.yml
+
+collections:
+  - name: ansible.posix
+    version: ">=1.4.0"
+  - name: community.general
+    version: ">=6.0.0"
+  # OCI Dynamic Inventory (optional - only needed if using inventory.oci.yml)
+  - name: oracle.oci
+    version: ">=5.0.0"
+  # AWS Dynamic Inventory (optional - only needed if using inventory.aws.yml)
+  # Requires: pip3 install boto3 botocore
+  - name: amazon.aws
+    version: ">=6.0.0"
+  # GCP Dynamic Inventory (optional - only needed if using inventory.gcp.yml)
+  # Requires: pip3 install google-auth requests
+  - name: google.cloud
+    version: ">=1.0.0"
