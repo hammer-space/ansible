@@ -506,12 +506,17 @@ ocid1.computegpumemoryfabric.oc1.us-sanjose-1.anqwyl...xk8m2pqrs instance2026012
 
 After collecting GPU fabric data, assign AZ prefixes to Hammerspace volumes:
 
+> **Credential setup (all scripts):** Use `--password-file` (recommended), `HAMMERSPACE_PASSWORD` env var, or interactive prompt. The `--password` flag still works for backward compatibility.
+> ```bash
+> echo 'your-password' > ~/.hs_password && chmod 600 ~/.hs_password
+> ```
+
 **Dry run (recommended first):**
 ```bash
 python3 assign_az_to_volumes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'your-password' \
+  --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt \
   --dry-run
 ```
@@ -521,7 +526,7 @@ python3 assign_az_to_volumes.py \
 python3 assign_az_to_volumes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'your-password' \
+  --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt
 ```
 
@@ -530,7 +535,7 @@ python3 assign_az_to_volumes.py \
 python3 assign_az_to_volumes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'your-password' \
+  --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt \
   --report-only
 ```
@@ -544,7 +549,7 @@ Use `--az-map` to explicitly map a GPU fabric OCID to an AZ. This is useful when
 python3 assign_az_to_volumes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'your-password' \
+  --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt \
   --az-map "ocid1.computegpumemoryfabric.oc1...newid=AZ3" \
   --dry-run
@@ -553,7 +558,7 @@ python3 assign_az_to_volumes.py \
 python3 assign_az_to_volumes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'your-password' \
+  --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt \
   --az-map "ocid1...fabric_a=AZ3" \
   --az-map "ocid1...fabric_b=AZ5"
@@ -566,7 +571,7 @@ When you need to replace an old GPU fabric (and its nodes) with a new one while 
 ```bash
 # 1. Check current AZ assignments
 python3 assign_az_to_volumes.py \
-  --host 10.241.0.105 --user admin --password 'your-password' \
+  --host 10.241.0.105 --user admin --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt --report-only
 
 # 2. Collect GPU fabric for new replacement nodes
@@ -576,7 +581,7 @@ ansible-playbook collect_gpu_fabric.yml -i inventory.oci.yml \
 
 # 3. Clean up old nodes and volumes from Hammerspace
 python3 cleanup_instance_nodes.py \
-  --host 10.241.0.105 --user admin --password 'your-password' \
+  --host 10.241.0.105 --user admin --password-file ~/.hs_password \
   --node old-instance1 --node old-instance2 \
   --parallel 5
 
@@ -586,7 +591,7 @@ ansible-playbook site.yml -i inventory.oci.yml \
 
 # 5. Assign the old AZ number to the new GPU fabric
 python3 assign_az_to_volumes.py \
-  --host 10.241.0.105 --user admin --password 'your-password' \
+  --host 10.241.0.105 --user admin --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt \
   --az-map "ocid1.computegpumemoryfabric.oc1...new_fabric_id=AZ3" \
   --dry-run
@@ -668,7 +673,7 @@ ansible-playbook site.yml -i inventory.oci.yml --limit @.new_instances_limit
 
 # 5. Collect GPU fabric and assign AZ (if using GPU fabric-based AZ)
 ansible-playbook collect_gpu_fabric.yml -i inventory.oci.yml
-python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt
 ```
 
@@ -817,7 +822,7 @@ The `cleanup_instance_nodes.py` script removes nodes and their volumes from Hamm
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'your-password' \
+  --password-file ~/.hs_password \
   --dry-run
 ```
 
@@ -850,7 +855,7 @@ Fetching storage volumes...
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'your-password'
+  --password-file ~/.hs_password
 ```
 
 **Step 3: Execute cleanup (with parallel volume deletion)**
@@ -858,7 +863,7 @@ python3 cleanup_instance_nodes.py \
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'your-password' \
+  --password-file ~/.hs_password \
   --parallel 5
 ```
 
@@ -891,7 +896,7 @@ Nodes:   10 deleted, 0 failed, 0 skipped
 |--------|-------------|
 | `--host` | Hammerspace Anvil IP (required) |
 | `--user` | API username (required) |
-| `--password` | API password (required) |
+| `--password` | API password (or use `--password-file` / `HAMMERSPACE_PASSWORD` env) |
 | `--list-nodes` | List all nodes and exit (no deletion) |
 | `--prefix` | Match nodes starting with prefix |
 | `--contains` | Match nodes containing string |
@@ -906,7 +911,7 @@ Nodes:   10 deleted, 0 failed, 0 skipped
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'xxx' \
+  --password-file ~/.hs_password \
   --list-nodes
 ```
 
@@ -916,7 +921,7 @@ python3 cleanup_instance_nodes.py \
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'xxx' \
+  --password-file ~/.hs_password \
   --prefix "bu-test" \
   --dry-run
 
@@ -924,7 +929,7 @@ python3 cleanup_instance_nodes.py \
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'xxx' \
+  --password-file ~/.hs_password \
   --contains "test" \
   --dry-run
 
@@ -932,7 +937,7 @@ python3 cleanup_instance_nodes.py \
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'xxx' \
+  --password-file ~/.hs_password \
   --pattern "^bu-.*-01$" \
   --dry-run
 
@@ -940,7 +945,7 @@ python3 cleanup_instance_nodes.py \
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'xxx' \
+  --password-file ~/.hs_password \
   --node bu-test-01 \
   --node bu-test-02 \
   --dry-run
@@ -949,7 +954,7 @@ python3 cleanup_instance_nodes.py \
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'xxx' \
+  --password-file ~/.hs_password \
   --contains "test" \
   --parallel 5
 
@@ -957,7 +962,7 @@ python3 cleanup_instance_nodes.py \
 python3 cleanup_instance_nodes.py \
   --host 10.241.0.105 \
   --user admin \
-  --password 'xxx' \
+  --password-file ~/.hs_password \
   --contains "test" \
   --parallel 5 \
   --yes
@@ -1022,18 +1027,18 @@ python3 cleanup_instance_nodes.py \
 | Collect GPU fabric | `ansible-playbook collect_gpu_fabric.yml -i inventory.oci.yml` |
 | Assign AZ to volumes | `python3 assign_az_to_volumes.py --host <IP> --gpu-fabric-file gpu_fabric_data.txt` |
 | Assign AZ (explicit) | `python3 assign_az_to_volumes.py --host <IP> --gpu-fabric-file gpu_fabric_data.txt --az-map "FABRIC_OCID=AZ3"` |
-| List all nodes | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --list-nodes` |
-| Cleanup (dry run) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name" --dry-run` |
-| Cleanup (execute) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name"` |
-| Cleanup (parallel) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password 'xxx' --contains "name" --parallel 5` |
-| Avail-drop check | `python3 set_availability_drop.py --host <IP> --user admin --password 'xxx' --node <NAME> --check` |
-| Avail-drop disable (pre-RMA) | `python3 set_availability_drop.py --host <IP> --user admin --password 'xxx' --node <NAME> --disable` |
-| Avail-drop enable (post-RMA) | `python3 set_availability_drop.py --host <IP> --user admin --password 'xxx' --node <NAME> --enable` |
-| Health check (post-restart) | `python3 set_availability_drop.py --host <IP> --user admin --password 'xxx' --node <NAME> --health-check` |
-| Add volumes to group | `python3 add_volumes_to_group.py --host <IP> --user admin --password 'xxx' --group "group-name" --instances-file tier0_instances_limit` |
-| List volume group members | `python3 add_volumes_to_group.py --host <IP> --user admin --password 'xxx' --group "group-name" --list` |
-| Rename OCI instances (pattern) | `python3 rename_oci_instances_az.py --host <IP> --user admin --password 'xxx' --compartment-id <OCID> --name-pattern "^instance2026"` |
-| Rename OCI instances (file) | `python3 rename_oci_instances_az.py --host <IP> --user admin --password 'xxx' --compartment-id <OCID> --instances-file tier0_instances_limit` |
+| List all nodes | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password-file ~/.hs_password --list-nodes` |
+| Cleanup (dry run) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password-file ~/.hs_password --contains "name" --dry-run` |
+| Cleanup (execute) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password-file ~/.hs_password --contains "name"` |
+| Cleanup (parallel) | `python3 cleanup_instance_nodes.py --host <IP> --user admin --password-file ~/.hs_password --contains "name" --parallel 5` |
+| Avail-drop check | `python3 set_availability_drop.py --host <IP> --user admin --password-file ~/.hs_password --node <NAME> --check` |
+| Avail-drop disable (pre-RMA) | `python3 set_availability_drop.py --host <IP> --user admin --password-file ~/.hs_password --node <NAME> --disable` |
+| Avail-drop enable (post-RMA) | `python3 set_availability_drop.py --host <IP> --user admin --password-file ~/.hs_password --node <NAME> --enable` |
+| Health check (post-restart) | `python3 set_availability_drop.py --host <IP> --user admin --password-file ~/.hs_password --node <NAME> --health-check` |
+| Add volumes to group | `python3 add_volumes_to_group.py --host <IP> --user admin --password-file ~/.hs_password --group "group-name" --instances-file tier0_instances_limit` |
+| List volume group members | `python3 add_volumes_to_group.py --host <IP> --user admin --password-file ~/.hs_password --group "group-name" --list` |
+| Rename OCI instances (pattern) | `python3 rename_oci_instances_az.py --host <IP> --user admin --password-file ~/.hs_password --compartment-id <OCID> --name-pattern "^instance2026"` |
+| Rename OCI instances (file) | `python3 rename_oci_instances_az.py --host <IP> --user admin --password-file ~/.hs_password --compartment-id <OCID> --instances-file tier0_instances_limit` |
 
 ---
 

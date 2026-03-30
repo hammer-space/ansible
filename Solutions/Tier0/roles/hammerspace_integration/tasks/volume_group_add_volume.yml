@@ -4,25 +4,30 @@
 # Uses the volume group's existing configuration and appends the new volume
 
 - name: "Get existing volume group {{ volume_group_update.group_name }}"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/volume-groups/{{ volume_group_update.group_name | urlencode }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: [200, 404]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: vg_existing
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/volume-groups/{{ volume_group_update.group_name | urlencode }}"
+  register: vg_existing_raw
+  changed_when: false
   failed_when: false
+  check_mode: false
+
+- name: "Parse existing volume group result"
+  ansible.builtin.set_fact:
+    vg_existing_check:
+      status: "{{ (vg_existing_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((vg_existing_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
 
 - name: "Skip if volume group {{ volume_group_update.group_name }} does not exist"
   ansible.builtin.debug:
     msg: "Volume group '{{ volume_group_update.group_name }}' not found - skipping"
-  when: vg_existing.status == 404
+  when: vg_existing_check.status | int == 404
 
 - name: "Add volume to volume group {{ volume_group_update.group_name }}"
-  when: vg_existing.status == 200
+  when: vg_existing_check.status | int == 200
   block:
     - name: "Wait for task queue before updating volume group {{ volume_group_update.group_name }}"
       ansible.builtin.include_tasks: task_queue_wait.yml
@@ -30,7 +35,7 @@
 
     - name: "Build updated volume group payload"
       ansible.builtin.set_fact:
-        _vg_existing_locations: "{{ vg_existing.json.expressions[0].locations | default([]) }}"
+        _vg_existing_locations: "{{ vg_existing_check.json.expressions[0].locations | default([]) }}"
         _vg_new_volume_location:
           _type: "VOLUME_LOCATION"
           extendedInfo: {}
@@ -43,30 +48,35 @@
       ansible.builtin.set_fact:
         _volume_already_in_group: "{{ _vg_existing_locations | selectattr('storageVolume.name', 'equalto', volume_group_update.volume_name) | list | length > 0 }}"
 
-    - name: "Skip - volume already in group"
+    - name: "Skip volume group update (volume already in group)"
       ansible.builtin.debug:
         msg: "Volume '{{ volume_group_update.volume_name }}' already in volume group '{{ volume_group_update.group_name }}'"
       when: _volume_already_in_group
 
-    - name: "Update volume group {{ volume_group_update.group_name }} with new volume"
-      ansible.builtin.uri:
-        url: "{{ hs_api_url }}/volume-groups/{{ volume_group_update.group_name | urlencode }}"
-        user: "{{ hammerspace_api_user }}"
-        password: "{{ hammerspace_api_password }}"
-        method: PUT
-        body:
+    - name: "Build volume group update payload"
+      ansible.builtin.set_fact:
+        _vg_update_payload:
           _type: "VOLUME_GROUP"
           name: "{{ volume_group_update.group_name }}"
           expressions:
             - operator: "IN"
               locations: "{{ _vg_existing_locations + [_vg_new_volume_location] }}"
-        body_format: json
-        force_basic_auth: true
-        status_code: [200, 201, 202]
-        validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-        timeout: 180
-      register: vg_update_result
       when: not _volume_already_in_group
+
+    - name: "Update volume group {{ volume_group_update.group_name }} with new volume"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+          -X PUT -H "Content-Type: application/json"
+          -d '{{ _vg_update_payload | to_json }}'
+          "{{ hs_api_url }}/volume-groups/{{ volume_group_update.group_name | urlencode }}"
+      register: vg_update_result
+      changed_when: true
+      when:
+        - not _volume_already_in_group
+        - not ansible_check_mode
 
     - name: "Display volume group update status"
       ansible.builtin.debug:

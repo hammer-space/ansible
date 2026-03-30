@@ -4,20 +4,25 @@
 # Reference: hs_ops ad_join.yml
 
 - name: "Get current AD configuration"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/ad"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: [200, 404]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: current_ad
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/ad"
+  register: current_ad_raw
+  changed_when: false
   failed_when: false
+  check_mode: false
   retries: 20
   delay: 5
-  until: current_ad.status in [200, 404]
+  until: (current_ad_raw.stdout_lines | default(['0']))[-1] | default('0') | int in [200, 404]
+
+- name: "Parse current AD configuration"
+  ansible.builtin.set_fact:
+    current_ad:
+      status: "{{ (current_ad_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((current_ad_raw.stdout_lines | default(['[]']))[:-1] | join('\n') | trim | default('[]', true)) | from_json }}"
 
 - name: "Build AD join payload"
   ansible.builtin.set_fact:
@@ -32,38 +37,75 @@
   ansible.builtin.set_fact:
     ad_already_joined: "{{ current_ad.json[0].joined | default(false) if current_ad.json is defined and current_ad.json | length > 0 else false }}"
 
-- name: "Join Active Directory domain {{ ad_config.domain }}"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/ad/{{ current_ad.json[0].uoid.uuid }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: PUT
-    body: "{{ current_ad.json[0] | combine(ad_payload, recursive=True) }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: [200, 202]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 300
-  register: ad_join_result
+- name: "Build combined AD payload"
+  ansible.builtin.set_fact:
+    ad_combined_payload: "{{ current_ad.json[0] | combine(ad_payload, recursive=True) }}"
   when:
     - not ad_already_joined
     - current_ad.json is defined
     - current_ad.json | length > 0
 
+- name: "Join Active Directory domain {{ ad_config.domain }}"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(300) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X PUT -H "Content-Type: application/json"
+      -D /tmp/hs_ad_join_headers.txt
+      -d '{{ ad_combined_payload | to_json }}'
+      "{{ hs_api_url }}/ad/{{ current_ad.json[0].uoid.uuid }}"
+  register: ad_join_raw
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - not ad_already_joined
+    - current_ad.json is defined
+    - current_ad.json | length > 0
+
+- name: "Extract AD join location header"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_ad_join_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: ad_join_location_raw
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - ad_join_raw is not skipped
+
+- name: "Parse AD join result"
+  ansible.builtin.set_fact:
+    ad_join_result:
+      status: "{{ (ad_join_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      location: "{{ ad_join_location_raw.stdout | default('') }}"
+  when:
+    - not ansible_check_mode
+    - ad_join_raw is not skipped
+
 - name: "Wait for AD join to complete"
-  ansible.builtin.uri:
-    url: "{{ ad_join_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: ad_join_status
-  until: ad_join_status.json.status == "COMPLETED"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ ad_join_result.location }}"
+  register: ad_join_status_raw
+  changed_when: false
+  until: (ad_join_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
   retries: 60
   delay: 10
-  when: ad_join_result.location is defined
+  when:
+    - not ansible_check_mode
+    - ad_join_result is defined
+    - ad_join_result.location | default('') | length > 0
+
+- name: "Fail if AD join did not complete successfully"
+  ansible.builtin.fail:
+    msg: "AD join task ended with status: {{ (ad_join_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}"
+  when:
+    - not ansible_check_mode
+    - ad_join_status_raw is defined
+    - ad_join_status_raw.stdout is defined
+    - (ad_join_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: "Display AD join status"
   ansible.builtin.debug:

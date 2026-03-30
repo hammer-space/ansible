@@ -1,0 +1,91 @@
+---
+# Reusable API Request Wrapper
+# Abstracts curl vs ansible.builtin.uri based on _hs_use_curl detection
+#
+# Required variables:
+#   _api_request_url:     Full API URL
+#   _api_request_method:  HTTP method (GET, POST, PUT, DELETE)
+#
+# Optional variables:
+#   _api_request_body:        Request body dict (for POST/PUT)
+#   _api_request_timeout:     Timeout in seconds (default: 60 for GET, 180 for POST/PUT)
+#   _api_request_save_headers: true to save response headers (for Location extraction)
+#   _api_request_header_file:  Header file path (default: /tmp/hs_api_headers.txt)
+#
+# Output:
+#   _api_response.status:   HTTP status code (int)
+#   _api_response.json:     Parsed response body (dict or list)
+#   _api_response.location: Location header value (if _api_request_save_headers)
+
+- name: "Set API request defaults"
+  ansible.builtin.set_fact:
+    _api_req_timeout: "{{ _api_request_timeout | default(60 if _api_request_method == 'GET' else 180) }}"
+    _api_req_header_file: "{{ _api_request_header_file | default('/tmp/hs_api_headers.txt') }}"
+    _api_req_save_headers: "{{ _api_request_save_headers | default(false) }}"
+
+# =============================================================================
+# curl path
+# =============================================================================
+
+- name: "API request via curl ({{ _api_request_method }} {{ _api_request_url | regex_replace('.*/(mgmt/.*)', '/\\1') }})"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ _api_req_timeout }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      {% if _api_request_method != 'GET' %}-X {{ _api_request_method }} -H "Content-Type: application/json"{% endif %}
+      {% if _api_req_save_headers | bool %}-D {{ _api_req_header_file }}{% endif %}
+      {% if _api_request_body is defined %}-d '{{ _api_request_body | to_json }}'{% endif %}
+      "{{ _api_request_url }}"
+  register: _api_curl_raw
+  changed_when: _api_request_method != 'GET'
+  failed_when: false
+  check_mode: false
+  when: _hs_use_curl | bool
+
+- name: "Extract Location header (curl)"
+  ansible.builtin.shell: |
+    grep -i '^Location:' {{ _api_req_header_file }} 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: _api_curl_location_raw
+  changed_when: false
+  when:
+    - _hs_use_curl | bool
+    - _api_req_save_headers | bool
+    - _api_curl_raw is defined
+
+- name: "Parse curl response"
+  ansible.builtin.set_fact:
+    _api_response:
+      status: "{{ ((_api_curl_raw.stdout_lines | default(['0']))[-1] | default('0')) | int }}"
+      json: "{{ ((_api_curl_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+      location: "{{ _api_curl_location_raw.stdout | default('') if (_api_req_save_headers | bool) else '' }}"
+  when: _hs_use_curl | bool
+
+# =============================================================================
+# uri module path (Python < 3.13)
+# =============================================================================
+
+- name: "API request via uri ({{ _api_request_method }} {{ _api_request_url | regex_replace('.*/(mgmt/.*)', '/\\1') }})"
+  ansible.builtin.uri:
+    url: "{{ _api_request_url }}"
+    method: "{{ _api_request_method }}"
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: "{{ _api_req_timeout | int }}"
+    body_format: json
+    body: "{{ _api_request_body | default(omit) }}"
+    return_content: true
+    status_code: [200, 201, 202, 204, 400, 404, 409, 500]
+  register: _api_uri_raw
+  check_mode: false
+  when: not (_hs_use_curl | bool)
+
+- name: "Parse uri response"
+  ansible.builtin.set_fact:
+    _api_response:
+      status: "{{ _api_uri_raw.status | default(0) | int }}"
+      json: "{{ _api_uri_raw.json | default(_api_uri_raw.content | default('{}') | from_json) }}"
+      location: "{{ _api_uri_raw.location | default('') }}"
+  when: not (_hs_use_curl | bool)

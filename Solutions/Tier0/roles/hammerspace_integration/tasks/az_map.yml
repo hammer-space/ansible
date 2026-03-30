@@ -27,43 +27,49 @@
   ansible.builtin.debug:
     msg: "Node '{{ hs_node_name }}' mapped to AZ: {{ node_az }}, Base name: {{ node_base_name }}"
 
-- name: "Apply availability-zone label to node"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/nodes/{{ hs_node_name | urlencode }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: node_details
+- name: "Get node details for AZ label"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/nodes/{{ hs_node_name | urlencode }}"
+  register: node_details_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: hammerspace_apply_az_labels | default(false)
+
+- name: "Parse node details result"
+  ansible.builtin.set_fact:
+    node_details_check:
+      status: "{{ (node_details_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((node_details_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
   when: hammerspace_apply_az_labels | default(false)
 
 - name: "Build node update payload with AZ label"
   ansible.builtin.set_fact:
-    node_az_payload: "{{ node_details.json | combine({'labels': (node_details.json.labels | default([])) + [{'key': 'availability-zone', 'value': node_az}]}, recursive=True) }}"
+    node_az_payload: "{{ node_details_check.json | combine({'labels': (node_details_check.json.labels | default([])) + [{'key': 'availability-zone', 'value': node_az}]}, recursive=True) }}"
   when:
     - hammerspace_apply_az_labels | default(false)
-    - node_details.json is defined
+    - node_details_check.json is defined
 
 - name: "Update node with AZ label"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/nodes/{{ node_details.json.uoid.uuid }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: PUT
-    body: "{{ node_az_payload }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: [200, 202]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X PUT -H "Content-Type: application/json"
+      -d '{{ node_az_payload | to_json }}'
+      "{{ hs_api_url }}/nodes/{{ node_details_check.json.uoid.uuid }}"
   register: az_label_result
+  changed_when: true
   when:
     - hammerspace_apply_az_labels | default(false)
     - node_az_payload is defined
-    - node_az not in (node_details.json.labels | default([]) | map(attribute='value') | list)
+    - node_az not in (node_details_check.json.labels | default([]) | map(attribute='value') | list)
+    - not ansible_check_mode
 
 - name: "Display AZ label status"
   ansible.builtin.debug:

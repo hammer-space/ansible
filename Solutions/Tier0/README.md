@@ -1697,6 +1697,11 @@ pip3 install google-auth requests
 
 ## Utility Scripts
 
+> **Credential setup (all scripts):** Use `--password-file` (recommended), `HAMMERSPACE_PASSWORD` env var, or interactive prompt. The `--password` flag still works for backward compatibility.
+> ```bash
+> echo 'your-password' > ~/.hs_password && chmod 600 ~/.hs_password
+> ```
+
 ### cleanup_instance_nodes.py
 
 Removes nodes and their volumes from Hammerspace. Use before terminating instances.
@@ -1705,18 +1710,18 @@ Removes nodes and their volumes from Hammerspace. Use before terminating instanc
 
 ```bash
 # List all nodes
-python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password 'xxx' --list-nodes
+python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password --list-nodes
 
 # Delete nodes containing "bu-test" (dry run first)
-python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --contains "bu-test" --dry-run
 
 # Delete specific nodes
-python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --node bu-test-01 --node bu-test-02
 
 # Parallel volume deletion (5 at a time)
-python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 cleanup_instance_nodes.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --contains "bu-test" --parallel 5
 
 # Filter options: --prefix, --contains, --pattern (regex), --node (specific names)
@@ -1732,15 +1737,15 @@ Assigns AZ prefixes to Hammerspace volumes based on OCI GPU memory fabric.
 ansible-playbook collect_gpu_fabric.yml -i inventory.oci.yml
 
 # Assign AZ prefixes (dry run)
-python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt --dry-run
 
 # Apply AZ prefixes
-python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt
 
 # Force a specific GPU fabric to a specific AZ (e.g., replacing an old fabric)
-python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 assign_az_to_volumes.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --gpu-fabric-file gpu_fabric_data.txt \
   --az-map "ocid1.computegpumemoryfabric.oc1...newid=AZ3" --dry-run
 
@@ -1753,19 +1758,19 @@ Sets availability-drop on Hammerspace volumes for planned maintenance or RMA. Di
 
 ```bash
 # Check current status for specific nodes
-python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --node instance20260303192653 --node instance20260303192654 --check
 
 # Disable availability-drop before shutdown (pre-RMA)
-python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --node instance20260303192653 --disable --dry-run
 
 # Re-enable after maintenance
-python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --node instance20260303192653 --enable
 
 # Post-restart health check (nodes + volumes + events)
-python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 set_availability_drop.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --node instance20260303192653 --health-check
 
 # Filter options: --node, --prefix, --contains, --pattern (regex), --all-nodes
@@ -1777,19 +1782,19 @@ Adds volumes to an existing Hammerspace volume group for instances listed in a f
 
 ```bash
 # Dry run - see what would be added
-python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --group "tier0-az1-volumes" --instances-file tier0_instances_limit --dry-run
 
 # Filter by AZ prefix (only AZ1 volumes)
-python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --group "tier0-az1-volumes" --instances-file tier0_instances_limit --az AZ1
 
 # Apply changes
-python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --group "tier0-az1-volumes" --instances-file tier0_instances_limit --yes
 
 # List current volume group members
-python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 add_volumes_to_group.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --group "tier0-az1-volumes" --list
 ```
 
@@ -1799,23 +1804,23 @@ Renames OCI instance display names by prepending their Hammerspace AZ prefix (e.
 
 ```bash
 # Using regex pattern to match OCI instances (dry run)
-python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --compartment-id <OCID> --name-pattern "^instance2026" --dry-run
 
 # Using instances file
-python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --compartment-id <OCID> --instances-file tier0_instances_limit --dry-run
 
 # Apply renames
-python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --compartment-id <OCID> --name-pattern "^instance2026" --yes
 
 # Skip instances already renamed with AZ prefix
-python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --compartment-id <OCID> --name-pattern "^instance2026" --skip-existing
 
 # Both: file + pattern (union of both)
-python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password 'xxx' \
+python3 rename_oci_instances_az.py --host <ANVIL_IP> --user admin --password-file ~/.hs_password \
   --compartment-id <OCID> --instances-file tier0_instances_limit \
   --name-pattern "^instance2026030319" --dry-run
 ```

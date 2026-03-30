@@ -4,19 +4,25 @@
 # Reference: hs_ops s3_server_create_user.yml
 
 - name: "Get current S3 server configuration"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/s3server"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: s3_server_info
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/s3server"
+  register: s3_server_info_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
   retries: 20
   delay: 5
-  until: s3_server_info.status == 200
+  until: (s3_server_info_raw.stdout_lines | default(['0']))[-1] | default('0') | int == 200
+
+- name: "Parse S3 server info result"
+  ansible.builtin.set_fact:
+    s3_server_info:
+      status: "{{ (s3_server_info_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((s3_server_info_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
 
 - name: "Build S3 user payload for {{ s3_user_config.name }}"
   ansible.builtin.set_fact:
@@ -31,22 +37,38 @@
     s3_user_exists: "{{ s3_user_config.name in (s3_server_info.json.users | default([]) | map(attribute='username') | list) }}"
   when: s3_server_info.json is defined
 
-- name: "Add S3 user {{ s3_user_config.name }}"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/s3server/{{ s3_server_info.json.uoid.uuid }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: PUT
-    body: "{{ s3_server_info.json | combine({'users': (s3_server_info.json.users | default([])) + [s3_user_payload]}, recursive=True) }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: [200, 202]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: s3_user_create_result
+- name: "Build S3 user update payload"
+  ansible.builtin.set_fact:
+    s3_user_update_body: "{{ s3_server_info.json | combine({'users': (s3_server_info.json.users | default([])) + [s3_user_payload]}, recursive=True) }}"
   when:
     - s3_server_info.json is defined
     - not (s3_user_exists | default(false))
+
+- name: "Add S3 user {{ s3_user_config.name }}"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X PUT -H "Content-Type: application/json"
+      -d '{{ s3_user_update_body | to_json }}'
+      "{{ hs_api_url }}/s3server/{{ s3_server_info.json.uoid.uuid }}"
+  register: s3_user_create_raw
+  changed_when: true
+  when:
+    - s3_server_info.json is defined
+    - not (s3_user_exists | default(false))
+    - not ansible_check_mode
+
+- name: "Parse S3 user create result"
+  ansible.builtin.set_fact:
+    s3_user_create_result:
+      status: "{{ (s3_user_create_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((s3_user_create_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+  when:
+    - s3_server_info.json is defined
+    - not (s3_user_exists | default(false))
+    - not ansible_check_mode
 
 - name: "Display S3 user status"
   ansible.builtin.debug:

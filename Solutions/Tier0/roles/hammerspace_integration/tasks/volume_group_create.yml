@@ -29,50 +29,86 @@
   when: volume_group_config.volumes is not defined
 
 - name: "Check if volume group {{ volume_group_config.name }} already exists"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/volume-groups/{{ volume_group_config.name | urlencode }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: [200, 404]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: volume_group_check
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/volume-groups/{{ volume_group_config.name | urlencode }}"
+  register: volume_group_check_raw
+  changed_when: false
   failed_when: false
+  check_mode: false
+
+- name: "Parse volume group check result"
+  ansible.builtin.set_fact:
+    volume_group_check:
+      status: "{{ (volume_group_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((volume_group_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
 
 - name: "Create volume group {{ volume_group_config.name }}"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/volume-groups"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: POST
-    body: "{{ volume_group_payload }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: [200, 201, 202]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: volume_group_create_result
-  when: volume_group_check.status == 404
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X POST -H "Content-Type: application/json"
+      -D /tmp/hs_vg_create_headers.txt
+      -d '{{ volume_group_payload | to_json }}'
+      "{{ hs_api_url }}/volume-groups"
+  register: volume_group_create_raw
+  changed_when: true
+  when:
+    - volume_group_check.status | int == 404
+    - not ansible_check_mode
+
+- name: "Extract location header from volume group creation"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_vg_create_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: volume_group_location_raw
+  changed_when: false
+  when:
+    - volume_group_check.status | int == 404
+    - not ansible_check_mode
+
+- name: "Parse volume group creation result"
+  ansible.builtin.set_fact:
+    volume_group_create_result:
+      status: "{{ (volume_group_create_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((volume_group_create_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+      location: "{{ volume_group_location_raw.stdout | default('') }}"
+  when:
+    - volume_group_check.status | int == 404
+    - not ansible_check_mode
 
 - name: "Wait for volume group creation to complete"
-  ansible.builtin.uri:
-    url: "{{ volume_group_create_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: volume_group_status
-  until: volume_group_status.json.status == "COMPLETED"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ volume_group_create_result.location }}"
+  register: volume_group_status_raw
+  changed_when: false
+  until: (volume_group_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
   retries: 20
   delay: 5
-  when: volume_group_create_result.location is defined
+  when:
+    - not ansible_check_mode
+    - volume_group_create_result is defined
+    - volume_group_create_result.location | default('') | length > 0
+
+- name: "Fail if volume group creation task did not complete successfully"
+  ansible.builtin.fail:
+    msg: "Task ended with status: {{ (volume_group_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}"
+  when:
+    - not ansible_check_mode
+    - volume_group_status_raw is defined
+    - volume_group_status_raw.stdout is defined
+    - (volume_group_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: "Display volume group {{ volume_group_config.name }} status"
   ansible.builtin.debug:
     msg: >-
       Volume Group '{{ volume_group_config.name }}'
-      {% if volume_group_check.status == 200 %}already exists{% else %}created successfully{% endif %}
+      {% if volume_group_check.status | int == 200 %}already exists{% else %}created successfully{% endif %}

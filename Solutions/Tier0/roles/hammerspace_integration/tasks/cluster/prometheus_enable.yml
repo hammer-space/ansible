@@ -4,16 +4,22 @@
 # Reference: hs_ops prometheus_exporters_enable.yml
 
 - name: "Get current cluster controller configuration"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/cntl"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: current_cntl
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/cntl"
+  register: current_cntl_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Parse current cluster controller configuration"
+  ansible.builtin.set_fact:
+    current_cntl:
+      status: "{{ (current_cntl_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((current_cntl_raw.stdout_lines | default(['[]']))[:-1] | join('\n') | trim | default('[]', true)) | from_json }}"
 
 - name: "Check if Prometheus is already enabled"
   ansible.builtin.set_fact:
@@ -26,37 +32,73 @@
       prometheusExportersEnabled: true
       prometheusExporterPort: "{{ prometheus_config.port | default(9100) }}"
 
-- name: "Enable Prometheus exporters"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/cntl/{{ current_cntl.json[0].uoid.uuid }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: PUT
-    body: "{{ current_cntl.json[0] | combine(prometheus_payload, recursive=True) }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: [200, 202]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: prometheus_enable_result
+- name: "Build combined Prometheus payload"
+  ansible.builtin.set_fact:
+    prometheus_combined_payload: "{{ current_cntl.json[0] | combine(prometheus_payload, recursive=True) }}"
   when:
     - current_cntl.json | length > 0
     - not (prometheus_already_enabled | default(false))
 
+- name: "Enable Prometheus exporters"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X PUT -H "Content-Type: application/json"
+      -D /tmp/hs_prometheus_enable_headers.txt
+      -d '{{ prometheus_combined_payload | to_json }}'
+      "{{ hs_api_url }}/cntl/{{ current_cntl.json[0].uoid.uuid }}"
+  register: prometheus_enable_raw
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - current_cntl.json | length > 0
+    - not (prometheus_already_enabled | default(false))
+
+- name: "Extract Prometheus enable location header"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_prometheus_enable_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: prometheus_enable_location_raw
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - prometheus_enable_raw is not skipped
+
+- name: "Parse Prometheus enable result"
+  ansible.builtin.set_fact:
+    prometheus_enable_result:
+      status: "{{ (prometheus_enable_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      location: "{{ prometheus_enable_location_raw.stdout | default('') }}"
+  when:
+    - not ansible_check_mode
+    - prometheus_enable_raw is not skipped
+
 - name: "Wait for Prometheus enable to complete"
-  ansible.builtin.uri:
-    url: "{{ prometheus_enable_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: prometheus_status
-  until: prometheus_status.json.status == "COMPLETED"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ prometheus_enable_result.location }}"
+  register: prometheus_status_raw
+  changed_when: false
+  until: (prometheus_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
   retries: 30
   delay: 5
-  when: prometheus_enable_result.location is defined
+  when:
+    - not ansible_check_mode
+    - prometheus_enable_result is defined
+    - prometheus_enable_result.location | default('') | length > 0
+
+- name: "Fail if Prometheus enable did not complete successfully"
+  ansible.builtin.fail:
+    msg: "Prometheus enable task ended with status: {{ (prometheus_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}"
+  when:
+    - not ansible_check_mode
+    - prometheus_status_raw is defined
+    - prometheus_status_raw.stdout is defined
+    - (prometheus_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: "Display Prometheus status"
   ansible.builtin.debug:

@@ -1,0 +1,56 @@
+---
+# Package Installation & Verification
+# Installs required packages and verifies critical commands are available
+
+- name: Define required packages (Debian/Ubuntu)
+  ansible.builtin.set_fact:
+    required_packages: >-
+      {{ ([] if _precheck_hw_raid else ['mdadm'])
+       + ['xfsprogs', 'parted', 'nfs-kernel-server']
+       + (['nvme-cli'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['nvme', 'all']) else [])
+       + (['smartmontools', 'hdparm'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']) else []) }}
+  when: ansible_os_family == "Debian"
+
+- name: Define required packages (RedHat/Rocky/CentOS)
+  ansible.builtin.set_fact:
+    required_packages: >-
+      {{ ([] if _precheck_hw_raid else ['mdadm'])
+       + ['xfsprogs', 'parted', 'nfs-utils']
+       + (['nvme-cli'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['nvme', 'all']) else [])
+       + (['smartmontools', 'hdparm'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']) else []) }}
+  when: ansible_os_family == "RedHat"
+
+- name: Install required packages (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: "{{ required_packages }}"
+    state: present
+    update_cache: true
+  when: ansible_os_family == "Debian"
+
+- name: Install required packages (RedHat/Rocky/CentOS)
+  ansible.builtin.dnf:
+    name: "{{ required_packages }}"
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Build required commands list
+  ansible.builtin.set_fact:
+    required_commands: >-
+      {{ ([] if _precheck_hw_raid else ['mdadm'])
+       + ['mkfs.xfs', 'parted', 'exportfs']
+       + (['nvme'] if (not _precheck_hw_raid and storage_type | default('nvme') in ['nvme', 'all']) else []) }}
+
+- name: Verify required commands are available
+  ansible.builtin.command: "which {{ item }}"
+  loop: "{{ required_commands }}"
+  register: package_check
+  changed_when: false
+  failed_when: false
+
+- name: Report package status
+  ansible.builtin.debug:
+    msg: |
+      Package availability:
+      {% for item in package_check.results %}
+      {{ item.item }}: {% if item.rc == 0 %}OK{% else %}MISSING{% endif %}
+      {% endfor %}

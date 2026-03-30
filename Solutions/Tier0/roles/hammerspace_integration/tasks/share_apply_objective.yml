@@ -9,33 +9,64 @@
 # - performance-high
 # - durability-high
 
+- name: "Set objective hash for {{ share_objective_config.share_name }}"
+  ansible.builtin.set_fact:
+    _objective_hash: "{{ (share_objective_config.share_name ~ share_objective_config.objective) | hash('md5') }}"
+
 - name: "Apply objective {{ share_objective_config.objective }} to share {{ share_objective_config.share_name }}"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/shares/{{ share_objective_config.share_name | urlencode }}/objective-set?objective-identifier={{ share_objective_config.objective | urlencode }}&applicability={{ share_objective_config.applicability | default('TRUE') | upper }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: POST
-    body: ""
-    force_basic_auth: true
-    status_code: [200, 202]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: objective_apply_result
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X POST -H "Content-Type: application/json"
+      -D /tmp/hs_objective_{{ _objective_hash }}_headers.txt
+      -d ''
+      "{{ hs_api_url }}/shares/{{ share_objective_config.share_name | urlencode }}/objective-set?objective-identifier={{ share_objective_config.objective | urlencode }}&applicability={{ share_objective_config.applicability | default('TRUE') | upper }}"
+  register: objective_apply_raw
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: "Extract location header from objective application"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_objective_{{ _objective_hash }}_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: objective_location_raw
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: "Parse objective application result"
+  ansible.builtin.set_fact:
+    objective_apply_result:
+      status: "{{ (objective_apply_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((objective_apply_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+      location: "{{ objective_location_raw.stdout | default('') }}"
+  when: not ansible_check_mode
 
 - name: "Wait for objective application to complete"
-  ansible.builtin.uri:
-    url: "{{ objective_apply_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: objective_status
-  until: objective_status.json.status == "COMPLETED"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ objective_apply_result.location }}"
+  register: objective_status_raw
+  changed_when: false
+  until: (objective_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
   retries: 30
   delay: 5
-  when: objective_apply_result.location is defined
+  when:
+    - not ansible_check_mode
+    - objective_apply_result is defined
+    - objective_apply_result.location | default('') | length > 0
+
+- name: "Fail if objective application did not complete successfully"
+  ansible.builtin.fail:
+    msg: "Objective application task ended with status: {{ (objective_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}"
+  when:
+    - not ansible_check_mode
+    - objective_status_raw is defined
+    - objective_status_raw.stdout is defined
+    - (objective_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: "Display objective application status"
   ansible.builtin.debug:

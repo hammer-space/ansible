@@ -35,28 +35,53 @@
   changed_when: false
   failed_when: false
 
-- name: Create XFS filesystem with Hammerspace-recommended options
-  ansible.builtin.command: >-
-    mkfs.xfs -f
-    {% if xfs_agcount is defined and xfs_agcount %}-d agcount={{ xfs_agcount }}{% endif %}
-    -L {{ item.item.label }} {{ item.item.device }}
-  loop: "{{ fs_check.results }}"
-  loop_control:
-    label: "{{ item.item.device }}"
-  when:
-    - item.item.fstype == 'xfs'
-    - item.stdout != 'xfs'
-    - force_fs_recreate | default(false) or item.stdout != 'xfs'
+- name: Create filesystems
+  block:
+    - name: Create XFS filesystem with Hammerspace-recommended options
+      ansible.builtin.command: >-
+        mkfs.xfs -f
+        {% if xfs_agcount is defined and xfs_agcount %}-d agcount={{ xfs_agcount }}{% endif %}
+        -L {{ item.item.label }} {{ item.item.device }}
+      loop: "{{ fs_check.results }}"
+      loop_control:
+        label: "{{ item.item.device }}"
+      when:
+        - item.item.fstype == 'xfs'
+        - item.stdout != 'xfs'
+        - force_fs_recreate | default(false) or item.stdout != 'xfs'
 
-- name: Create ext4 filesystem
-  ansible.builtin.command: "mkfs.ext4 -F -L {{ item.item.label }} {{ item.item.device }}"
-  loop: "{{ fs_check.results }}"
-  loop_control:
-    label: "{{ item.item.device }}"
-  when:
-    - item.item.fstype == 'ext4'
-    - item.stdout != 'ext4'
-    - force_fs_recreate | default(false) or item.stdout != 'ext4'
+    - name: Create ext4 filesystem
+      ansible.builtin.command: "mkfs.ext4 -F -L {{ item.item.label }} {{ item.item.device }}"
+      loop: "{{ fs_check.results }}"
+      loop_control:
+        label: "{{ item.item.device }}"
+      when:
+        - item.item.fstype == 'ext4'
+        - item.stdout != 'ext4'
+        - force_fs_recreate | default(false) or item.stdout != 'ext4'
+
+  rescue:
+    - name: Display filesystem creation failure diagnostics
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          FILESYSTEM CREATION FAILED
+          ============================================
+          Mount points attempted:
+          {% for mp in mount_points %}
+            {{ mp.device }} -> {{ mp.path }} ({{ mp.fstype }})
+          {% endfor %}
+
+          TROUBLESHOOTING:
+          1. Verify RAID arrays are healthy: cat /proc/mdstat
+          2. Check device exists: ls -la /dev/md*
+          3. Check for existing filesystem: blkid {{ mount_points[0].device | default('/dev/md0') }}
+          4. Check dmesg for I/O errors: dmesg | grep -i error | tail -20
+          ============================================
+
+    - name: Fail playbook after filesystem error
+      ansible.builtin.fail:
+        msg: "Filesystem creation failed. See diagnostics above. Fix the issue and re-run."
 
 - name: Get filesystem UUIDs for fstab
   ansible.builtin.command: "blkid -s UUID -o value {{ item.device }}"

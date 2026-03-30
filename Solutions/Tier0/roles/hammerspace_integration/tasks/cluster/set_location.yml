@@ -4,16 +4,22 @@
 # Reference: hs_ops cluster_set_location.yml
 
 - name: "Get current cluster controller configuration"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/cntl"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: current_cntl
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/cntl"
+  register: current_cntl_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Parse current cluster controller configuration"
+  ansible.builtin.set_fact:
+    current_cntl:
+      status: "{{ (current_cntl_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((current_cntl_raw.stdout_lines | default(['[]']))[:-1] | join('\n') | trim | default('[]', true)) | from_json }}"
 
 - name: "Build location update payload"
   ansible.builtin.set_fact:
@@ -25,35 +31,70 @@
         rack: "{{ location_config.rack | default('') }}"
         position: "{{ location_config.position | default('') }}"
 
-- name: "Update cluster location"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/cntl/{{ current_cntl.json[0].uoid.uuid }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: PUT
-    body: "{{ current_cntl.json[0] | combine(location_payload, recursive=True) }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: [200, 202]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: location_update_result
+- name: "Build combined location payload"
+  ansible.builtin.set_fact:
+    location_combined_payload: "{{ current_cntl.json[0] | combine(location_payload, recursive=True) }}"
   when: current_cntl.json | length > 0
 
+- name: "Update cluster location"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X PUT -H "Content-Type: application/json"
+      -D /tmp/hs_location_update_headers.txt
+      -d '{{ location_combined_payload | to_json }}'
+      "{{ hs_api_url }}/cntl/{{ current_cntl.json[0].uoid.uuid }}"
+  register: location_update_raw
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - current_cntl.json | length > 0
+
+- name: "Extract location update location header"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_location_update_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: location_update_location_raw
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - location_update_raw is not skipped
+
+- name: "Parse location update result"
+  ansible.builtin.set_fact:
+    location_update_result:
+      status: "{{ (location_update_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      location: "{{ location_update_location_raw.stdout | default('') }}"
+  when:
+    - not ansible_check_mode
+    - location_update_raw is not skipped
+
 - name: "Wait for location update to complete"
-  ansible.builtin.uri:
-    url: "{{ location_update_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: location_update_status
-  until: location_update_status.json.status == "COMPLETED"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ location_update_result.location }}"
+  register: location_update_status_raw
+  changed_when: false
+  until: (location_update_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
   retries: 30
   delay: 5
-  when: location_update_result.location is defined
+  when:
+    - not ansible_check_mode
+    - location_update_result is defined
+    - location_update_result.location | default('') | length > 0
+
+- name: "Fail if location update did not complete successfully"
+  ansible.builtin.fail:
+    msg: "Location update task ended with status: {{ (location_update_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}"
+  when:
+    - not ansible_check_mode
+    - location_update_status_raw is defined
+    - location_update_status_raw.stdout is defined
+    - (location_update_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: "Display location update status"
   ansible.builtin.debug:

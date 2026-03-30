@@ -9,19 +9,19 @@ when the instance comes back.
 
 Usage:
     # Check current availability-drop status for nodes being taken down
-    python3 set_availability_drop.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --node instance20260116093136 --check
 
     # Disable availability-drop (pre-shutdown: keeps volumes registered while offline)
-    python3 set_availability_drop.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --disable --dry-run
 
     # Re-enable availability-drop (post-maintenance, after instances are back)
-    python3 set_availability_drop.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --enable
 
     # Health check: verify volume and node operational state after restart
-    python3 set_availability_drop.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --health-check
 
 Filter Options (same as cleanup_instance_nodes.py):
@@ -33,27 +33,29 @@ Filter Options (same as cleanup_instance_nodes.py):
 
 Examples:
     # Pre-shutdown workflow:
-    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --node instance20260116093136 --check
-    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --node instance20260116093136 --disable --dry-run
-    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --node instance20260116093136 --disable
 
     # Post-restart workflow:
-    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --node instance20260116093136 --health-check
-    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password 'xxx' \
+    python3 set_availability_drop.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --node instance20260116093135 --node instance20260116093136 --enable
 """
 
 import argparse
+import getpass
+import json
+import os
 import re
 import requests
-import urllib.parse
 import sys
 import time
-import json
+import urllib.parse
 from typing import List, Dict, Any, Optional, Tuple
 
 # Disable SSL warnings for self-signed certificates
@@ -65,18 +67,36 @@ AVAIL_DROP_DISABLED = 1  # --availability-drop-disabled (availability unchanged 
 
 
 class HammerspaceClient:
-    def __init__(self, host: str, user: str, password: str, verify_ssl: bool = False):
-        self.base_url = f"https://{host}:8443/mgmt/v1.2/rest"
+    def __init__(self, host: str, user: str, password: str, port: int = 8443,
+                 verify_ssl: bool = False, max_retries: int = 3, retry_backoff: float = 2.0):
+        self.base_url = f"https://{host}:{port}/mgmt/v1.2/rest"
         self.auth = (user, password)
         self.verify_ssl = verify_ssl
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         self.session = requests.Session()
         self.session.auth = self.auth
         self.session.verify = self.verify_ssl
 
     def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
         url = f"{self.base_url}/{endpoint}"
-        response = self.session.request(method, url, **kwargs)
-        return response
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                if response.status_code in (502, 503, 504) and attempt < self.max_retries - 1:
+                    wait = self.retry_backoff ** attempt
+                    print(f"    Retry {attempt + 1}/{self.max_retries} after HTTP {response.status_code} (wait {wait:.0f}s)")
+                    time.sleep(wait)
+                    continue
+                return response
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    wait = self.retry_backoff ** attempt
+                    print(f"    Retry {attempt + 1}/{self.max_retries} after connection error (wait {wait:.0f}s)")
+                    time.sleep(wait)
+        raise requests.exceptions.ConnectionError(f"Failed after {self.max_retries} retries: {last_exception}")
 
     def get_all_nodes(self) -> List[Dict[str, Any]]:
         response = self._request("GET", "nodes")
@@ -117,17 +137,36 @@ class HammerspaceClient:
     def _wait_for_task(self, task_url: str, timeout: int = 120, interval: int = 5):
         start_time = time.time()
         while time.time() - start_time < timeout:
-            response = self.session.get(task_url)
-            if response.status_code == 200:
-                task_status = response.json().get('status', '')
-                if task_status == 'COMPLETED':
-                    return True
-                elif task_status in ['FAILED', 'CANCELLED']:
-                    print(f"    Task failed: {task_status}")
-                    return False
+            try:
+                response = self._request_url(task_url)
+                if response.status_code == 200:
+                    task_status = response.json().get('status', '')
+                    if task_status == 'COMPLETED':
+                        return True
+                    elif task_status in ['FAILED', 'CANCELLED']:
+                        print(f"    Task failed: {task_status}")
+                        return False
+            except requests.exceptions.ConnectionError:
+                pass
             time.sleep(interval)
         print(f"    Task timed out after {timeout}s")
         return False
+
+    def _request_url(self, url: str, method: str = "GET", **kwargs) -> requests.Response:
+        """Make a request to a full URL (e.g., task location) with retry."""
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                if response.status_code in (502, 503, 504) and attempt < self.max_retries - 1:
+                    time.sleep(self.retry_backoff ** attempt)
+                    continue
+                return response
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_backoff ** attempt)
+        raise requests.exceptions.ConnectionError(f"Failed after {self.max_retries} retries: {last_exception}")
 
 
 def find_matching_nodes(nodes: List[Dict], prefix: str = None, contains: str = None,
@@ -471,8 +510,10 @@ API field: storageCapabilities.protection.unavailableStateAvailabilityMultiplier
 
     # Connection
     parser.add_argument('--host', required=True, help='Hammerspace Anvil IP or hostname')
+    parser.add_argument('--port', type=int, default=8443, help='API port (default: 8443)')
     parser.add_argument('--user', required=True, help='API username')
-    parser.add_argument('--password', required=True, help='API password')
+    parser.add_argument('--password', help='API password (or use --password-file / HAMMERSPACE_PASSWORD env var)')
+    parser.add_argument('--password-file', help='Path to file containing API password')
 
     # Node filter (mutually exclusive)
     filter_group = parser.add_mutually_exclusive_group()
@@ -507,9 +548,20 @@ API field: storageCapabilities.protection.unavailableStateAvailabilityMultiplier
     if not any([args.nodes, args.prefix, args.contains, args.pattern, args.all_nodes]):
         parser.error("Must specify a node filter (--node, --prefix, --contains, --pattern, or --all-nodes)")
 
+    # Resolve password: --password > --password-file > HAMMERSPACE_PASSWORD env > prompt
+    if args.password:
+        password = args.password
+    elif args.password_file:
+        with open(args.password_file) as f:
+            password = f.read().strip()
+    elif os.environ.get('HAMMERSPACE_PASSWORD'):
+        password = os.environ['HAMMERSPACE_PASSWORD']
+    else:
+        password = getpass.getpass('Hammerspace API password: ')
+
     # Connect
-    print(f"Connecting to Hammerspace at {args.host}...")
-    client = HammerspaceClient(args.host, args.user, args.password)
+    print(f"Connecting to Hammerspace at {args.host}:{args.port}...")
+    client = HammerspaceClient(args.host, args.user, password, port=args.port)
 
     # Fetch nodes
     try:

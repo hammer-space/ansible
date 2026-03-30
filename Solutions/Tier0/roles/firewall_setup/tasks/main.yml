@@ -65,7 +65,7 @@
   ansible.builtin.include_tasks: iptables.yml
   when: firewall_type == 'iptables'
 
-- name: Skip firewall configuration - no firewall detected
+- name: Skip firewall configuration (no firewall detected)
   ansible.builtin.debug:
     msg: |
       No firewall (firewalld, ufw, or iptables) detected.

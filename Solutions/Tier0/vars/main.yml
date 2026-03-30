@@ -263,10 +263,19 @@ hammerspace_api_host: "10.0.10.15"
 
 # API credentials (admin role required)
 hammerspace_api_user: "admin"
-hammerspace_api_password: "Hammer.123!!"
+hammerspace_api_password: "{{ vault_hammerspace_api_password }}"
+
+# API port (default: 8443)
+# hammerspace_api_port: 8443
 
 # Skip SSL certificate validation (set to true for self-signed certs)
 hammerspace_api_validate_certs: false
+
+# API HTTP method (auto/curl/uri)
+# auto: Use ansible.builtin.uri if Python < 3.13, shell+curl otherwise
+# curl: Always use shell+curl (required for Python 3.13+ — uri module broken)
+# uri:  Always use ansible.builtin.uri (faster, but fails on Python 3.13+)
+hammerspace_api_method: "auto"
 
 # Node name in Hammerspace (defaults to inventory_hostname)
 # Use AZ prefix for availability zones: "AZ1:tier0-node01"
@@ -374,6 +383,27 @@ hammerspace_min_queued_tasks: 5      # Resume when queue is below this
 hammerspace_max_queued_tasks: 10     # Throttle when queue exceeds this
 hammerspace_task_queue_retries: 100  # Max retries (100 x 10s = ~16 min)
 hammerspace_task_queue_delay: 10     # Delay between retries (seconds)
+
+# ============================================================================
+# API Timeout Configuration
+# ============================================================================
+# Timeouts for async Hammerspace API operations
+# Each operation polls until complete or max retries reached
+
+# curl per-request timeout (seconds)
+# hammerspace_api_curl_timeout: 60
+
+# Node add: retries * delay = max wait (default: 30 * 10 = 300s = 5 min)
+# hammerspace_node_add_retries: 30
+# hammerspace_node_add_delay: 10
+
+# Volume add: retries * delay = max wait (default: 40 * 10 = 400s = ~7 min)
+# hammerspace_volume_add_retries: 40
+# hammerspace_volume_add_delay: 10
+
+# RAID sync wait: retries * delay = max wait (default: 60 * 30 = 1800s = 30 min)
+# raid_sync_retries: 60
+# raid_sync_delay: 30
 
 # ============================================================================
 # Availability Zone Mapping (from Hammerspace Engineering)

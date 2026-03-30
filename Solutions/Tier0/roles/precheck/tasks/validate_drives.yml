@@ -1,0 +1,177 @@
+---
+# Drive Count Validation + Drive Mount Status Check
+# Validates NVMe/SCSI drive counts and checks for drives already in use
+# Skipped when hardware RAID mode is active (_precheck_hw_raid)
+
+# ============================================================================
+# Drive Count Validation
+# ============================================================================
+
+- name: Count total NVMe namespaces
+  ansible.builtin.shell: |
+    ls -1 /dev/nvme*n1 2>/dev/null | wc -l
+  register: nvme_count_raw
+  changed_when: false
+  when: storage_type | default('nvme') in ['nvme', 'all']
+
+- name: Set NVMe count fact
+  ansible.builtin.set_fact:
+    nvme_count: "{{ nvme_count_raw.stdout | default('0') | int }}"
+  when: storage_type | default('nvme') in ['nvme', 'all']
+
+- name: Validate expected NVMe drive count
+  ansible.builtin.assert:
+    that:
+      - nvme_count | int >= expected_nvme_count | int
+    fail_msg: |
+      FAILED: Expected {{ expected_nvme_count }} NVMe drives but found {{ nvme_count }}.
+      Check hardware or update expected_nvme_count in vars/main.yml.
+    success_msg: "NVMe drive count OK: {{ nvme_count }} drives found (expected: {{ expected_nvme_count }})"
+  when:
+    - storage_type | default('nvme') in ['nvme', 'all']
+    - expected_nvme_count is defined
+    - expected_nvme_count | int > 0
+    - enforce_drive_count | default(false)
+
+- name: Warn if NVMe drive count doesn't match expected
+  ansible.builtin.debug:
+    msg: |
+      WARNING: Expected {{ expected_nvme_count }} NVMe drives but found {{ nvme_count }}.
+      Set enforce_drive_count: true to fail on mismatch.
+  when:
+    - storage_type | default('nvme') in ['nvme', 'all']
+    - expected_nvme_count is defined
+    - expected_nvme_count | int > 0
+    - nvme_count | int != expected_nvme_count | int
+    - not (enforce_drive_count | default(false))
+
+- name: Count total SCSI/SATA block devices
+  ansible.builtin.shell: |
+    lsblk -dno NAME,TYPE 2>/dev/null | grep -c ' disk' || echo "0"
+  register: scsi_count_raw
+  changed_when: false
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Set SCSI count fact
+  ansible.builtin.set_fact:
+    scsi_count: "{{ scsi_count_raw.stdout | default('0') | int }}"
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Validate expected SCSI/SATA drive count
+  ansible.builtin.assert:
+    that:
+      - scsi_count | int >= expected_scsi_count | int
+    fail_msg: |
+      FAILED: Expected {{ expected_scsi_count }} SCSI/SATA drives but found {{ scsi_count }}.
+      Check hardware or update expected_scsi_count in vars/main.yml.
+    success_msg: "SCSI/SATA drive count OK: {{ scsi_count }} drives found (expected: {{ expected_scsi_count }})"
+  when:
+    - storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+    - expected_scsi_count is defined
+    - expected_scsi_count | int > 0
+    - enforce_drive_count | default(false)
+
+# ============================================================================
+# Drive Mount Status Check (ensure drives are not already in use)
+# ============================================================================
+
+- name: Detect boot device for exclusion
+  ansible.builtin.include_tasks: ../nvme_discovery/tasks/detect_boot_device.yml
+
+- name: Set boot device check fact
+  ansible.builtin.set_fact:
+    boot_device_check:
+      stdout: "{{ _detected_boot_device | default('') }}"
+
+- name: Get list of currently mounted NVMe devices
+  ansible.builtin.shell: |
+    mount | grep -E '^/dev/nvme' | awk '{print $1}' | sed 's/p[0-9]*$//' | sort -u
+  register: mounted_nvme_raw
+  changed_when: false
+  failed_when: false
+  when: storage_type | default('nvme') in ['nvme', 'all']
+
+- name: Get list of NVMe devices in use by mdadm
+  ansible.builtin.shell: |
+    cat /proc/mdstat 2>/dev/null | grep -oE 'nvme[0-9]+n[0-9]+' | sed 's/^/\/dev\//' | sort -u
+  register: mdadm_nvme_raw
+  changed_when: false
+  failed_when: false
+  when: storage_type | default('nvme') in ['nvme', 'all']
+
+- name: Get list of NVMe devices with LVM
+  ansible.builtin.shell: |
+    pvs --noheadings -o pv_name 2>/dev/null | grep nvme | awk '{print $1}' | sed 's/p[0-9]*$//' | sort -u
+  register: lvm_nvme_raw
+  changed_when: false
+  failed_when: false
+  when: storage_type | default('nvme') in ['nvme', 'all']
+
+- name: Get list of currently mounted SCSI/SATA devices
+  ansible.builtin.shell: |
+    mount | grep -E '^/dev/sd' | awk '{print $1}' | sed 's/[0-9]*$//' | sort -u
+  register: mounted_scsi_raw
+  changed_when: false
+  failed_when: false
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Get list of SCSI/SATA devices in use by mdadm
+  ansible.builtin.shell: |
+    cat /proc/mdstat 2>/dev/null | grep -oE 'sd[a-z]+' | sed 's/^/\/dev\//' | sort -u
+  register: mdadm_scsi_raw
+  changed_when: false
+  failed_when: false
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Get list of SCSI/SATA devices with LVM
+  ansible.builtin.shell: |
+    pvs --noheadings -o pv_name 2>/dev/null | grep '/dev/sd' | awk '{print $1}' | sed 's/[0-9]*$//' | sort -u
+  register: lvm_scsi_raw
+  changed_when: false
+  failed_when: false
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Combine all in-use devices
+  ansible.builtin.set_fact:
+    drives_in_use: >-
+      {{ (mounted_nvme_raw.stdout_lines | default([]))
+       + (mdadm_nvme_raw.stdout_lines | default([]))
+       + (lvm_nvme_raw.stdout_lines | default([]))
+       + (mounted_scsi_raw.stdout_lines | default([]))
+       + (mdadm_scsi_raw.stdout_lines | default([]))
+       + (lvm_scsi_raw.stdout_lines | default([]))
+       | unique }}
+
+- name: Set boot device for comparison
+  ansible.builtin.set_fact:
+    boot_nvme_device: "/dev/{{ boot_device_check.stdout | trim }}n1"
+  when: boot_device_check.stdout | default('') | trim is match('^nvme')
+
+- name: Filter out boot device from in-use list
+  ansible.builtin.set_fact:
+    drives_in_use_non_boot: "{{ drives_in_use | reject('search', boot_device_check.stdout | trim) | list }}"
+
+- name: Display devices currently in use
+  ansible.builtin.debug:
+    msg: |
+      Storage devices currently in use (excluding boot):
+      {% if drives_in_use_non_boot | length > 0 %}
+      {% for dev in drives_in_use_non_boot %}
+        - {{ dev }}
+      {% endfor %}
+      {% else %}
+        None - all devices are available for configuration
+      {% endif %}
+
+- name: Fail if drives are already in use
+  ansible.builtin.fail:
+    msg: |
+      ERROR: The following devices are already in use:
+      {{ drives_in_use_non_boot | join(', ') }}
+
+      These drives must be unmounted/removed from RAID/LVM before proceeding.
+      Set force_raid_recreate: true and force_fs_recreate: true to override (DESTRUCTIVE!).
+  when:
+    - drives_in_use_non_boot | length > 0
+    - not (force_raid_recreate | default(false))
+    - fail_on_drives_in_use | default(true)

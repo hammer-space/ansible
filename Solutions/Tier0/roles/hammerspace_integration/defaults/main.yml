@@ -11,6 +11,13 @@
 # hammerspace_api_password: "password"
 hammerspace_api_validate_certs: false
 
+# API HTTP method: how to make REST calls
+# Options:
+#   auto - Auto-detect (use uri module if Python < 3.13, curl otherwise)
+#   curl - Always use shell+curl (required for Python 3.13+ where uri module breaks)
+#   uri  - Always use ansible.builtin.uri (only works with Python < 3.13)
+hammerspace_api_method: "auto"
+
 # =============================================================================
 # Debug Settings
 # =============================================================================

@@ -10,36 +10,39 @@ Prerequisites:
 
 Usage:
     # Using instances file (default: tier0_instances_limit)
-    python3 rename_oci_instances_az.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 rename_oci_instances_az.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --compartment-id <ocid> --instances-file tier0_instances_limit --dry-run
 
     # Using regex pattern to match OCI instance names directly
-    python3 rename_oci_instances_az.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 rename_oci_instances_az.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --compartment-id <ocid> --name-pattern "instance2026.*" --dry-run
 
     # Skip instances that already have AZ prefix
-    python3 rename_oci_instances_az.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 rename_oci_instances_az.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --compartment-id <ocid> --name-pattern "instance2026.*" --skip-existing
 
 Examples:
     # Match all instances starting with "instance2026"
-    python3 rename_oci_instances_az.py --host 10.0.10.15 --user admin --password 'Hammer.123!!' \
+    python3 rename_oci_instances_az.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --compartment-id ocid1.compartment.oc1..aaaaaa --name-pattern "^instance2026" --dry-run
 
     # Using instances file
-    python3 rename_oci_instances_az.py --host 10.0.10.15 --user admin --password 'Hammer.123!!' \
+    python3 rename_oci_instances_az.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --compartment-id ocid1.compartment.oc1..aaaaaa --instances-file tier0_instances_limit --yes
 
     # Both: file + pattern (union of both)
-    python3 rename_oci_instances_az.py --host 10.0.10.15 --user admin --password 'Hammer.123!!' \
+    python3 rename_oci_instances_az.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --compartment-id ocid1.compartment.oc1..aaaaaa --instances-file tier0_instances_limit \
         --name-pattern "^instance2026030319" --dry-run
 """
 
 import argparse
+import getpass
+import os
+import re
 import requests
 import sys
-import re
+import time
 from typing import Dict, List, Any
 
 # Disable SSL warnings for self-signed certificates
@@ -53,17 +56,37 @@ except ImportError:
 
 
 class HammerspaceClient:
-    def __init__(self, host: str, user: str, password: str, verify_ssl: bool = False):
-        self.base_url = f"https://{host}:8443/mgmt/v1.2/rest"
+    def __init__(self, host: str, user: str, password: str, port: int = 8443,
+                 verify_ssl: bool = False, max_retries: int = 3, retry_backoff: float = 2.0):
+        self.base_url = f"https://{host}:{port}/mgmt/v1.2/rest"
         self.auth = (user, password)
         self.verify_ssl = verify_ssl
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         self.session = requests.Session()
         self.session.auth = self.auth
         self.session.verify = self.verify_ssl
 
     def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
+        """Make an API request with retry on transient errors."""
         url = f"{self.base_url}/{endpoint}"
-        return self.session.request(method, url, **kwargs)
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                if response.status_code in (502, 503, 504) and attempt < self.max_retries - 1:
+                    wait = self.retry_backoff ** attempt
+                    print(f"    Retry {attempt + 1}/{self.max_retries} after HTTP {response.status_code} (wait {wait:.0f}s)")
+                    time.sleep(wait)
+                    continue
+                return response
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    wait = self.retry_backoff ** attempt
+                    print(f"    Retry {attempt + 1}/{self.max_retries} after connection error (wait {wait:.0f}s)")
+                    time.sleep(wait)
+        raise requests.exceptions.ConnectionError(f"Failed after {self.max_retries} retries: {last_exception}")
 
     def get_all_storage_volumes(self) -> List[Dict[str, Any]]:
         response = self._request("GET", "storage-volumes")
@@ -165,8 +188,10 @@ The AZ is determined from Hammerspace volume names (AZ<N>:instance_name::/path).
 
     # Hammerspace connection
     parser.add_argument('--host', required=True, help='Hammerspace Anvil IP or hostname')
+    parser.add_argument('--port', type=int, default=8443, help='API port (default: 8443)')
     parser.add_argument('--user', required=True, help='Hammerspace API username')
-    parser.add_argument('--password', required=True, help='Hammerspace API password')
+    parser.add_argument('--password', help='API password (or use --password-file / HAMMERSPACE_PASSWORD env var)')
+    parser.add_argument('--password-file', help='Path to file containing API password')
 
     # OCI
     parser.add_argument('--compartment-id', required=True, help='OCI compartment OCID')
@@ -235,9 +260,20 @@ The AZ is determined from Hammerspace volume names (AZ<N>:instance_name::/path).
     # Use discovered instance names for Hammerspace lookup
     instance_names = list(oci_instances.keys())
 
+    # Resolve password: --password > --password-file > HAMMERSPACE_PASSWORD env > prompt
+    if args.password:
+        password = args.password
+    elif args.password_file:
+        with open(args.password_file) as f:
+            password = f.read().strip()
+    elif os.environ.get('HAMMERSPACE_PASSWORD'):
+        password = os.environ['HAMMERSPACE_PASSWORD']
+    else:
+        password = getpass.getpass('Hammerspace API password: ')
+
     # Connect to Hammerspace and get AZ mapping
     print(f"\nConnecting to Hammerspace at {args.host}...")
-    hs_client = HammerspaceClient(args.host, args.user, args.password)
+    hs_client = HammerspaceClient(args.host, args.user, password, port=args.port)
 
     try:
         volumes = hs_client.get_all_storage_volumes()

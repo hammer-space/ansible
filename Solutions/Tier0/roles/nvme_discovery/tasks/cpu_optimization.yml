@@ -15,8 +15,7 @@
   changed_when: false
 
 - name: Get number of CPU cores
-  ansible.builtin.shell: |
-    nproc
+  ansible.builtin.command: nproc
   register: cpu_cores_raw
   changed_when: false
 
@@ -35,8 +34,7 @@
     detected_numa_nodes: "{{ numa_nodes_raw.stdout | default('1') | int }}"
 
 - name: Get CPU architecture
-  ansible.builtin.shell: |
-    uname -m
+  ansible.builtin.command: uname -m
   register: cpu_arch_raw
   changed_when: false
 

@@ -42,6 +42,7 @@
     state: present
 
 - name: Reload sunrpc module by restarting NFS services
+  throttle: "{{ nfs_restart_throttle | default(5) }}"
   when:
     - not ansible_check_mode
     - sunrpc_pool_mode_before.stdout != "pernode"
@@ -310,3 +311,53 @@
 - name: Display RPC services
   ansible.builtin.debug:
     var: rpcinfo_output.stdout_lines
+
+# ============================================================================
+# NFS Export Validation
+# ============================================================================
+
+- name: Validate NFS exports are accessible
+  ansible.builtin.command: showmount -e localhost
+  register: showmount_validation
+  changed_when: false
+  failed_when: false
+
+- name: Parse expected export paths
+  ansible.builtin.set_fact:
+    _expected_export_paths: "{{ nfs_exports | default([]) | map(attribute='path') | list }}"
+
+- name: Check each expected export is present in showmount output
+  ansible.builtin.set_fact:
+    _missing_exports: >-
+      {{ _expected_export_paths
+         | reject('in', showmount_validation.stdout | default(''))
+         | list }}
+  when: showmount_validation.rc == 0
+
+- name: Display NFS export validation results
+  ansible.builtin.debug:
+    msg: |
+      NFS Export Validation:
+      {% if showmount_validation.rc != 0 %}
+        WARNING: showmount command failed (rc={{ showmount_validation.rc }})
+        This may indicate NFS server is not fully running.
+        Error: {{ showmount_validation.stderr | default('unknown') }}
+      {% elif _missing_exports | default([]) | length > 0 %}
+        WARNING: {{ _missing_exports | length }} expected export(s) not found in showmount:
+        {% for path in _missing_exports %}
+          - {{ path }}
+        {% endfor %}
+        Verify NFS exports configuration and run: exportfs -ra
+      {% else %}
+        OK: All {{ _expected_export_paths | length }} expected exports are visible via showmount.
+      {% endif %}
+
+- name: Fail if NFS export validation is enforced and exports are missing
+  ansible.builtin.fail:
+    msg: >-
+      NFS export validation failed: {{ _missing_exports | length }} export(s) missing.
+      Missing: {{ _missing_exports | join(', ') }}
+  when:
+    - enforce_nfs_export_validation | default(false)
+    - showmount_validation.rc == 0
+    - _missing_exports | default([]) | length > 0

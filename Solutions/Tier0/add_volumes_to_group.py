@@ -10,33 +10,36 @@ Prerequisites:
 
 Usage:
     # Dry run - see what would be added
-    python3 add_volumes_to_group.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 add_volumes_to_group.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --group "tier0-az1-volumes" --instances-file tier0_instances_limit --dry-run
 
     # Apply changes
-    python3 add_volumes_to_group.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 add_volumes_to_group.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --group "tier0-az1-volumes" --instances-file tier0_instances_limit
 
     # Filter by AZ prefix
-    python3 add_volumes_to_group.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 add_volumes_to_group.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --group "tier0-az1-volumes" --instances-file tier0_instances_limit --az AZ1
 
     # List current volume group members
-    python3 add_volumes_to_group.py --host <anvil_ip> --user admin --password 'xxx' \
+    python3 add_volumes_to_group.py --host <anvil_ip> --user admin --password-file ~/.hs_password \
         --group "tier0-az1-volumes" --list
 
 Examples:
-    python3 add_volumes_to_group.py --host 10.0.10.15 --user admin --password 'Hammer.123!!' \
+    python3 add_volumes_to_group.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --group "tier0-az1-volumes" --instances-file tier0_instances_limit --dry-run
 
-    python3 add_volumes_to_group.py --host 10.0.10.15 --user admin --password 'Hammer.123!!' \
+    python3 add_volumes_to_group.py --host 10.0.10.15 --user admin --password-file ~/.hs_password \
         --group "tier0-az1-volumes" --instances-file tier0_instances_limit --yes
 """
 
 import argparse
+import getpass
+import os
 import requests
-import urllib.parse
 import sys
+import time
+import urllib.parse
 from typing import List, Dict, Any, Optional
 
 # Disable SSL warnings for self-signed certificates
@@ -44,18 +47,37 @@ requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.
 
 
 class HammerspaceClient:
-    def __init__(self, host: str, user: str, password: str, verify_ssl: bool = False):
-        self.base_url = f"https://{host}:8443/mgmt/v1.2/rest"
+    def __init__(self, host: str, user: str, password: str, port: int = 8443,
+                 verify_ssl: bool = False, max_retries: int = 3, retry_backoff: float = 2.0):
+        self.base_url = f"https://{host}:{port}/mgmt/v1.2/rest"
         self.auth = (user, password)
         self.verify_ssl = verify_ssl
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         self.session = requests.Session()
         self.session.auth = self.auth
         self.session.verify = self.verify_ssl
 
     def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
+        """Make an API request with retry on transient errors."""
         url = f"{self.base_url}/{endpoint}"
-        response = self.session.request(method, url, **kwargs)
-        return response
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                if response.status_code in (502, 503, 504) and attempt < self.max_retries - 1:
+                    wait = self.retry_backoff ** attempt
+                    print(f"    Retry {attempt + 1}/{self.max_retries} after HTTP {response.status_code} (wait {wait:.0f}s)")
+                    time.sleep(wait)
+                    continue
+                return response
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    wait = self.retry_backoff ** attempt
+                    print(f"    Retry {attempt + 1}/{self.max_retries} after connection error (wait {wait:.0f}s)")
+                    time.sleep(wait)
+        raise requests.exceptions.ConnectionError(f"Failed after {self.max_retries} retries: {last_exception}")
 
     def get_all_storage_volumes(self) -> List[Dict[str, Any]]:
         response = self._request("GET", "storage-volumes")
@@ -137,8 +159,10 @@ def main():
     )
 
     parser.add_argument('--host', required=True, help='Hammerspace Anvil IP or hostname')
+    parser.add_argument('--port', type=int, default=8443, help='API port (default: 8443)')
     parser.add_argument('--user', required=True, help='API username')
-    parser.add_argument('--password', required=True, help='API password')
+    parser.add_argument('--password', help='API password (or use --password-file / HAMMERSPACE_PASSWORD env var)')
+    parser.add_argument('--password-file', help='Path to file containing API password')
     parser.add_argument('--group', required=True, help='Volume group name (must already exist)')
     parser.add_argument('--instances-file', default='tier0_instances_limit',
                         help='File with instance names, one per line (default: tier0_instances_limit)')
@@ -149,9 +173,20 @@ def main():
 
     args = parser.parse_args()
 
+    # Resolve password: --password > --password-file > HAMMERSPACE_PASSWORD env > prompt
+    if args.password:
+        password = args.password
+    elif args.password_file:
+        with open(args.password_file) as f:
+            password = f.read().strip()
+    elif os.environ.get('HAMMERSPACE_PASSWORD'):
+        password = os.environ['HAMMERSPACE_PASSWORD']
+    else:
+        password = getpass.getpass('Hammerspace API password: ')
+
     # Connect to Hammerspace
-    print(f"Connecting to Hammerspace at {args.host}...")
-    client = HammerspaceClient(args.host, args.user, args.password)
+    print(f"Connecting to Hammerspace at {args.host}:{args.port}...")
+    client = HammerspaceClient(args.host, args.user, password, port=args.port)
 
     # Get volume group
     print(f"Fetching volume group '{args.group}'...")

@@ -62,7 +62,7 @@
     label: "{{ item.item.1 }}"
   when: "'raid' in item.stdout"
 
-- name: Create RAID arrays
+- name: Create RAID arrays individually with per-array error tracking
   ansible.builtin.command: >
     mdadm --create --verbose {{ item.device }}
     --level={{ item.level }}
@@ -77,17 +77,103 @@
     - item.name not in existing_arrays
     - force_raid_recreate | default(false) or item.name not in existing_arrays
   register: raid_creation
-  # mdadm may prompt - using --run to skip
-  # chunk size is auto-tuned based on CPU if cpu_optimized_raid: true
+  failed_when: false
+
+- name: Track RAID creation results
+  ansible.builtin.set_fact:
+    _raid_failed_arrays: >-
+      {{ raid_creation.results | default([])
+         | selectattr('rc', 'defined')
+         | selectattr('rc', 'ne', 0)
+         | map(attribute='item')
+         | list }}
+    _raid_succeeded_arrays: >-
+      {{ raid_creation.results | default([])
+         | selectattr('rc', 'defined')
+         | selectattr('rc', 'eq', 0)
+         | map(attribute='item')
+         | list }}
+    _raid_skipped_arrays: >-
+      {{ raid_creation.results | default([])
+         | selectattr('skipped', 'defined')
+         | selectattr('skipped')
+         | map(attribute='item')
+         | list }}
+
+- name: Display RAID creation results per array
+  ansible.builtin.debug:
+    msg: |
+      RAID Creation Results:
+        Succeeded: {{ _raid_succeeded_arrays | map(attribute='name') | list | join(', ') | default('none') }}
+        Skipped:   {{ _raid_skipped_arrays | map(attribute='name') | list | join(', ') | default('none') }}
+        Failed:    {{ _raid_failed_arrays | map(attribute='name') | list | join(', ') | default('none') }}
+
+- name: Display per-array failure diagnostics
+  ansible.builtin.debug:
+    msg: |
+      RAID ARRAY FAILED: {{ item.item.name }} ({{ item.item.device }})
+        Drives: {{ item.item.drives | join(', ') }}
+        Return code: {{ item.rc }}
+        Error: {{ item.stderr | default('') }}
+  loop: "{{ raid_creation.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: _raid_failed_arrays | length > 0
+
+- name: Capture RAID state after partial failure
+  ansible.builtin.command: cat /proc/mdstat
+  register: partial_failure_mdstat
+  changed_when: false
+  failed_when: false
+  when: _raid_failed_arrays | length > 0
+
+- name: Display RAID state after partial failure
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+      PARTIAL RAID FAILURE - {{ _raid_failed_arrays | length }}/{{ raid_arrays | length }} arrays failed
+      ============================================
+      /proc/mdstat:
+      {{ partial_failure_mdstat.stdout | default('unable to read') }}
+
+      TROUBLESHOOTING:
+      1. Check if drives are in use: lsblk
+      2. Check for existing signatures: wipefs -a /dev/nvmeXnY
+      3. Check boot device exclusion: findmnt -n -o SOURCE /
+      4. Check dmesg for hardware errors: dmesg | tail -50
+      ============================================
+  when: _raid_failed_arrays | length > 0
+
+- name: Fail if ALL RAID arrays failed
+  ansible.builtin.fail:
+    msg: >-
+      All {{ _raid_failed_arrays | length }} RAID array(s) failed to create.
+      See diagnostics above. Fix the issue and re-run.
+  when:
+    - _raid_failed_arrays | length > 0
+    - _raid_succeeded_arrays | length == 0
+
+- name: Warn about partial RAID failure (continuing with successful arrays)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _raid_failed_arrays | length }} of {{ raid_arrays | length }} RAID arrays failed.
+      Continuing with {{ _raid_succeeded_arrays | length }} successful arrays.
+      Failed: {{ _raid_failed_arrays | map(attribute='name') | list | join(', ') }}.
+      Re-run playbook to retry failed arrays.
+  when:
+    - _raid_failed_arrays | length > 0
+    - _raid_succeeded_arrays | length > 0
 
 - name: Wait for RAID arrays to sync (for mirrored/parity arrays)
   ansible.builtin.command: cat /proc/mdstat
   register: sync_status
   until: "'resync' not in sync_status.stdout and 'recovery' not in sync_status.stdout"
-  retries: 60
-  delay: 30
+  retries: "{{ raid_sync_retries | default(60) }}"
+  delay: "{{ raid_sync_delay | default(30) }}"
   changed_when: false
-  when: raid_arrays | selectattr('level', 'in', [1, 5, 6, 10]) | list | length > 0
+  when:
+    - _raid_succeeded_arrays | length > 0
+    - _raid_succeeded_arrays | selectattr('level', 'in', [1, 5, 6, 10]) | list | length > 0
 
 - name: Ensure /etc/mdadm directory exists
   ansible.builtin.file:
@@ -142,6 +228,6 @@
   register: final_mdstat
   changed_when: false
 
-- name: Show RAID status
+- name: Display RAID status
   ansible.builtin.debug:
     var: final_mdstat.stdout_lines

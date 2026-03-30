@@ -75,7 +75,7 @@
   when: hammerspace_debug | default(false)
 
 - name: "Check if volume {{ volume_config.path }} already exists"
-  ansible.builtin.command:
+  ansible.builtin.shell:
     cmd: >-
       curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 60
       {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
@@ -89,8 +89,8 @@
 - name: "Parse volume check result"
   ansible.builtin.set_fact:
     volume_check:
-      status: "{{ (volume_check_raw.stdout_lines | default(['0']))[-1] | int }}"
-      json: "{{ ((volume_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n')) | default('{}', true) | from_json }}"
+      status: "{{ (volume_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((volume_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
 
 - name: "Debug volume check result"
   ansible.builtin.debug:
@@ -105,7 +105,7 @@
     volume_already_exists: "{{ (volume_check.status | int) == 200 }}"
 
 - name: "Add storage volume {{ volume_config.path }}"
-  ansible.builtin.command:
+  ansible.builtin.shell:
     cmd: >-
       curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 180
       {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
@@ -132,8 +132,8 @@
 - name: "Parse volume add result"
   ansible.builtin.set_fact:
     volume_add_result:
-      status: "{{ (volume_add_raw.stdout_lines | default(['0']))[-1] | int }}"
-      json: "{{ ((volume_add_raw.stdout_lines | default(['{}']))[:-1] | join('\n')) | default('{}', true) | from_json }}"
+      status: "{{ (volume_add_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((volume_add_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
       location: "{{ volume_add_location_raw.stdout | default('') }}"
   when:
     - not ansible_check_mode
@@ -149,22 +149,35 @@
     - "'already exists' in (volume_add_result.json | default({}) | string)"
 
 - name: "Wait for volume {{ volume_config.path }} add to complete"
-  ansible.builtin.command:
+  ansible.builtin.shell:
     cmd: >-
-      curl -s --max-time 60
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
       {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
       -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
       "{{ volume_add_result.location }}"
   register: volume_add_status_raw
   changed_when: false
-  until: (volume_add_status_raw.stdout | from_json).status | default('') == "COMPLETED"
-  retries: 20
-  delay: 5
+  until: (volume_add_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
+  retries: "{{ hammerspace_volume_add_retries | default(40) }}"
+  delay: "{{ hammerspace_volume_add_delay | default(10) }}"
   when:
     - not ansible_check_mode
     - not volume_already_exists
     - volume_add_result is defined
     - volume_add_result.location | default('') | length > 0
+
+- name: "Fail if volume {{ volume_config.path }} add task did not complete"
+  ansible.builtin.fail:
+    msg: >-
+      Volume add task for '{{ volume_name }}' ended with status:
+      {{ (volume_add_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}.
+      Check Hammerspace GUI for details.
+  when:
+    - not ansible_check_mode
+    - not volume_already_exists
+    - volume_add_status_raw is defined
+    - volume_add_status_raw.stdout is defined
+    - (volume_add_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: "Display volume {{ volume_config.path }} status"
   ansible.builtin.debug:

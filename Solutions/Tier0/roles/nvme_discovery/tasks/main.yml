@@ -131,42 +131,13 @@
     - not _hw_raid_mode
     - cpu_optimized_raid | default(true)
 
-- name: Identify boot device (device containing root filesystem)
-  ansible.builtin.shell: |
-    # Find the root filesystem source device
-    root_source=$(findmnt -n -o SOURCE / 2>/dev/null)
-
-    # Trace through LVM/device-mapper to the physical disk
-    if echo "$root_source" | grep -q "mapper\|dm-"; then
-      # LVM: get the physical volume, then trace to the base disk
-      pv_device=$(pvs --noheadings -o pv_name 2>/dev/null | head -1 | xargs)
-      if [ -n "$pv_device" ]; then
-        # Strip partition number to get base disk (nvme2n1p3 -> nvme2n1, sda3 -> sda)
-        base_disk=$(lsblk -no PKNAME "$pv_device" 2>/dev/null | head -1)
-        if [ -z "$base_disk" ]; then
-          # Fallback: strip partition suffix directly
-          base_disk=$(echo "$pv_device" | sed 's|/dev/||' | sed 's/p\?[0-9]*$//')
-        fi
-        echo "$base_disk"
-      else
-        lsblk -no PKNAME "$root_source" 2>/dev/null | head -1
-      fi
-    else
-      # Direct partition or disk
-      parent=$(lsblk -no PKNAME "$root_source" 2>/dev/null | head -1)
-      if [ -n "$parent" ]; then
-        echo "$parent"
-      else
-        echo "$root_source" | sed 's|/dev/||' | sed 's/p\?[0-9]*$//'
-      fi
-    fi
-  register: boot_device_raw
-  changed_when: false
+- name: Detect boot device
+  ansible.builtin.include_tasks: detect_boot_device.yml
   when: not _hw_raid_mode
 
 - name: Set boot device fact
   ansible.builtin.set_fact:
-    boot_device: "{{ boot_device_raw.stdout | default('') | trim }}"
+    boot_device: "{{ _detected_boot_device | default('') }}"
   when: not _hw_raid_mode
 
 - name: Display boot device
@@ -505,3 +476,36 @@
       NFS Exports: {{ nfs_exports | length }} paths configured
       ============================================
   when: not _hw_raid_mode
+
+# ============================================================================
+# Validate Discovery Output
+# ============================================================================
+
+- name: Validate discovery produced RAID arrays
+  ansible.builtin.assert:
+    that:
+      - raid_arrays is defined
+      - raid_arrays | length > 0
+    fail_msg: |
+      Discovery produced 0 RAID arrays. Check:
+      - storage_type is set correctly (current: {{ storage_type | default('nvme') }})
+      - Drives exist and are not excluded by boot device detection
+      - boot_device detected: {{ boot_device | default('unknown') }}
+  when:
+    - use_dynamic_discovery | default(true)
+    - use_raid | default(true)
+    - not _hw_raid_mode
+
+- name: Validate discovery produced mount points
+  ansible.builtin.assert:
+    that:
+      - mount_points is defined
+      - mount_points | length > 0
+    fail_msg: "Discovery produced 0 mount points. RAID arrays or HW RAID devices may not be configured correctly."
+
+- name: Validate discovery produced NFS exports
+  ansible.builtin.assert:
+    that:
+      - nfs_exports is defined
+      - nfs_exports | length > 0
+    fail_msg: "Discovery produced 0 NFS exports. Check hammerspace_nodes and client_subnets variables."

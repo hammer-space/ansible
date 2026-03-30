@@ -13,7 +13,27 @@
 
 - name: Set API base URL
   ansible.builtin.set_fact:
-    hs_api_url: "https://{{ hammerspace_api_host }}:8443/mgmt/v1.2/rest"
+    hs_api_url: "https://{{ hammerspace_api_host }}:{{ hammerspace_api_port | default(8443) }}/mgmt/v1.2/rest"
+
+# =============================================================================
+# API Method Detection (curl vs uri module)
+# =============================================================================
+# Python 3.13 removed cert_file/key_file from HTTPSConnection.__init__(),
+# breaking ansible.builtin.uri. Auto-detect selects the best method.
+
+- name: Detect API method
+  ansible.builtin.set_fact:
+    _hs_use_curl: >-
+      {{ true if (hammerspace_api_method | default('auto')) == 'curl'
+         else false if (hammerspace_api_method | default('auto')) == 'uri'
+         else (ansible_python_version is version('3.13', '>=')) }}
+
+- name: Display API method
+  ansible.builtin.debug:
+    msg: >-
+      API method: {{ 'curl' if _hs_use_curl else 'uri' }}
+      (Python {{ ansible_python_version }}, config: {{ hammerspace_api_method | default('auto') }})
+  when: hammerspace_debug | default(false)
 
 # =============================================================================
 # Cluster Configuration (Optional - run first)
@@ -133,7 +153,7 @@
       _type: "NODE"
 
 - name: Check if storage system already exists
-  ansible.builtin.command:
+  ansible.builtin.shell:
     cmd: >-
       curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 60
       {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
@@ -147,11 +167,11 @@
 - name: Parse node check result
   ansible.builtin.set_fact:
     node_check:
-      status: "{{ (node_check_raw.stdout_lines | default(['0']))[-1] | int }}"
-      json: "{{ ((node_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n')) | default('{}', true) | from_json }}"
+      status: "{{ (node_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((node_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
 
 - name: Add storage system to Hammerspace cluster
-  ansible.builtin.command:
+  ansible.builtin.shell:
     cmd: >-
       curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 180
       {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
@@ -178,28 +198,39 @@
 - name: Parse node add result
   ansible.builtin.set_fact:
     node_add_result:
-      status: "{{ (node_add_raw.stdout_lines | default(['0']))[-1] | int }}"
+      status: "{{ (node_add_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
       location: "{{ node_add_location_raw.stdout | default('') }}"
   when:
     - not ansible_check_mode
     - node_check.status | int == 404
 
 - name: Wait for storage system add to complete
-  ansible.builtin.command:
+  ansible.builtin.shell:
     cmd: >-
-      curl -s --max-time 60
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
       {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
       -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
       "{{ node_add_result.location }}"
   register: node_add_status_raw
   changed_when: false
-  until: (node_add_status_raw.stdout | from_json).status | default('') == "COMPLETED"
-  retries: 30
-  delay: 10
+  until: (node_add_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
+  retries: "{{ hammerspace_node_add_retries | default(30) }}"
+  delay: "{{ hammerspace_node_add_delay | default(10) }}"
   when:
     - not ansible_check_mode
     - node_add_result is defined
     - node_add_result.location | default('') | length > 0
+
+- name: Fail if node add task did not complete successfully
+  ansible.builtin.fail:
+    msg: >-
+      Node add task ended with status: {{ (node_add_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}.
+      Check Hammerspace GUI for details.
+  when:
+    - not ansible_check_mode
+    - node_add_status_raw is defined
+    - node_add_status_raw.stdout is defined
+    - (node_add_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: Display storage system status
   ansible.builtin.debug:

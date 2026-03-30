@@ -25,50 +25,85 @@
       compressionType: "{{ object_volume_config.compression | default('NO_COMPRESSION') }}"
 
 - name: "Check if object storage volume {{ object_volume_config.name }} already exists"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/object-storage-volumes/{{ object_volume_payload.name | urlencode }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: [200, 404]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: object_volume_check
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/object-storage-volumes/{{ object_volume_payload.name | urlencode }}"
+  register: object_volume_check_raw
+  changed_when: false
   failed_when: false
+  check_mode: false
+
+- name: "Parse object storage volume check result"
+  ansible.builtin.set_fact:
+    object_volume_check:
+      status: "{{ (object_volume_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((object_volume_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
 
 - name: "Add object storage volume {{ object_volume_config.name }}"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/object-storage-volumes"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: POST
-    body: "{{ object_volume_payload }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: [200, 202]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: object_volume_add_result
-  when: object_volume_check.status == 404
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X POST -H "Content-Type: application/json"
+      -D /tmp/hs_object_volume_add_headers.txt
+      -d '{{ object_volume_payload | to_json }}'
+      "{{ hs_api_url }}/object-storage-volumes"
+  register: object_volume_add_raw
+  changed_when: true
+  when:
+    - object_volume_check.status | int == 404
+    - not ansible_check_mode
+
+- name: "Extract location header from object volume add"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_object_volume_add_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: object_volume_add_location_raw
+  changed_when: false
+  when:
+    - object_volume_check.status | int == 404
+    - not ansible_check_mode
+
+- name: "Parse object volume add result"
+  ansible.builtin.set_fact:
+    object_volume_add_result:
+      status: "{{ (object_volume_add_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((object_volume_add_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+      location: "{{ object_volume_add_location_raw.stdout | default('') }}"
+  when:
+    - object_volume_check.status | int == 404
+    - not ansible_check_mode
 
 - name: "Wait for object storage volume add to complete"
-  ansible.builtin.uri:
-    url: "{{ object_volume_add_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: object_volume_add_status
-  until: object_volume_add_status.json.status == "COMPLETED"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ object_volume_add_result.location }}"
+  register: object_volume_add_status_raw
+  changed_when: false
+  until: (object_volume_add_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
   retries: 20
   delay: 5
-  when: object_volume_add_result.location is defined
+  when:
+    - not ansible_check_mode
+    - object_volume_add_result.location | default('') | length > 0
+
+- name: "Fail if object volume add task did not complete successfully"
+  ansible.builtin.fail:
+    msg: "Task ended with status: {{ (object_volume_add_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}"
+  when:
+    - not ansible_check_mode
+    - object_volume_add_status_raw is defined
+    - object_volume_add_status_raw.stdout is defined
+    - (object_volume_add_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: "Display object storage volume status"
   ansible.builtin.debug:
     msg: >-
       Object Storage Volume '{{ object_volume_payload.name }}'
-      {% if object_volume_check.status == 200 %}already exists{% else %}added successfully{% endif %}
+      {% if object_volume_check.status | int == 200 %}already exists{% else %}added successfully{% endif %}

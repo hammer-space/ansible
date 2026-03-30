@@ -1,0 +1,30 @@
+---
+# Existing Configuration Checks
+# Detects pre-existing mdadm and NFS configurations
+
+- name: Check for existing mdadm configuration
+  ansible.builtin.stat:
+    path: /etc/mdadm/mdadm.conf
+  register: mdadm_conf
+  when: not _precheck_hw_raid
+
+- name: Display existing mdadm configuration status
+  ansible.builtin.debug:
+    msg: "Existing mdadm.conf found at /etc/mdadm/mdadm.conf - will be updated"
+  when:
+    - not _precheck_hw_raid
+    - mdadm_conf.stat is defined
+    - mdadm_conf.stat.exists
+
+- name: Check current NFS exports
+  ansible.builtin.command: exportfs -v
+  register: current_exports
+  changed_when: false
+  failed_when: false
+
+- name: Display current NFS exports
+  ansible.builtin.debug:
+    msg: |
+      Current NFS exports:
+      {{ current_exports.stdout | default('None configured') }}
+  when: current_exports.rc == 0

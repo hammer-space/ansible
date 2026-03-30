@@ -24,50 +24,85 @@
       proxyInfo: "{{ s3_node_config.proxy | default(omit) }}"
 
 - name: "Check if S3 node {{ s3_node_config.name }} already exists"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/nodes/{{ s3_node_config.name | urlencode }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: [200, 404]
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 60
-  register: s3_node_check
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ hs_api_url }}/nodes/{{ s3_node_config.name | urlencode }}"
+  register: s3_node_check_raw
+  changed_when: false
   failed_when: false
+  check_mode: false
+
+- name: "Parse S3 node check result"
+  ansible.builtin.set_fact:
+    s3_node_check:
+      status: "{{ (s3_node_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((s3_node_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
 
 - name: "Add S3 node {{ s3_node_config.name }}"
-  ansible.builtin.uri:
-    url: "{{ hs_api_url }}/nodes"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: POST
-    body: "{{ s3_node_payload }}"
-    body_format: json
-    force_basic_auth: true
-    status_code: 202
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-    timeout: 180
-  register: s3_node_add_result
-  when: s3_node_check.status == 404
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -o /dev/stdout -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      -X POST -H "Content-Type: application/json"
+      -D /tmp/hs_s3_node_add_headers.txt
+      -d '{{ s3_node_payload | to_json }}'
+      "{{ hs_api_url }}/nodes"
+  register: s3_node_add_raw
+  changed_when: true
+  when:
+    - s3_node_check.status | int == 404
+    - not ansible_check_mode
+
+- name: "Extract location header from S3 node add"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_s3_node_add_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: s3_node_add_location_raw
+  changed_when: false
+  when:
+    - s3_node_check.status | int == 404
+    - not ansible_check_mode
+
+- name: "Parse S3 node add result"
+  ansible.builtin.set_fact:
+    s3_node_add_result:
+      status: "{{ (s3_node_add_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((s3_node_add_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+      location: "{{ s3_node_add_location_raw.stdout | default('') }}"
+  when:
+    - s3_node_check.status | int == 404
+    - not ansible_check_mode
 
 - name: "Wait for S3 node add to complete"
-  ansible.builtin.uri:
-    url: "{{ s3_node_add_result.location }}"
-    user: "{{ hammerspace_api_user }}"
-    password: "{{ hammerspace_api_password }}"
-    method: GET
-    force_basic_auth: true
-    status_code: 200
-    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
-  register: s3_node_add_status
-  until: s3_node_add_status.json.status == "COMPLETED"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ s3_node_add_result.location }}"
+  register: s3_node_add_status_raw
+  changed_when: false
+  until: (s3_node_add_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
   retries: 30
   delay: 10
-  when: s3_node_add_result.location is defined
+  when:
+    - not ansible_check_mode
+    - s3_node_add_result.location | default('') | length > 0
+
+- name: "Fail if S3 node add task did not complete successfully"
+  ansible.builtin.fail:
+    msg: "Task ended with status: {{ (s3_node_add_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}"
+  when:
+    - not ansible_check_mode
+    - s3_node_add_status_raw is defined
+    - s3_node_add_status_raw.stdout is defined
+    - (s3_node_add_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
 
 - name: "Display S3 node {{ s3_node_config.name }} status"
   ansible.builtin.debug:
     msg: >-
       S3 Node '{{ s3_node_config.name }}'
-      {% if s3_node_check.status == 200 %}already exists{% else %}added successfully{% endif %}
+      {% if s3_node_check.status | int == 200 %}already exists{% else %}added successfully{% endif %}

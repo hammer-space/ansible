@@ -1,0 +1,82 @@
+---
+# Reusable Task Queue Poll Wrapper
+# Polls a Hammerspace task URL until completion, using curl or uri
+#
+# Required variables:
+#   _api_poll_url:     Task URL to poll (from Location header)
+#
+# Optional variables:
+#   _api_poll_retries: Max retries (default: 30)
+#   _api_poll_delay:   Delay between retries in seconds (default: 10)
+#
+# Output:
+#   _api_poll_result.status:      HTTP status code
+#   _api_poll_result.task_status: COMPLETED / FAILED / CANCELLED
+
+# =============================================================================
+# curl path
+# =============================================================================
+
+- name: "Poll task status via curl"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -u "{{ hammerspace_api_user }}:{{ hammerspace_api_password }}"
+      "{{ _api_poll_url }}"
+  register: _api_poll_curl_raw
+  changed_when: false
+  until: >-
+    (_api_poll_curl_raw.stdout | default('{}') | from_json).status | default('')
+    in ["COMPLETED", "FAILED", "CANCELLED"]
+  retries: "{{ _api_poll_retries | default(30) }}"
+  delay: "{{ _api_poll_delay | default(10) }}"
+  when:
+    - _hs_use_curl | bool
+    - not ansible_check_mode
+    - _api_poll_url | default('') | length > 0
+
+- name: "Parse curl poll result"
+  ansible.builtin.set_fact:
+    _api_poll_result:
+      status: 200
+      task_status: "{{ (_api_poll_curl_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}"
+  when:
+    - _hs_use_curl | bool
+    - _api_poll_curl_raw is defined
+    - _api_poll_curl_raw is not skipped
+
+# =============================================================================
+# uri module path
+# =============================================================================
+
+- name: "Poll task status via uri"
+  ansible.builtin.uri:
+    url: "{{ _api_poll_url }}"
+    method: GET
+    user: "{{ hammerspace_api_user }}"
+    password: "{{ hammerspace_api_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ hammerspace_api_validate_certs | default(false) }}"
+    timeout: "{{ hammerspace_api_curl_timeout | default(60) }}"
+    return_content: true
+  register: _api_poll_uri_raw
+  until: >-
+    (_api_poll_uri_raw.json | default({})).status | default('')
+    in ["COMPLETED", "FAILED", "CANCELLED"]
+  retries: "{{ _api_poll_retries | default(30) }}"
+  delay: "{{ _api_poll_delay | default(10) }}"
+  when:
+    - not (_hs_use_curl | bool)
+    - not ansible_check_mode
+    - _api_poll_url | default('') | length > 0
+
+- name: "Parse uri poll result"
+  ansible.builtin.set_fact:
+    _api_poll_result:
+      status: "{{ _api_poll_uri_raw.status | default(0) | int }}"
+      task_status: "{{ (_api_poll_uri_raw.json | default({})).status | default('UNKNOWN') }}"
+  when:
+    - not (_hs_use_curl | bool)
+    - _api_poll_uri_raw is defined
+    - _api_poll_uri_raw is not skipped

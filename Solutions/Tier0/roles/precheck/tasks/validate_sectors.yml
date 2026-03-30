@@ -1,0 +1,174 @@
+---
+# 4K Sector Size Validation + Optional NVMe Format
+# Validates NVMe drives use recommended 4096-byte sectors
+# Optionally formats drives to 4K (DESTRUCTIVE — requires explicit confirmation)
+# Skipped when hardware RAID mode is active (_precheck_hw_raid)
+
+# ============================================================================
+# 4K Sector Size Validation (Hammerspace recommends 4096 bytes)
+# ============================================================================
+
+- name: Check NVMe sector sizes (physical and logical)
+  ansible.builtin.shell: |
+    for dev in /dev/nvme*n1; do
+      if [ -b "$dev" ]; then
+        name=$(basename "$dev")
+        logical=$(cat /sys/block/$name/queue/logical_block_size 2>/dev/null || echo "unknown")
+        physical=$(cat /sys/block/$name/queue/physical_block_size 2>/dev/null || echo "unknown")
+        echo "$dev:$logical:$physical"
+      fi
+    done
+  register: sector_size_raw
+  changed_when: false
+  when: storage_type | default('nvme') in ['nvme', 'all']
+
+- name: Parse sector size information
+  ansible.builtin.set_fact:
+    nvme_sector_info: >-
+      {{
+        nvme_sector_info | default([]) + [{
+          'device': item.split(':')[0],
+          'logical_block_size': item.split(':')[1] | int,
+          'physical_block_size': item.split(':')[2] | int
+        }]
+      }}
+  loop: "{{ sector_size_raw.stdout_lines | default([]) }}"
+  when: item | length > 0
+
+- name: Identify drives not using recommended 4K sector size
+  ansible.builtin.set_fact:
+    drives_needing_4k_format: "{{ nvme_sector_info | selectattr('logical_block_size', 'ne', expected_sector_size | default(4096)) | list }}"
+
+- name: Display NVMe sector sizes
+  ansible.builtin.debug:
+    msg: |
+      NVMe Sector Size Check (Hammerspace recommends {{ expected_sector_size | default(4096) }} bytes):
+      ============================================
+      {% for drive in nvme_sector_info | default([]) %}
+      {{ drive.device }}:
+        Logical block size: {{ drive.logical_block_size }} bytes {% if drive.logical_block_size != (expected_sector_size | default(4096)) %}[NOT OPTIMAL]{% else %}[OK]{% endif %}
+        Physical block size: {{ drive.physical_block_size }} bytes
+      {% endfor %}
+      ============================================
+      {% if drives_needing_4k_format | length > 0 %}
+
+      WARNING: {{ drives_needing_4k_format | length }} drive(s) not using {{ expected_sector_size | default(4096) }}-byte sectors:
+      {% for drive in drives_needing_4k_format %}
+        - {{ drive.device }} (currently {{ drive.logical_block_size }} bytes)
+      {% endfor %}
+
+      To format drives to 4K sectors, set:
+        format_nvme_to_4k: true
+        nvme_format_confirm: "YES_I_UNDERSTAND_THIS_IS_DESTRUCTIVE"
+      {% else %}
+      All drives using recommended {{ expected_sector_size | default(4096) }}-byte sector size.
+      {% endif %}
+
+- name: Fail if 4K sector size is required but not present
+  ansible.builtin.fail:
+    msg: |
+      ERROR: Drives not using {{ expected_sector_size | default(4096) }}-byte sector size:
+      {{ drives_needing_4k_format | map(attribute='device') | join(', ') }}
+
+      Set require_4k_sectors: false to allow 512-byte sectors, or
+      Set format_nvme_to_4k: true with nvme_format_confirm to format drives.
+  when:
+    - drives_needing_4k_format | length > 0
+    - require_4k_sectors | default(false)
+    - boot_nvme_device is not defined or (drives_needing_4k_format | map(attribute='device') | reject('equalto', boot_nvme_device) | list | length > 0)
+
+# ============================================================================
+# Optional: NVMe 4K Format (DESTRUCTIVE — requires explicit confirmation)
+# ============================================================================
+
+- name: Format NVMe drives to 4K sector size
+  when:
+    - storage_type | default('nvme') in ['nvme', 'all']
+    - format_nvme_to_4k | default(false)
+    - nvme_format_confirm | default('') == "YES_I_UNDERSTAND_THIS_IS_DESTRUCTIVE"
+    - drives_needing_4k_format | length > 0
+  block:
+    - name: Confirm NVMe format operation
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          WARNING: DESTRUCTIVE OPERATION
+          ============================================
+          About to format the following drives to {{ expected_sector_size | default(4096) }}-byte sectors:
+          {% for drive in drives_needing_4k_format %}
+            - {{ drive.device }}
+          {% endfor %}
+
+          ALL DATA ON THESE DRIVES WILL BE LOST!
+          ============================================
+
+    - name: Get NVMe namespace ID for formatting
+      ansible.builtin.shell: |
+        nvme id-ns {{ item.device }} -o json 2>/dev/null | grep -o '"nsid":[0-9]*' | cut -d: -f2 || echo "1"
+      register: nvme_nsid
+      loop: "{{ drives_needing_4k_format }}"
+      loop_control:
+        label: "{{ item.device }}"
+      when: item.device != (boot_nvme_device | default(''))
+      changed_when: false
+
+    - name: Check supported LBA formats
+      ansible.builtin.shell: |
+        nvme id-ns {{ item.device }} -o json 2>/dev/null | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        for i, lba in enumerate(data.get('lbafs', [])):
+            ds = lba.get('ds', 0)
+            size = 2**ds if ds > 0 else 0
+            print(f'{i}:{size}')
+        " 2>/dev/null || echo "0:512"
+      register: nvme_lba_formats
+      loop: "{{ drives_needing_4k_format }}"
+      loop_control:
+        label: "{{ item.device }}"
+      when: item.device != (boot_nvme_device | default(''))
+      changed_when: false
+
+    - name: Format NVMe drives to 4K (lbaf with 4096 bytes)
+      ansible.builtin.shell: |
+        # Find the LBA format index for 4096 bytes
+        lbaf_index=$(nvme id-ns {{ item.item.device }} -o json 2>/dev/null | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        for i, lba in enumerate(data.get('lbafs', [])):
+            ds = lba.get('ds', 0)
+            size = 2**ds if ds > 0 else 0
+            if size == {{ expected_sector_size | default(4096) }}:
+                print(i)
+                sys.exit(0)
+        print('-1')
+        " 2>/dev/null)
+
+        if [ "$lbaf_index" = "-1" ]; then
+          echo "ERROR: Drive does not support {{ expected_sector_size | default(4096) }}-byte sectors"
+          exit 1
+        fi
+
+        # Format the drive
+        nvme format {{ item.item.device | regex_replace('n[0-9]+$', '') }} -l $lbaf_index -n 1
+      register: nvme_format_result
+      loop: "{{ nvme_lba_formats.results }}"
+      loop_control:
+        label: "{{ item.item.device }}"
+      when:
+        - item.item.device != (boot_nvme_device | default(''))
+        - item.stdout is defined
+        - (":" ~ (expected_sector_size | default(4096) | string)) in item.stdout
+      changed_when: nvme_format_result.rc == 0
+
+    - name: Display format results
+      ansible.builtin.debug:
+        msg: |
+          NVMe format results:
+          {% for result in nvme_format_result.results | default([]) %}
+          {% if result.changed | default(false) %}
+          {{ result.item.item.device }}: Formatted to {{ expected_sector_size | default(4096) }}-byte sectors
+          {% elif result.skipped | default(false) %}
+          {{ result.item.item.device }}: Skipped (4K not supported or boot device)
+          {% endif %}
+          {% endfor %}
