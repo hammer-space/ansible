@@ -1,7 +1,0 @@
----
-# RedHat/Rocky/CentOS specific variables
-
-fs_packages:
-  - xfsprogs
-  - parted
-  - e2fsprogs

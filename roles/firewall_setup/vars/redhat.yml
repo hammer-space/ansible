@@ -1,5 +1,0 @@
----
-# RedHat/Rocky/CentOS firewall variables
-
-firewall_packages:
-  - firewalld
