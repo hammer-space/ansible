@@ -1,6 +1,0 @@
----
-# Default OS variables
-
-fs_packages:
-  - xfsprogs
-  - parted

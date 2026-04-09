@@ -1,8 +1,0 @@
----
-# Default variables for nfs_setup role
-
-# NFS version to use (v4 recommended)
-nfs_version: 4
-
-# Default export options
-default_export_options: "rw,sync,no_subtree_check"
