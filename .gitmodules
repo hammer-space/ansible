@@ -1,0 +1,3 @@
+[submodule "Solutions/Ansible-Tier0"]
+	path = Solutions/Ansible-Tier0
+	url = https://github.com/hammerspace-solutions/Ansible-Tier0.git
