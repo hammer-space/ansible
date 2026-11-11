@@ -1,0 +1,54 @@
+---
+# SELinux setup role - Disable SELinux on RedHat systems
+
+- name: Skip SELinux configuration on non-RedHat systems
+  ansible.builtin.debug:
+    msg: "SELinux configuration not applicable on {{ ansible_os_family }}"
+  when: ansible_os_family != 'RedHat'
+
+- name: Configure SELinux (RedHat only)
+  when:
+    - ansible_os_family == 'RedHat'
+    - di_disable_selinux | default(true)
+  block:
+    - name: Check current SELinux status
+      ansible.builtin.command:
+        cmd: getenforce
+      register: selinux_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display current SELinux status
+      ansible.builtin.debug:
+        msg: "Current SELinux status: {{ selinux_status.stdout | default('unknown') }}"
+
+    - name: Disable SELinux in config
+      ansible.posix.selinux:
+        state: disabled
+      register: selinux_changed
+      when: selinux_status.stdout | default('') != 'Disabled'
+
+    - name: Set SELinux to permissive immediately
+      ansible.builtin.command:
+        cmd: setenforce 0
+      when:
+        - selinux_status.stdout | default('') == 'Enforcing'
+      failed_when: false
+
+    - name: Reboot if SELinux was changed
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        msg: "Rebooting to apply SELinux changes"
+      when:
+        - selinux_changed is defined
+        - selinux_changed is changed
+        - di_selinux_reboot | default(true)
+
+    - name: Wait for system to come back after reboot
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 300
+      when:
+        - selinux_changed is defined
+        - selinux_changed is changed
+        - di_selinux_reboot | default(true)

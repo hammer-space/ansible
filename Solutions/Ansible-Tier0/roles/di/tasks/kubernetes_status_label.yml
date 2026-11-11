@@ -1,0 +1,95 @@
+---
+# Snapshot the DI pod state on each labeled node and set
+# {{ di_k8s_status_label }} = ready | degraded | failed on the node.
+# Re-runnable standalone via: --tags di-k8s-status
+
+- name: Validate inputs
+  ansible.builtin.assert:
+    that:
+      - di_k8s_kubeconfig | length > 0
+      - di_k8s_namespace | length > 0
+      - di_k8s_status_label | length > 0
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Fetch DI pods in namespace
+  ansible.builtin.command:
+    cmd: >-
+      kubectl --kubeconfig {{ di_k8s_kubeconfig }} -n {{ di_k8s_namespace }}
+      get pods -l app.kubernetes.io/name=hammerspace-di -o json
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: _di_k8s_pods_raw
+  changed_when: false
+  retries: "{{ di_k8s_status_retries }}"
+  delay: "{{ di_k8s_status_delay }}"
+  until: _di_k8s_pods_raw.rc == 0
+
+- name: Parse pod status per node
+  ansible.builtin.set_fact:
+    _di_k8s_node_status: >-
+      {{ dict(
+           (_di_k8s_pods_raw.stdout | from_json).get('items', [])
+           | map(attribute='spec.nodeName')
+           | zip(
+               (_di_k8s_pods_raw.stdout | from_json).get('items', [])
+               | map('community.general.json_query',
+                     "status.containerStatuses[?name=='hammerspace-di'].ready | [0]")
+             )
+         ) }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Compute target nodes (same as deploy)
+  ansible.builtin.set_fact:
+    _di_k8s_target_nodes: >-
+      {{ di_k8s_target_nodes
+         if (di_k8s_target_nodes | length > 0)
+         else (groups['di_nodes'] | default([])
+               | map('extract', hostvars, 'inventory_hostname') | list) }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Compute status label per target node
+  ansible.builtin.set_fact:
+    _di_k8s_label_plan: >-
+      {{ dict(
+           _di_k8s_target_nodes
+           | zip(_di_k8s_target_nodes
+                 | map('extract', _di_k8s_node_status)
+                 | map('default', None) | list)
+         ) }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Display label plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.key }}: {{ 'ready' if item.value is true
+                         else ('degraded' if item.value is false else 'failed') }}
+  loop: "{{ _di_k8s_label_plan | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Apply status label to each target node
+  ansible.builtin.command:
+    cmd: >-
+      kubectl --kubeconfig {{ di_k8s_kubeconfig }} label node {{ item.key }}
+      {{ di_k8s_status_label }}={{ 'ready' if item.value is true
+                                    else ('degraded' if item.value is false else 'failed') }}
+      --overwrite
+  loop: "{{ _di_k8s_label_plan | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: true

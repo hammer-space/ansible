@@ -1,0 +1,302 @@
+---
+# Integration test for RAID idempotency (Peter's bug, 2026-05-15).
+#
+# Symptom: a re-run after reboot fails with:
+#   mdadm: super1.x cannot open /dev/sdb: Device or resource busy
+# because the kernel auto-assembled the array as /dev/md127 (different from
+# the planned name /dev/md0), so the role's name-only check missed it and
+# tried to recreate the array on drives that are already members.
+#
+# This test exercises the new pre-create detection logic in raid_setup:
+#   - _array_md_lookup → finds the actual md device for each planned name
+#   - _existing_md_for_array → dict mapping planned → actual
+#   - _arrays_already_present → list of planned names that should be skipped
+#   - device remap on raid_arrays / mount_points
+#
+# Runs against localhost; uses mocked inputs (no real mdadm needed).
+#
+# Usage:
+#   ansible-playbook tests/integration/test_raid_idempotency.yml \
+#       -i localhost, -c local
+
+- name: RAID idempotency regression tests
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+
+    # Mocked planned arrays (what nvme_discovery / build_raid_arrays produces)
+    planned_arrays:
+      - name: md0
+        device: /dev/md0
+        level: 0
+        drives: [/dev/sdb, /dev/sdc]
+      - name: md1
+        device: /dev/md1
+        level: 0
+        drives: [/dev/sdd, /dev/sde]
+
+    # Mocked mount_points pointing at the planned devices
+    planned_mount_points:
+      - path: /hammerspace/hsvol0
+        device: /dev/md0
+        fstype: xfs
+        label: hsvol0
+        mount_opts: defaults,nofail,discard
+        is_raid: true
+      - path: /hammerspace/hsvol1
+        device: /dev/md1
+        fstype: xfs
+        label: hsvol1
+        mount_opts: defaults,nofail,discard
+        is_raid: true
+
+  tasks:
+    # ========================================================================
+    # TEST 1: drives already in md127 — md0 should be detected as "present"
+    # and remapped, not recreated.
+    # ========================================================================
+    - name: 'TEST 1: simulate Peter''s scenario (md0 already assembled as md127)'
+      block:
+        # Simulate _array_md_lookup output as if /dev/sdb is a member of md127
+        # and /dev/sdd is a member of md126. This mirrors what the new shell
+        # block in raid_setup/tasks/main.yml emits.
+        - name: Simulate lsblk-derived md memberships
+          ansible.builtin.set_fact:
+            _array_md_lookup:
+              results:
+                - item: "{{ planned_arrays[0] }}"
+                  stdout: "/dev/md127"
+                - item: "{{ planned_arrays[1] }}"
+                  stdout: "/dev/md126"
+
+        - name: Build planned-name → existing-md-device mapping (same logic as role)
+          ansible.builtin.set_fact:
+            _existing_md_for_array: >-
+              {{ dict(_array_md_lookup.results
+                      | map(attribute='item')
+                      | map(attribute='name')
+                      | zip(_array_md_lookup.results
+                            | map(attribute='stdout')
+                            | map('trim')
+                            | list)) }}
+
+        - name: Build planned-device → actual-device remap
+          ansible.builtin.set_fact:
+            _device_remap: >-
+              {{ dict(_array_md_lookup.results
+                      | map(attribute='item')
+                      | map(attribute='device')
+                      | zip(_array_md_lookup.results
+                            | map(attribute='stdout')
+                            | map('trim')
+                            | list))
+                 | dict2items
+                 | selectattr('value', 'ne', '')
+                 | items2dict }}
+
+        - name: List arrays already present (under any name)
+          ansible.builtin.set_fact:
+            _arrays_already_present: >-
+              {{ _existing_md_for_array
+                 | dict2items | selectattr('value', 'ne', '') | map(attribute='key') | list }}
+
+        - name: 'TEST 1 ASSERT: mapping captures md0→/dev/md127 and md1→/dev/md126'
+          ansible.builtin.assert:
+            that:
+              - _existing_md_for_array['md0'] == '/dev/md127'
+              - _existing_md_for_array['md1'] == '/dev/md126'
+              - _arrays_already_present | sort == ['md0', 'md1']
+              - _device_remap['/dev/md0'] == '/dev/md127'
+              - _device_remap['/dev/md1'] == '/dev/md126'
+
+        - name: Apply the create-skip condition from the role
+          ansible.builtin.set_fact:
+            _arrays_to_create: >-
+              {{ planned_arrays
+                 | rejectattr('name', 'in', _arrays_already_present)
+                 | list }}
+
+        - name: 'TEST 1 ASSERT: nothing would be passed to mdadm --create'
+          ansible.builtin.assert:
+            that:
+              - _arrays_to_create | length == 0
+            fail_msg: |
+              REGRESSION: the create-skip filter let {{ _arrays_to_create | length }} array(s)
+              through. They would be sent to `mdadm --create` and fail with EBUSY:
+                {{ _arrays_to_create | map(attribute='name') | list }}
+
+        - name: Initialize remapped_mount_points
+          ansible.builtin.set_fact:
+            remapped_mount_points: "{{ planned_mount_points }}"
+
+        - name: Apply the mount_points remap from the role (per-element)
+          ansible.builtin.set_fact:
+            remapped_mount_points: >-
+              {{ (remapped_mount_points | rejectattr('path', 'equalto', item.path) | list)
+                 + [ item | combine({'device': _device_remap[item.device]
+                                      | default(item.device)}) ] }}
+          loop: "{{ planned_mount_points }}"
+          loop_control:
+            label: "{{ item.path }}"
+          when: item.device in _device_remap
+
+        - name: Sort remapped list by path (rejectattr+append reorders entries)
+          ansible.builtin.set_fact:
+            remapped_mount_points: "{{ remapped_mount_points | sort(attribute='path') }}"
+
+        - name: 'TEST 1 ASSERT: mount_points now point at the real md devices'
+          ansible.builtin.assert:
+            that:
+              - remapped_mount_points[0].device == '/dev/md127'
+              - remapped_mount_points[1].device == '/dev/md126'
+              - remapped_mount_points[0].path == '/hammerspace/hsvol0'
+              - remapped_mount_points[1].path == '/hammerspace/hsvol1'
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: md0/md1 already assembled as md127/md126 → create skipped, mounts remapped'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace(\"\\n\", \" \"))] }}"
+
+    # ========================================================================
+    # TEST 2: drives NOT yet in any array — both planned arrays must be created
+    # (negative test: ensures we don't accidentally skip valid creates).
+    # ========================================================================
+    - name: 'TEST 2: fresh host with no existing arrays should create both'
+      block:
+        - name: Simulate lsblk lookup with no existing md membership
+          ansible.builtin.set_fact:
+            _array_md_lookup:
+              results:
+                - item: "{{ planned_arrays[0] }}"
+                  stdout: ""
+                - item: "{{ planned_arrays[1] }}"
+                  stdout: ""
+
+        - name: Recompute helper facts
+          ansible.builtin.set_fact:
+            _existing_md_for_array: >-
+              {{ dict(_array_md_lookup.results
+                      | map(attribute='item')
+                      | map(attribute='name')
+                      | zip(_array_md_lookup.results
+                            | map(attribute='stdout')
+                            | map('trim')
+                            | list)) }}
+            _arrays_already_present: >-
+              {{ _array_md_lookup.results
+                 | map(attribute='stdout') | map('trim') | reject('equalto', '') | list }}
+
+        - name: Filter arrays-to-create with same rule as role
+          ansible.builtin.set_fact:
+            _arrays_to_create: >-
+              {{ planned_arrays
+                 | rejectattr('name', 'in', _arrays_already_present)
+                 | list }}
+
+        - name: 'TEST 2 ASSERT: both planned arrays survive (no false skips)'
+          ansible.builtin.assert:
+            that:
+              - _arrays_to_create | length == 2
+              - (_arrays_to_create | map(attribute='name') | list | sort) == ['md0', 'md1']
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: fresh host → both planned arrays survive the skip filter'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 3: partial overlap — md0 exists as md127, md1 is fresh.
+    # Must skip only md0 and create md1.
+    # ========================================================================
+    - name: 'TEST 3: partial overlap — skip md0, create md1'
+      block:
+        - name: Simulate partial overlap
+          ansible.builtin.set_fact:
+            _array_md_lookup:
+              results:
+                - item: "{{ planned_arrays[0] }}"
+                  stdout: "/dev/md127"      # md0 already assembled
+                - item: "{{ planned_arrays[1] }}"
+                  stdout: ""                # md1 is fresh
+
+        - name: Recompute helper facts
+          ansible.builtin.set_fact:
+            _existing_md_for_array: >-
+              {{ dict(_array_md_lookup.results
+                      | map(attribute='item')
+                      | map(attribute='name')
+                      | zip(_array_md_lookup.results
+                            | map(attribute='stdout')
+                            | map('trim')
+                            | list)) }}
+            _arrays_already_present: >-
+              {{ dict(_array_md_lookup.results
+                      | map(attribute='item')
+                      | map(attribute='name')
+                      | zip(_array_md_lookup.results
+                            | map(attribute='stdout')
+                            | map('trim')
+                            | list))
+                 | dict2items | selectattr('value', 'ne', '') | map(attribute='key') | list }}
+
+        - name: Filter arrays-to-create
+          ansible.builtin.set_fact:
+            _arrays_to_create: >-
+              {{ planned_arrays
+                 | rejectattr('name', 'in', _arrays_already_present)
+                 | list }}
+
+        - name: 'TEST 3 ASSERT: only md1 is created; md0 is skipped'
+          ansible.builtin.assert:
+            that:
+              - _arrays_to_create | length == 1
+              - _arrays_to_create[0].name == 'md1'
+              - _arrays_already_present == ['md0']
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: partial overlap → skip existing md0, create fresh md1'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          RAID IDEMPOTENCY REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed — see report above."
+      when: _test_failures | length > 0

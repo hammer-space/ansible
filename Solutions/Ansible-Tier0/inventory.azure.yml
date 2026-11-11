@@ -1,0 +1,217 @@
+---
+# Azure Dynamic Inventory for Ansible
+# Prerequisites:
+#   ansible-galaxy collection install azure.azcollection
+#   pip3 install -r ~/.ansible/collections/ansible_collections/azure/azcollection/requirements.txt
+#   Configure Azure credentials
+#
+# Authentication options:
+#   Option 1: Azure CLI - run 'az login' (auth_source: cli)
+#     az login
+#     az account set --subscription <subscription-id>
+#   Option 2: Service principal via environment variables:
+#     export AZURE_SUBSCRIPTION_ID='...'
+#     export AZURE_CLIENT_ID='...'
+#     export AZURE_SECRET='...'
+#     export AZURE_TENANT='...'
+#   Option 3: Managed identity (when running on an Azure VM) - auth_source: msi
+#
+# NOTE: the file MUST be named with an `azure_rm.yml` / `azure.yml` suffix for
+# the plugin to be recognized. `inventory.azure.yml` matches the `azure.yml`
+# suffix rule. Do NOT confuse this file with `inventory.az.yml`, which is a
+# STATIC availability-zone-grouped inventory and is unrelated to Azure.
+#
+# Test with: ansible-inventory -i inventory.azure.yml --list
+
+plugin: azure.azcollection.azure_rm
+
+# Which resource groups to pull VMs from - REQUIRED: update for your environment.
+# Remove this key entirely to scan the whole subscription (slower).
+#
+# Fetches STANDALONE VMs ONLY. Scale-set instances are NOT returned by this
+# option — VMSS fetch is off by default and needs include_vmss_resource_groups
+# below. If nodes are missing here but `az vmss list` shows them, that is why.
+include_vm_resource_groups:
+  - tier0-rg
+
+# Scale Sets (VMSS). Defaults to NO VMSS FETCH AT ALL. Uncomment to include
+# them: '*' scans every resource group, or list specific groups. Relevant for
+# CycleCloud/HPC, which provisions execute nodes as scale sets.
+#
+# include_vmss_resource_groups:
+#   - '*'
+#
+# Uniform vs Flexible orchestration matters here:
+#   Uniform  - instances are not standalone VM resources; they appear ONLY
+#              via include_vmss_resource_groups
+#   Flexible - instances ARE standard VM resources and may ALSO appear via
+#              include_vm_resource_groups, so enabling both can surface the
+#              same node twice under different names
+# Check which you have:
+#   az vmss list -g <rg> --query "[].{name:name, mode:orchestrationMode}" -o table
+
+# Use the bare VM name as the Ansible inventory hostname instead of the
+# default "name_(resourcegroup)" form. Keeps hostnames matching the
+# Hammerspace node names.
+plain_host_names: true
+
+# ----------------------------------------------------------------------------
+# Naming hosts by IP so `--limit <ip>` works
+# ----------------------------------------------------------------------------
+# `--limit` matches inventory_hostname and GROUP names only — never
+# `ansible_host`. So `--limit 10.0.16.5` fails with "Could not match supplied
+# host pattern" even though that IP is the host's connection address. (Verified
+# directly: limiting by inventory name or wildcard matches; by IP it does not.)
+#
+# If your automation can only supply IP addresses, uncomment this to make the
+# inventory NAME each host by its private IP. Then this works:
+#
+#   --limit '10.0.16.5,10.0.16.7'
+#
+# hostnames:
+#   - private_ipv4_addresses | first
+#   - default
+#
+# Each entry is a JINJA2 EXPRESSION, not a keyword — see the plugin source
+# comment "change how inventory_hostname is generated. Each item is a jinja2
+# expression similar to hostvar_expressions". So a bare
+# `private_ipv4_addresses` yields the whole LIST as the name; `| first` is
+# required. `default` is a documented special value meaning the plugin's normal
+# hashed name — keep it last so a host with no private IP still appears.
+#
+# NOT verified against a live Azure subscription. Confirm before relying on it:
+#   ansible-inventory -i inventory.azure.yml --graph --flush-cache
+#   ansible-doc -t inventory azure.azcollection.azure_rm | grep -A20 hostnames
+# The plugin caches results, so --flush-cache matters when testing changes.
+#
+# TRADE-OFFS: every host is renamed, so --graph output and log lines lose
+# readable names, and any host_vars/ keyed by name stop matching. On CycleCloud
+# the IP may be no more stable than the name, since nodes are recycled. The
+# simpler alternative that needs no inventory change is a name wildcard —
+# VMSS instances are "<vmss-name>_<instance-id>", and the prefix is stable:
+#   --limit 'hb120v3*'
+
+# auto -> tries env vars, then credential profile, then CLI, then MSI.
+auth_source: auto
+
+# Only running, successfully-provisioned VMs (these are the plugin defaults;
+# restated here so they are visible/editable).
+exclude_host_filters:
+  - "powerstate != 'running'"
+  - "provisioning_state != 'succeeded'"
+
+# Host variables consumed by the Tier 0 roles.
+#
+# azure_zone / azure_fault_domain feed the AZ-derivation chain in
+# vars/main.yml (_cloud_az_detected). `availability_zone` is exposed by the
+# azure_rm plugin from the VM's `zones` property and is null/absent for
+# non-zonal VMs (availability sets, or regions without zones). In that case
+# leave it unset here and enable `hammerspace_azure_imds_az: true` so the AZ
+# is read from Instance Metadata Service (which also exposes the platform
+# fault domain). See roles/hammerspace_integration/tasks/azure_imds_az.yml.
+hostvar_expressions:
+  ansible_host: private_ipv4_addresses[0]
+  azure_zone: availability_zone | default(None)
+  azure_vm_size: virtual_machine_size | default(None)
+  azure_location: location | default(None)
+  azure_resource_group: resource_group | default(None)
+
+# Which discovered VMs become storage_servers — the group the plays target.
+#
+# NOTE the two filters do different jobs and are easy to conflate:
+#   include_vm_resource_groups  -> what is FETCHED from Azure (cost/permission
+#                                  boundary; too narrow and no expression here
+#                                  can recover the missing hosts)
+#   conditional_groups          -> what of the fetched set lands in the group
+#
+# SAFETY: whatever lands in storage_servers gets its disks discovered, RAIDed
+# and mkfs'd. A filter that is too broad is DESTRUCTIVE, not just noisy — an
+# unrelated VM that happens to match joins the group and loses its data. Prefer
+# the narrowest expression that covers the fleet, and confirm with
+# `ansible-inventory -i inventory.azure.yml --graph` before every first run
+# against a new environment.
+#
+# Option 1 (DEFAULT — tightest): exact VM sizes. Tier 0 fleets are normally
+# homogeneous, so an explicit list is both precise and self-documenting.
+# `virtual_machine_size` is the SKU/size string, e.g. "Standard_L16s_v3".
+conditional_groups:
+  storage_servers: >-
+    virtual_machine_size is defined and
+    virtual_machine_size in ['Standard_L16s_v3', 'Standard_L32s_v3']
+
+# Option 2: whole SKU FAMILY — survives adding a node of a different size in
+# the same family, at the cost of sweeping in any same-family VM in the
+# resource group. Matches the storage-optimized L-family (Lsv2/Lsv3/Lasv3/
+# Lsv4 — local NVMe) and the NC/ND GPU families.
+#   storage_servers: >-
+#     virtual_machine_size is defined and
+#     virtual_machine_size | regex_search('^Standard_(L[0-9]+a?s_v[0-9]+|N[CD][0-9]+)')
+#
+# Option 3 (SAFEST): explicit intent via a tag, optionally AND-ed with the SKU
+# so a mistagged VM of the wrong size still cannot join.
+#   az vm update -g <rg> -n <vm> --set tags.role=tier0
+#   storage_servers: >-
+#     tags.role | default('') == 'tier0' and
+#     virtual_machine_size | default('') | regex_search('^Standard_L')
+
+# Filtering on scale-set membership
+# ---------------------------------
+# The `vmss` hostvar is {id, name} for a scale-set instance and an EMPTY DICT
+# {} for a standalone VM. It is therefore ALWAYS defined — test its length,
+# never `is defined`, which is true for both and silently matches everything:
+#
+#   only scale-set instances   vmss | default({}) | length > 0
+#   only standalone VMs        vmss | default({}) | length == 0
+#   one named scale set        (vmss | default({})).get('name', '') == 'execute'
+#   scale set AND SKU          (vmss | default({})).get('name', '') == 'execute'
+#                                and virtual_machine_size | default('') == 'Standard_L16s_v3'
+#
+# `resource_type` is an independent second signal, useful as a cross-check:
+#   standalone  Microsoft.Compute/virtualMachines
+#   scale set   Microsoft.Compute/virtualMachineScaleSets/virtualMachines
+#
+# Example — Tier 0 nodes are the L16s_v3 members of the 'tier0' scale set:
+#
+#   conditional_groups:
+#     storage_servers: >-
+#       (vmss | default({})).get('name', '') == 'tier0' and
+#       virtual_machine_size | default('') == 'Standard_L16s_v3'
+
+# conditional_groups expressions fail SILENTLY by default — a typo drops hosts
+# with no error, and storage_servers just comes back empty. Set strict: true
+# while debugging to turn those into hard errors.
+strict: false
+
+# Group by zone (az1, az2, ...) so on-prem-style AZ group names still work as
+# a fallback AZ source, and by VM size for targeted --limit runs.
+#
+# EVERY key is wrapped in `| default('<fallback>', true)`. A keyed_groups key
+# that evaluates to null or "" aborts the host with
+#   "No key or key resulted empty for <key> in host <name>, invalid entry"
+# on ansible-core <= 2.14 (newer cores skip the host silently instead — so this
+# breaks on an OLD controller while looking fine on a new one). Non-zonal Azure
+# VMs — availability sets, CycleCloud/HPC deployments, regions without zone
+# support — report availability_zone as null, which is the common case, not an
+# edge case. The `true` second argument is required: it makes `default` fire on
+# falsy values (null, "") rather than only on undefined.
+#
+# Non-zonal hosts land in `aznone`. That group is informational only; AZ
+# derivation for them comes from IMDS via hammerspace_azure_imds_az.
+keyed_groups:
+  - key: availability_zone | default('none', true)
+    prefix: az
+    separator: ''
+  - key: virtual_machine_size | default('unknown', true)
+    prefix: size
+  - key: location | default('unknown', true)
+    prefix: loc
+  # Scale-set membership: vmss_<scaleset-name>, or vmss_standalone for
+  # non-VMSS VMs. Enables `--limit vmss_tier0`.
+  - key: (vmss | default({})).get('name', 'standalone')
+    prefix: vmss
+
+# Cache the API results - Azure inventory calls are slow on large subscriptions.
+cache: true
+cache_plugin: jsonfile
+cache_timeout: 300
+cache_connection: /tmp/ansible_azure_inventory_cache

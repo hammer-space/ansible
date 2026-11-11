@@ -1,0 +1,126 @@
+---
+# DI Register role - Register DI node with Hammerspace cluster
+
+- name: Set DI node facts
+  ansible.builtin.set_fact:
+    _di_node_name: "{{ di_node_name | default(inventory_hostname) }}"
+    _di_node_ip: "{{ di_node_ip | default(ansible_default_ipv4.address) }}"
+
+# Always use curl for API requests (uri module has SSL/compatibility issues)
+- name: Set API method
+  ansible.builtin.set_fact:
+    _hs_use_curl: true
+
+# Check if node is already registered
+- name: Check if DI node already exists in Hammerspace
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -w "\n%{http_code}" --max-time 30
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      "https://{{ hammerspace_cluster_mgmt_ip | default(hammerspace_api_host) }}:{{ hammerspace_api_port | default(8443) }}/mgmt/v1.2/rest/nodes/{{ _di_node_name | urlencode }}"
+  register: node_check_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Parse node check result
+  ansible.builtin.set_fact:
+    _di_node_exists: "{{ ((node_check_raw.stdout_lines | default(['404']))[-1] | int) == 200 }}"
+
+- name: Display node registration status
+  ansible.builtin.debug:
+    msg: >-
+      DI node '{{ _di_node_name }}' {{ 'is already registered - skipping registration' if _di_node_exists | bool
+      else 'is not registered - will register now' }}
+
+# Register via add_node.py script
+- name: Register DI node with Hammerspace
+  when:
+    - not (_di_node_exists | bool)
+    - di_registration_method | default('script') == 'script'
+  block:
+    - name: Check for add_node.py
+      ansible.builtin.stat:
+        path: /usr/local/bin/add_node.py
+      register: add_node_script
+
+    - name: Check for add_node.py in DI install directory
+      ansible.builtin.find:
+        paths:
+          - "{{ di_tmp_dir | default('/tmp/di_install') }}"
+          - /opt/hammerspace
+          - /usr/local/bin
+        patterns: "add_node.py"
+        recurse: true
+      register: add_node_search
+      when: not add_node_script.stat.exists
+
+    - name: Set add_node.py path
+      ansible.builtin.set_fact:
+        _add_node_path: >-
+          {%- if add_node_script.stat.exists -%}
+            /usr/local/bin/add_node.py
+          {%- elif add_node_search.matched | default(0) > 0 -%}
+            {{ add_node_search.files[0].path }}
+          {%- else -%}
+            not_found
+          {%- endif -%}
+
+    - name: Fail if add_node.py not found
+      ansible.builtin.fail:
+        msg: >-
+          add_node.py script not found. Ensure the DI components tarball
+          includes add_node.py or place it at /usr/local/bin/add_node.py
+      when: _add_node_path == 'not_found'
+
+    - name: Patch add_node.py POST to use ignoreIpConflicts (for co-located Tier 0 + DI)
+      ansible.builtin.command:
+        cmd: >-
+          sed -i "/def post/,/def [a-z]/s|endpoint='nodes'|endpoint='nodes?ignoreIpConflicts=true'|"
+          {{ _add_node_path }}
+      changed_when: true
+      failed_when: false
+      when: di_ignore_ip_conflicts | default(true) | bool
+
+    - name: Run add_node.py to register DI with cluster
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ _add_node_path }}
+          -i {{ _di_node_ip }}
+          -l {{ di_node_netmask_prefix }}
+          -d
+          -u {{ hammerspace_api_user }}
+          -p {{ hammerspace_api_password }}
+          -n {{ _di_node_name }}
+      register: add_node_result
+      no_log: true
+
+    - name: Display registration result
+      ansible.builtin.debug:
+        msg: "DI node '{{ _di_node_name }}' registered successfully"
+      when: add_node_result.rc == 0
+
+    - name: Fail if registration failed
+      ansible.builtin.fail:
+        msg: "Failed to register DI node '{{ _di_node_name }}': {{ add_node_result.stderr | default('unknown error') }}"
+      when: add_node_result.rc != 0
+
+# Verify registration
+- name: Verify DI node registration
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time 30
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      "https://{{ hammerspace_cluster_mgmt_ip | default(hammerspace_api_host) }}:{{ hammerspace_api_port | default(8443) }}/mgmt/v1.2/rest/nodes/{{ _di_node_name | urlencode }}"
+  register: verify_result
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Display verification result
+  ansible.builtin.debug:
+    msg: "Node verification: {{ (verify_result.stdout | from_json).name | default('unable to verify') }}"
+  when: verify_result.stdout | default('') | length > 2
+  failed_when: false

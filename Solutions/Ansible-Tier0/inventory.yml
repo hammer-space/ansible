@@ -1,0 +1,39 @@
+---
+# Inventory file for storage servers
+# Customize this for your environment
+
+all:
+  children:
+    storage_servers:
+      hosts:
+        tier0-node-01:
+          ansible_host: 10.0.14.234
+
+      vars:
+        # SSH settings
+        ansible_user: ubuntu
+        ansible_ssh_private_key_file: /home/ubuntu/.ssh/ansible_admin_key
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_become: true
+        ansible_become_method: sudo
+
+    # Optional: DI (Data Instantiator / NFS Mover) nodes
+    # Enable with deploy_di: true in vars/main.yml or -e deploy_di=true
+    di_nodes:
+      hosts:
+        # mover101:
+        #   ansible_host: 10.0.12.100
+        #   di_node_ip: 10.0.12.100
+        #   di_node_name: mover101
+        # mover201:
+        #   ansible_host: 10.0.12.200
+        #   di_node_ip: 10.0.12.200
+        #   di_node_name: mover201
+      vars:
+        ansible_user: root
+
+    # Optional: Define NFS clients for verification
+    nfs_clients:
+      hosts:
+        # client-01:
+        #   ansible_host: 10.1.2.100

@@ -1,0 +1,335 @@
+---
+# Storage + NFS configuration for Hammerspace Tier 0 / LSS storage_servers.
+# Imported by site.yml.
+
+- name: Configure Storage and NFS for Hammerspace Tier 0 / LSS
+  hosts: storage_servers
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - ../vars/main.yml
+
+  pre_tasks:
+    # Load vault.yml if available (optional — password can be passed via -e)
+    # vars/main.yml defines repo_root = "{{ playbook_dir }}/..", which handles
+    # the plays/-subdirectory resolution. See vars/main.yml header for context.
+    - name: Load vault variables (if available)
+      ansible.builtin.include_vars:
+        file: "{{ repo_root }}/vars/vault.yml"
+      failed_when: false
+      no_log: true
+
+    - name: Require hammerspace_api_host (set with -e hammerspace_api_host=<anvil-ip>)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: require_api_host
+      tags: [always]
+
+    # Azure Key Vault (opt-in) — overrides vars/vault.yml when set. Must
+    # resolve BEFORE anything authenticates against the Anvil.
+    - name: Retrieve Hammerspace password from Azure Key Vault (optional)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: keyvault_password
+      when: (hammerspace_keyvault_uri | default('')) | length > 0
+
+    # Flush iptables immediately to prevent connectivity issues
+    - name: Flush iptables INPUT chain
+      ansible.builtin.iptables:
+        chain: INPUT
+        flush: true
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Flush iptables FORWARD chain
+      ansible.builtin.iptables:
+        chain: FORWARD
+        flush: true
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Set iptables INPUT policy to ACCEPT
+      ansible.builtin.iptables:
+        chain: INPUT
+        policy: ACCEPT
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Allow established connections
+      ansible.builtin.iptables:
+        chain: INPUT
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Allow SSH connections
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: 22
+        jump: ACCEPT
+      when: flush_iptables | default(true)
+      ignore_errors: true
+
+    - name: Verify we have the required variables (skip if using dynamic discovery, HW RAID, or manual mount_points)
+      ansible.builtin.assert:
+        that:
+          - raid_arrays is defined or individual_drives is defined or use_dynamic_discovery | default(false)
+            or hw_raid_devices is defined or mount_points is defined
+            or existing_mount_paths | default([]) | length > 0
+          - nfs_exports is defined or use_dynamic_discovery | default(false)
+            or hw_raid_devices is defined or mount_points is defined
+            or existing_mount_paths | default([]) | length > 0
+        fail_msg: "Required variables are not defined. Check vars/main.yml or enable use_dynamic_discovery"
+
+    # =========================================================================
+    # Hammerspace API connectivity + credentials precheck (fail fast)
+    # =========================================================================
+    # Validates that hammerspace_api_host is reachable and the credentials work
+    # BEFORE running any storage/NFS configuration. Saves an hour of work only
+    # to fail at the registration step with a bad password or unreachable Anvil.
+    - name: Hammerspace API preflight (connectivity + credentials)
+      when:
+        - hammerspace_api_host is defined
+        - hammerspace_api_user is defined
+        - hammerspace_api_password is defined
+      run_once: true
+      delegate_to: "{{ groups['storage_servers'][0] }}"
+      block:
+        - name: Test TCP connectivity to Hammerspace API
+          ansible.builtin.wait_for:
+            host: "{{ hammerspace_api_host }}"
+            port: "{{ hammerspace_api_port | default(8443) }}"
+            timeout: 10
+            state: started
+          register: hs_api_tcp_check
+
+        # Use /cntl (cluster controller) for the auth probe. Confirmed present
+        # on Anvil deployments where /cluster returns 404. The downstream role
+        # uses /nodes for real work; /cntl is just a cheap auth check.
+        - name: Authenticate against Hammerspace API
+          ansible.builtin.shell:
+            cmd: >-
+              curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 15
+              {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+              -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+              "https://{{ hammerspace_api_host }}:{{ hammerspace_api_port | default(8443) }}/mgmt/v1.2/rest/cntl"
+          register: hs_api_auth_check
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: Parse Hammerspace API response code
+          ansible.builtin.set_fact:
+            _hs_api_http_code: "{{ (hs_api_auth_check.stdout_lines | default(['000']))[-1] | int }}"
+
+        - name: Fail if Hammerspace API credentials are invalid
+          ansible.builtin.fail:
+            msg: |
+              Hammerspace API authentication FAILED at https://{{ hammerspace_api_host }}:{{ hammerspace_api_port | default(8443) }}
+              HTTP response code: {{ _hs_api_http_code }}
+              Expected: 200 (OK)
+              {% if _hs_api_http_code | int == 401 %}
+              Cause: Invalid username or password (check hammerspace_api_user / vault_hammerspace_api_password).
+              {% elif _hs_api_http_code | int == 403 %}
+              Cause: User is authenticated but lacks permission (admin role required).
+              {% elif _hs_api_http_code | int == 0 %}
+              Cause: No response — TLS handshake or connection failed.
+              {% else %}
+              Cause: Unexpected response from API. Check Anvil status.
+              {% endif %}
+          when: _hs_api_http_code | int != 200
+
+        - name: Hammerspace API preflight OK
+          ansible.builtin.debug:
+            msg: >-
+              Hammerspace API reachable and credentials valid at
+              https://{{ hammerspace_api_host }}:{{ hammerspace_api_port | default(8443) }}
+              (user: {{ hammerspace_api_user }})
+
+    # Check if node is already registered in Hammerspace (to skip NFS restart)
+    - name: Check if node already exists in Hammerspace
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -o /dev/stdout -w "\n%{http_code}" --max-time 30
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "https://{{ hammerspace_api_host }}:{{ hammerspace_api_port | default(8443) }}/mgmt/v1.2/rest/nodes/{{ hammerspace_node_name | default(inventory_hostname) | urlencode }}"
+      register: hs_node_precheck_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when:
+        - hammerspace_api_host is defined
+        - hammerspace_api_user is defined
+        - hammerspace_api_password is defined
+
+    - name: Set node_already_in_hammerspace fact
+      ansible.builtin.set_fact:
+        node_already_in_hammerspace: "{{ ((hs_node_precheck_raw.stdout_lines | default(['404']))[-1] | int) == 200 }}"
+      when: hammerspace_api_host is defined
+
+    - name: Display node registration status
+      ansible.builtin.debug:
+        msg: >-
+          Node '{{ hammerspace_node_name | default(inventory_hostname) }}'
+          {{ 'is already registered in Hammerspace - will skip NFS service restart'
+             if node_already_in_hammerspace | default(false)
+             else 'is not yet registered in Hammerspace' }}
+      when: hammerspace_api_host is defined
+
+    # ------------------------------------------------------------------ #
+    # Existing-mount mode: use filesystems that are already built and mounted
+    # instead of discovering disks and building RAID. Runs as a pre_task so
+    # mount_points / nfs_exports are populated before any role starts, and so
+    # the discovery + filesystem roles below can gate themselves off it.
+    # ------------------------------------------------------------------ #
+    - name: Use existing mounted filesystems instead of building RAID
+      ansible.builtin.include_role:
+        name: nvme_discovery
+        tasks_from: existing_mounts
+      when: existing_mount_paths | default([]) | length > 0
+      tags: [discovery, storage, existing-mounts]
+
+  roles:
+    # Dynamic storage discovery - groups drives by NUMA and excludes boot device
+    # Supports NVMe, HDD, SSD, and mixed environments (set storage_type in vars)
+    - role: nvme_discovery
+      when:
+        - use_dynamic_discovery | default(true)
+        - existing_mount_paths | default([]) | length == 0
+      tags: [discovery, nvme, storage]
+
+    - role: precheck
+      tags: [precheck, validation]
+
+    - role: raid_setup
+      when:
+        - use_raid | default(true)
+        # Existing-mount mode brings its own filesystems — nothing to assemble.
+        - existing_mount_paths | default([]) | length == 0
+      tags: [raid, storage]
+
+    # Skipped entirely in existing-mount mode: this role runs mkfs against
+    # every mount_points entry and manages /etc/fstab. In that mode the
+    # filesystem already exists and is someone else's to manage — the export
+    # directory was created by existing_mounts.yml and nothing else is needed.
+    - role: filesystem_setup
+      when: existing_mount_paths | default([]) | length == 0
+      tags: [filesystem, storage]
+
+    - role: nfs_setup
+      tags: [nfs]
+
+    # Hammerspace performance BKMs: sunrpc slot tables, NFSD direct I/O,
+    # block-device read-ahead, NIC IRQ pinning, TCP sysctl.
+    # Toggle off with perf_tuning_enabled: false in vars/main.yml.
+    - role: perf_tuning
+      when: perf_tuning_enabled | default(true)
+      tags: [perf, tuning]
+
+    - role: firewall_setup
+      when: configure_firewall | default(true)
+      tags: [firewall]
+
+    # Hammerspace cluster integration via API
+    # Runs inline (parallel across hosts) when hammerspace_serial is 0 (default)
+    # When hammerspace_serial > 0, integration runs in the serialized play instead
+    - role: hammerspace_integration
+      when:
+        - hammerspace_api_host is defined
+        - (hammerspace_serial | default(0) | int) == 0
+      tags: [hammerspace, integration]
+
+  post_tasks:
+    - name: Run systemctl daemon-reload after fstab changes
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    # =========================================================================
+    # Generate Instance Report (display_name, fault_domain, AZ)
+    # =========================================================================
+    # AZ derivation is centralized in vars/main.yml (_cloud_az_detected) so
+    # OCI / Azure stay in sync with az_map.yml and add_volume.yml.
+    - name: Convert cloud placement metadata to AZ for report
+      ansible.builtin.set_fact:
+        converted_az: "{{ (_cloud_az_detected | default('', true) | trim) | default('N/A', true) }}"
+        # Self-describing: the CSV column is named fault_domain, but on Azure
+        # the value may be a ZONE. Tag it so the report is not ambiguous.
+        report_fault_domain: >-
+          {%- if oci_fault_domain is defined and oci_fault_domain -%}
+            {{ oci_fault_domain }}
+          {%- elif azure_zone is defined and azure_zone is not none and (azure_zone | string | trim | length) > 0 -%}
+            azure-zone-{{ azure_zone | string | trim }}
+          {%- elif azure_fault_domain is defined and azure_fault_domain is not none and (azure_fault_domain | string | trim | length) > 0 -%}
+            azure-fd-{{ azure_fault_domain | string | trim }}
+          {%- else -%}
+            N/A
+          {%- endif -%}
+
+    - name: Set report file path
+      ansible.builtin.set_fact:
+        instance_report_file: "{{ repo_root }}/instance_report.csv"
+      run_once: true
+
+    - name: Create instance report CSV with header
+      ansible.builtin.copy:
+        dest: "{{ instance_report_file }}"
+        content: "display_name,fault_domain,az\n"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      when: not ansible_check_mode
+
+    - name: Append instance data to report
+      ansible.builtin.lineinfile:
+        path: "{{ instance_report_file }}"
+        regexp: "^{{ inventory_hostname }},"
+        line: "{{ inventory_hostname }},{{ report_fault_domain | trim }},{{ converted_az }}"
+        mode: '0644'
+      delegate_to: localhost
+      when: not ansible_check_mode
+
+    - name: Display instance report location
+      ansible.builtin.debug:
+        msg: |
+          Instance report generated: {{ instance_report_file }}
+          Instances: {{ ansible_play_hosts | length }}
+      run_once: true
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          HAMMERSPACE TIER 0 / LSS SETUP COMPLETE
+          ============================================
+          - RAID arrays configured: {{ raid_arrays | default([]) | length }}
+          - Mount points created: {{ mount_points | default([]) | length }}
+          - NFS exports configured: {{ nfs_exports | default([]) | length }}
+          {% if hammerspace_api_host is defined %}
+          - Hammerspace integration: ENABLED
+            - Storage system registered: {{ hammerspace_node_name | default(inventory_hostname) }}
+            - Volumes added: {{ mount_points | default([]) | length }}
+          {% else %}
+          - Hammerspace integration: SKIPPED (set hammerspace_api_host to enable)
+          {% endif %}
+
+          VERIFY:
+          1. NFS exports from another node:
+             showmount -e {{ ansible_default_ipv4.address }}
+
+          {% if hammerspace_api_host is defined %}
+          2. Hammerspace CLI:
+             anvil> node-list
+             anvil> volume-list
+          {% else %}
+          2. Manual Hammerspace integration (if not using API):
+             anvil> node-add --type OTHER --name {{ inventory_hostname }} --ip {{ ansible_default_ipv4.address }}
+             {% for mp in mount_points | default([]) %}
+             anvil> volume-add --name {{ inventory_hostname }}::{{ mp.path }} --node-name {{ inventory_hostname }} --logical-volume-name {{ mp.path }}
+             {% endfor %}
+          {% endif %}
+          ============================================

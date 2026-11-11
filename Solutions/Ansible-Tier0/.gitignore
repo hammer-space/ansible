@@ -1,0 +1,40 @@
+# DI payload directory (RPMs, add_node.py)
+payload/
+*.rpm
+*.deb
+*.tar.gz
+*.tar
+
+# Ansible vault password file
+.vault_pass
+.vault_pass.*
+
+# Ansible retry files
+*.retry
+
+# Reports and generated files
+instance_report.csv
+preflight_report.txt
+.new_instances_limit
+gpu_fabric_data.txt
+tier0_instances_limit
+
+# Ansible logs
+ansible.log
+
+# DI container build artifacts (on controller if local build)
+di-container-build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+.claude
+
+# Local-only project instructions (not for GitHub)
+CLAUDE.md
+SKILLS.md

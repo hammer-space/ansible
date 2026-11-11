@@ -1,0 +1,224 @@
+---
+# Regression test for the --check failure in
+# roles/nvme_discovery/tasks/existing_mounts.yml:
+#
+#   TASK [nvme_discovery : Fail if an export directory is not writable]
+#   fatal: [172.20.16.5]: FAILED!
+#     The conditional check 'item.rc != 0' failed. The error was: error while
+#     evaluating conditional (item.rc != 0): 'dict object' has no attribute 'rc'
+#
+# THE SHAPE
+# ---------
+# A looped command/script probe guarded with `when: not ansible_check_mode`,
+# whose registered result is then looped over by a fail/debug task.
+#
+# The trap: a LOOPED task whose `when` is false does NOT leave the registered
+# var without a `results` key. It registers a full `results` list, one entry
+# per item, each a skip dict:
+#
+#   {"skipped": true, "skip_reason": "Conditional result was False",
+#    "item": {...}, "changed": false}
+#
+# So `_var.results | default([])` — the guard that was in place — never fires.
+# The loop runs, and the per-item attribute is what is missing.
+#
+# This is the loop-shaped form of the 2026-07-21 registered-var rule. That rule
+# says to guard the ATTRIBUTE on a var registered inside a `when`-guarded
+# block; here the var itself is fine and it is each ITEM that must be guarded.
+#
+# TEST 1 asserts the actual Ansible behaviour (so the test fails if a future
+# Ansible changes the shape out from under the fix). TEST 2 reproduces the
+# consumer pattern and would have raised the field error before the fix.
+# TEST 3 audits the real file.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_check_mode_loop_skip.yml \
+#       -i localhost, -c local --check
+#   ansible-playbook tests/integration/test_check_mode_loop_skip.yml \
+#       -i localhost, -c local
+
+- name: Check-mode loop-skip registered-result tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _mounts:
+      - path: /nvme
+        export_path: /nvme/tier0
+      - path: /nvme2
+        export_path: /nvme2/tier0
+
+  tasks:
+    # ========================================================================
+    # TEST 1: a fully-skipped LOOP still registers `results`.
+    # ========================================================================
+    - name: 'TEST 1: a skipped looped task still registers a results list'
+      block:
+        - name: Probe that is skipped for every item
+          ansible.builtin.command: "true"
+          register: _probe
+          changed_when: false
+          failed_when: false
+          when: false
+          loop: "{{ _mounts }}"
+          loop_control:
+            label: "{{ item.path }}"
+
+        - name: 'TEST 1 ASSERT: results exists, one entry per item, no rc'
+          ansible.builtin.assert:
+            that:
+              # `| default([])` is NOT enough — results is present.
+              - _probe.results is defined
+              - _probe.results | length == 2
+              # ...and every entry is a skip dict with no `rc`.
+              - _probe.results | selectattr('skipped', 'defined') | list | length == 2
+              - _probe.results | selectattr('rc', 'defined') | list | length == 0
+            fail_msg: |
+              Ansible no longer registers a per-item results list for a fully
+              skipped loop. The guard in existing_mounts.yml assumes it does.
+              Got: {{ _probe }}
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: a fully-skipped loop registers results with no per-item rc'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2: the consumer pattern must survive that shape. Unguarded, this
+    # block raises the exact field error.
+    # ========================================================================
+    - name: 'TEST 2: the guarded consumer tolerates skipped items'
+      block:
+        - name: Probe skipped exactly as --check skips it
+          ansible.builtin.command: "test -w {{ item.export_path | quote }}"
+          register: _writable
+          changed_when: false
+          failed_when: false
+          when: false
+          loop: "{{ _mounts }}"
+          loop_control:
+            label: "{{ item.path }}"
+
+        - name: Consume the results the way existing_mounts.yml does
+          ansible.builtin.set_fact:
+            _bad: "{{ _bad | default([]) + [item.item.export_path] }}"
+          loop: "{{ _writable.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item.path }}"
+          when:
+            - item.rc is defined
+            - item.rc != 0
+
+        - name: 'TEST 2 ASSERT: nothing was flagged and nothing raised'
+          ansible.builtin.assert:
+            that:
+              - _bad is not defined
+            fail_msg: |
+              A skipped probe produced failures. Under --check the writability
+              check must be inert, not treated as a not-writable directory.
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: guarded consumer loops over skip dicts without raising'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3 (audit): every consumer of a check-mode-skipped looped probe in
+    # existing_mounts.yml must guard the per-item attribute.
+    # ========================================================================
+    - name: 'TEST 3: audit existing_mounts.yml per-item guards'
+      block:
+        - name: Read existing_mounts.yml
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../roles/nvme_discovery/tasks/existing_mounts.yml"
+          register: _em_src
+
+        - name: Decode
+          ansible.builtin.set_fact:
+            _em_raw: "{{ _em_src.content | b64decode }}"
+
+        - name: 'TEST 3 ASSERT: no bare item.rc conditional remains'
+          ansible.builtin.assert:
+            that:
+              # The bare form is what broke. Neither site may use it.
+              - "(_em_raw | regex_findall('when: item\\.rc != 0')) | length == 0"
+              # The writability gate fails OPEN: its probe is skipped under
+              # --check by design, so a missing rc means "not run".
+              - "'item.rc is defined' in _em_raw"
+              # The mountpoint gate fails CLOSED: it is a safety check, so a
+              # missing rc must read as "not verified" and still fail.
+              - "'item.rc | default(1) != 0' in _em_raw"
+            fail_msg: |
+              REGRESSION: existing_mounts.yml carries a bare
+              `when: item.rc != 0` over a registered loop result, or lost one
+              of the two guard idioms.
+
+              Under --check the writability probe is skipped per item and each
+              result has no `rc`, so a bare conditional dies with "'dict
+              object' has no attribute 'rc'" instead of reporting what the run
+              would do.
+
+              The two gates take OPPOSITE defaults on a missing rc:
+                - writability  -> `item.rc is defined`     (fails open;
+                                  skipped under --check by design)
+                - mountpoint   -> `item.rc | default(1)`   (fails closed; it
+                                  is a safety check and must not be bypassed)
+
+        - name: 'TEST 3 ASSERT: the writability probe is still check-mode gated'
+          ansible.builtin.assert:
+            that:
+              # It must stay skipped under --check: it probes a directory the
+              # simulated mkdir did not actually create.
+              - "'when: not ansible_check_mode' in _em_raw"
+            fail_msg: |
+              The writability probe lost its `when: not ansible_check_mode`
+              guard. It must not run under --check — the mkdir it depends on is
+              only simulated, so `test -w` would fail on a directory the real
+              run would have created.
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: audit — existing_mounts.yml guards item.rc and keeps the probe check-mode gated'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          CHECK-MODE LOOP-SKIP TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

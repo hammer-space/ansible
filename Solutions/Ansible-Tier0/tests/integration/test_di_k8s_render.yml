@@ -1,0 +1,228 @@
+---
+# Render the Kubernetes manifests with mock vars, parse, and assert key
+# fields. No kubeconfig / no cluster needed.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_di_k8s_render.yml -i localhost, -c local
+
+- name: K8s manifest render test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _repo: "{{ playbook_dir }}/../.."
+    _render_dir: "/tmp/di-k8s-render-test"
+    # Mock vars sufficient to render every template.
+    di_k8s_namespace: "hammerspace-di-test"
+    di_k8s_psa_level: "privileged"
+    di_k8s_node_selector_label: "hammerspace.io/di"
+    di_k8s_node_selector_value: "true"
+    di_k8s_tolerations:
+      - {key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule"}
+    di_k8s_priority_class: "system-node-critical"
+    di_k8s_status_label: "hammerspace.io/di-status"
+    di_k8s_registry: "us-ashburn-1.ocir.io"
+    di_k8s_registry_namespace: "axyz123"
+    di_k8s_image_repository: "hammerspace-di"
+    di_k8s_image_tag: "5.1.41-452"
+    di_k8s_image_pull_secret: "hammerspace-di-pull"
+    di_k8s_registry_username: "axyz123/oracleidentitycloudservice/user@example.com"
+    di_k8s_registry_password: "fake-token-do-not-commit"
+    di_k8s_registry_email: "noreply@hammerspace.com"
+    di_k8s_api_credentials_secret: "hammerspace-api-credentials"
+    di_container_memory: "4Gi"
+    di_container_cpus: ""
+    hammerspace_api_user: "admin"
+    hammerspace_api_password: "test-password-do-not-commit"
+    hammerspace_api_host: "10.0.0.1"
+    hammerspace_cluster_mgmt_ip: "10.0.0.1"
+    hammerspace_cluster_hostname: "data-cluster"
+    hammerspace_api_port: 8443
+    di_node_netmask_prefix: 24
+    di_ignore_ip_conflicts: true
+    _di_k8s_image_ref: "us-ashburn-1.ocir.io/axyz123/hammerspace-di:5.1.41-452"
+    _di_k8s_dockerconfigjson_b64: "eyJhdXRocyI6e319"
+
+  tasks:
+    - name: Prep render dir
+      ansible.builtin.file:
+        path: "{{ _render_dir }}"
+        state: directory
+        mode: "0700"
+
+    # ------------------------------------------------------------------
+    # TEST 1: namespace.yaml.j2 — PSA labels present and correct
+    # ------------------------------------------------------------------
+    - name: 'TEST 1: namespace renders with PSA labels'
+      block:
+        - ansible.builtin.template:
+            src: "{{ _repo }}/roles/di/templates/namespace.yaml.j2"
+            dest: "{{ _render_dir }}/ns.yaml"
+            mode: "0644"
+        - ansible.builtin.set_fact:
+            _ns: "{{ lookup('file', _render_dir + '/ns.yaml') | from_yaml }}"
+        - ansible.builtin.assert:
+            that:
+              - _ns.kind == 'Namespace'
+              - _ns.metadata.name == 'hammerspace-di-test'
+              - _ns.metadata.labels['pod-security.kubernetes.io/enforce'] == 'privileged'
+              - _ns.metadata.labels['pod-security.kubernetes.io/audit']   == 'privileged'
+              - _ns.metadata.labels['pod-security.kubernetes.io/warn']    == 'privileged'
+            fail_msg: "namespace.yaml.j2 missing required PSA labels"
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: namespace + PSA labels'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ------------------------------------------------------------------
+    # TEST 2: image_pull_secret.yaml.j2 — type, namespace, base64 payload
+    # ------------------------------------------------------------------
+    - name: 'TEST 2: image pull secret renders'
+      block:
+        - ansible.builtin.template:
+            src: "{{ _repo }}/roles/di/templates/image_pull_secret.yaml.j2"
+            dest: "{{ _render_dir }}/pull.yaml"
+            mode: "0600"
+        - ansible.builtin.set_fact:
+            _pull: "{{ lookup('file', _render_dir + '/pull.yaml') | from_yaml }}"
+        - ansible.builtin.assert:
+            that:
+              - _pull.kind == 'Secret'
+              - _pull.type == 'kubernetes.io/dockerconfigjson'
+              - _pull.metadata.namespace == 'hammerspace-di-test'
+              - _pull.data['.dockerconfigjson'] | length > 0
+            fail_msg: "image_pull_secret.yaml.j2 missing required fields"
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: pull secret structure'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ------------------------------------------------------------------
+    # TEST 3: api_credentials_secret.yaml.j2 — never plaintext-leaks
+    # the password into the rendered file's keys.
+    # ------------------------------------------------------------------
+    - name: 'TEST 3: API credentials secret renders with expected envFrom keys'
+      block:
+        - ansible.builtin.template:
+            src: "{{ _repo }}/roles/di/templates/api_credentials_secret.yaml.j2"
+            dest: "{{ _render_dir }}/creds.yaml"
+            mode: "0600"
+        - ansible.builtin.set_fact:
+            _creds: "{{ lookup('file', _render_dir + '/creds.yaml') | from_yaml }}"
+        - ansible.builtin.assert:
+            that:
+              - _creds.kind == 'Secret'
+              - _creds.type == 'Opaque'
+              - "'HAMMERSPACE_API_USER' in _creds.stringData"
+              - "'HAMMERSPACE_API_PASSWORD' in _creds.stringData"
+              - "'HAMMERSPACE_API_HOST' in _creds.stringData"
+              - _creds.stringData.HAMMERSPACE_API_HOST == '10.0.0.1'
+              - _creds.stringData.DI_IGNORE_IP_CONFLICTS == 'true'
+            fail_msg: "api_credentials_secret.yaml.j2 missing required keys"
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: API credentials secret keys'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ------------------------------------------------------------------
+    # TEST 4: daemonset.yaml.j2 — every field the customer ask requires
+    # ------------------------------------------------------------------
+    - name: 'TEST 4: DaemonSet has hostNetwork, nodeSelector, tolerations, privileged, caps, mounts, ports'
+      block:
+        - ansible.builtin.template:
+            src: "{{ _repo }}/roles/di/templates/daemonset.yaml.j2"
+            dest: "{{ _render_dir }}/ds.yaml"
+            mode: "0644"
+        - ansible.builtin.set_fact:
+            _ds: "{{ lookup('file', _render_dir + '/ds.yaml') | from_yaml }}"
+            _spec: "{{ (lookup('file', _render_dir + '/ds.yaml') | from_yaml).spec.template.spec }}"
+        - ansible.builtin.assert:
+            that:
+              - _ds.kind == 'DaemonSet'
+              - _ds.metadata.namespace == 'hammerspace-di-test'
+              # hostNetwork + DNS policy
+              - _spec.hostNetwork is true
+              - _spec.dnsPolicy == 'ClusterFirstWithHostNet'
+              # Selector
+              - _spec.nodeSelector['hammerspace.io/di'] == 'true'
+              # Tolerations include the nvidia.com/gpu one
+              - _spec.tolerations | length >= 1
+              - "_spec.tolerations | selectattr('key', 'equalto', 'nvidia.com/gpu') | list | length == 1"
+              # Priority class
+              - _spec.priorityClassName == 'system-node-critical'
+              # hostAliases for the Anvil
+              - _spec.hostAliases[0].ip == '10.0.0.1'
+              - "'data-cluster' in _spec.hostAliases[0].hostnames"
+              # Init container exists with right name
+              - _spec.initContainers | length == 1
+              - _spec.initContainers[0].name == 'register-node'
+              - _spec.initContainers[0].securityContext.privileged is true
+              # Main container
+              - _spec.containers[0].name == 'hammerspace-di'
+              - _spec.containers[0].command == ['/usr/sbin/init']
+              - _spec.containers[0].securityContext.privileged is true
+              - "'SYS_ADMIN' in _spec.containers[0].securityContext.capabilities.add"
+              - "'NET_ADMIN' in _spec.containers[0].securityContext.capabilities.add"
+              - "'SYS_PTRACE' in _spec.containers[0].securityContext.capabilities.add"
+              # Ports
+              - _spec.containers[0].ports | length == 2
+              - "_spec.containers[0].ports | selectattr('hostPort', 'equalto', 9095) | list | length == 1"
+              - "_spec.containers[0].ports | selectattr('hostPort', 'equalto', 9096) | list | length == 1"
+              # Volumes: cgroup hostPath, modules hostPath, run/tmp emptyDir Memory, pd-state emptyDir
+              - "_spec.volumes | selectattr('name', 'equalto', 'cgroup')  | map(attribute='hostPath') | list | length == 1"
+              - "_spec.volumes | selectattr('name', 'equalto', 'modules') | map(attribute='hostPath') | list | length == 1"
+              - "_spec.volumes | selectattr('name', 'equalto', 'run')     | first | community.general.json_query('emptyDir.medium') == 'Memory'"
+              - "_spec.volumes | selectattr('name', 'equalto', 'tmp')     | first | community.general.json_query('emptyDir.medium') == 'Memory'"
+            fail_msg: "DaemonSet failed structural assertions"
+        # Plaintext-leak guard: the rendered DaemonSet must NOT contain the
+        # API password as a literal string. It is consumed via envFrom secretRef.
+        - ansible.builtin.assert:
+            that:
+              - "'test-password-do-not-commit' not in (lookup('file', _render_dir + '/ds.yaml'))"
+            fail_msg: "DaemonSet leaked the API password as plaintext"
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: DaemonSet structural + no-plaintext-secret'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ------------------------------------------------------------------
+    # Report
+    # ------------------------------------------------------------------
+    - name: Clean render dir
+      ansible.builtin.file:
+        path: "{{ _render_dir }}"
+        state: absent
+
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          DI K8S RENDER TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

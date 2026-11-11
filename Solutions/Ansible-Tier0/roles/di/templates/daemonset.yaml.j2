@@ -1,0 +1,156 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hammerspace-di
+  namespace: {{ di_k8s_namespace }}
+  labels:
+    app.kubernetes.io/name: hammerspace-di
+    app.kubernetes.io/component: data-mover
+    app.kubernetes.io/managed-by: ansible-tier0
+    app.kubernetes.io/version: "{{ di_k8s_image_tag }}"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hammerspace-di
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hammerspace-di
+        app.kubernetes.io/component: data-mover
+        app.kubernetes.io/version: "{{ di_k8s_image_tag }}"
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Always
+{% if di_k8s_priority_class | length > 0 %}
+      priorityClassName: {{ di_k8s_priority_class }}
+{% endif %}
+      nodeSelector:
+        {{ di_k8s_node_selector_label }}: "{{ di_k8s_node_selector_value }}"
+{% if di_k8s_tolerations | length > 0 %}
+      tolerations:
+{% for tol in di_k8s_tolerations %}
+        - {{ tol | to_json }}
+{% endfor %}
+{% endif %}
+{% if di_k8s_image_pull_secret | length > 0 %}
+      imagePullSecrets:
+        - name: {{ di_k8s_image_pull_secret }}
+{% endif %}
+      hostAliases:
+        - ip: "{{ hammerspace_cluster_mgmt_ip | default(hammerspace_api_host) }}"
+          hostnames:
+            - "{{ hammerspace_cluster_hostname | default('data-cluster') }}"
+      initContainers:
+        - name: register-node
+          image: {{ _di_k8s_image_ref }}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              # Idempotent: add_node.py exits non-zero with "already exists"
+              # when the node is already registered. We treat that as success.
+              if [ -f /opt/pd/di ]; then
+                echo "DATA_MOVER UUID already present, skipping registration"
+                exit 0
+              fi
+              python3 /usr/local/bin/add_node.py \
+                -i "${NODE_IP}" \
+                -l "${DI_NODE_NETMASK_PREFIX}" \
+                -d \
+                -u "${HAMMERSPACE_API_USER}" \
+                -p "${HAMMERSPACE_API_PASSWORD}" \
+                -n "${NODE_NAME}" \
+              || (echo "$?" | grep -q "0" || \
+                  python3 /usr/local/bin/add_node.py 2>&1 | grep -q "already exists")
+          envFrom:
+            - secretRef:
+                name: {{ di_k8s_api_credentials_secret }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+          volumeMounts:
+            - {name: pd-state, mountPath: /opt/pd}
+      containers:
+        - name: hammerspace-di
+          image: {{ _di_k8s_image_ref }}
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/sbin/init"]
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+          ports:
+            - {containerPort: 9095, hostPort: 9095, protocol: TCP, name: di-9095}
+            - {containerPort: 9096, hostPort: 9096, protocol: TCP, name: di-9096}
+          envFrom:
+            - secretRef:
+                name: {{ di_k8s_api_credentials_secret }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "{{ di_k8s_cpu_request | default('500m') }}"
+              memory: "{{ di_k8s_memory_request | default('1Gi') }}"
+            limits:
+{% if di_container_cpus | default('') | length > 0 %}
+              cpu: "{{ di_container_cpus }}"
+{% endif %}
+              memory: "{{ di_container_memory | default('4Gi') }}"
+          readinessProbe:
+            exec:
+              command: ["systemctl", "is-active", "pd-di"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["systemctl", "is-active", "pd-di"]
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          volumeMounts:
+            - {name: pd-state,   mountPath: /opt/pd}
+            - {name: cgroup,     mountPath: /sys/fs/cgroup}
+            - {name: modules,    mountPath: /lib/modules, readOnly: true}
+            - {name: run,        mountPath: /run}
+            - {name: tmp,        mountPath: /tmp}
+      volumes:
+        - name: pd-state
+          emptyDir: {}
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
+        - name: run
+          emptyDir:
+            medium: Memory
+        - name: tmp
+          emptyDir:
+            medium: Memory

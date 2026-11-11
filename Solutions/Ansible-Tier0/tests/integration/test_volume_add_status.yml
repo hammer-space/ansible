@@ -1,0 +1,371 @@
+---
+# Regression test: adding a storage volume must fail loudly when the API
+# rejects it, and the volume must be proven to exist before any downstream
+# step references it by name.
+#
+# THE FIELD REPORT (2026-11-02)
+# -----------------------------
+# A run on a CycleCloud scheduler failed with
+#
+#   Updating volume group 'vg-tier0' failed with HTTP 404
+#   [{"errorCode":4002,"args":["storage volume","10.1.16.4::/nvme/tier0"],
+#     "message":"ENTITY_NOT_FOUND", ...}]
+#
+# The volume group PUT was correct. It was the first task in the whole run
+# that actually CHECKED whether the volume existed — and it ran run_once, so
+# it failed on whichever host Ansible picked, not on the host that built the
+# name.
+#
+# add_volume.yml registered the POST result but read `.status` at exactly one
+# place: to recognise the 400/"already exists" case. Every other rejection
+# (401, 403, 404, 409, 5xx, or curl never running at all — HTTP 0) fell
+# straight through. The completion poll that should have caught it is gated on
+# a Location header, which a rejected POST does not return, so the poll was
+# SKIPPED rather than failed. Both gates passed by being absent, and the task
+# then printed "added successfully".
+#
+# This is the shape of the objective-set silent success (2026-09-18): an async
+# API call has TWO failure points — the request status and the task status —
+# and "no Location, so skip the poll" is how a rejected request becomes a
+# silent success.
+#
+# A second path reaches the same place: the existence pre-check set
+# volume_already_exists from HTTP status alone, so a 200 with a null body
+# skipped the add entirely.
+#
+# RULES PINNED HERE
+#   1. A non-2xx POST status fails the play (except the known already-exists).
+#   2. A 2xx with no Location fails; it must never skip the poll silently.
+#   3. volume_already_exists requires a resolvable object, not just HTTP 200.
+#   4. The volume is re-read and must be present before the role moves on —
+#      the name in _hs_run_volume_names is what the group join PUTs.
+#   5. Volumes are found by LISTING /storage-volumes, never by
+#      GET /storage-volumes/<name>.
+#
+# RULE 5 — THE FOLLOW-UP FIELD REPORT (2026-11-03)
+# ------------------------------------------------
+# Once an Azure NSG rule let the Anvil reach the node, the add succeeded and
+# the verification from rule 4 failed with HTTP 404 on
+#
+#   GET .../storage-volumes/10.1.16.4%3A%3A/nvme/tier0
+#
+# — on a volume the Anvil UI showed as present. A volume name always contains
+# '/', and Jinja's `urlencode` encodes ':' but NOT '/', so the API read
+# /nvme/tier0 as extra path segments. Every per-name lookup in this file had
+# always 404'd: the existence pre-check never once found an existing volume
+# (re-runs survived on the 400 "already exists" reclassification), and the
+# verification added on 2026-11-02 inherited the same URL. The repo's Python
+# scripts use quote(name, safe=''). Listing removes the encoding question,
+# including whether a given Anvil accepts %2F in a path at all.
+#
+# TEST 8 pins the Jinja behaviour against the exact URL from the field
+# report; TEST 9 pins the list-and-select logic, including the
+# 10.1.16.4 / 10.1.16.40 prefix trap in the per-node listing.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_volume_add_status.yml -i localhost, -c local
+
+- name: Volume add status gating regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _av: "{{ playbook_dir }}/../../roles/hammerspace_integration/tasks/add_volume.yml"
+    _src: "{{ lookup('file', _av) }}"
+    # Strip comment lines: this file explains the bug in prose, and an audit
+    # that matched the explanation would pass on the broken code.
+    _code: >-
+      {{ _src.split('\n') | reject('match', '\s*#') | join('\n') }}
+
+  tasks:
+    # ---------------------------------------------------------------- TEST 1
+    # Behavioural: the two gates, driven by the same expressions the task
+    # file uses, over the statuses a real Anvil returns.
+    - name: 'TEST 1: the POST status gate fires on every rejection'
+      vars:
+        _reject: >-
+          {{ (not item.exists)
+             and ((item.status | int) not in [200, 201, 202, 204]) }}
+      ansible.builtin.assert:
+        that:
+          - (_reject | bool) == (item.expect_reject | bool)
+        fail_msg: >-
+          {{ item.name }}: status {{ item.status }} exists={{ item.exists }}
+          produced reject={{ _reject }}, expected {{ item.expect_reject }}
+        quiet: true
+      loop:
+        - name: "403 forbidden"            # auth/RBAC rejection
+          status: 403
+          exists: false
+          expect_reject: true
+        - name: "404 not found"
+          status: 404
+          exists: false
+          expect_reject: true
+        - name: "409 conflict"
+          status: 409
+          exists: false
+          expect_reject: true
+        - name: "500 server error"
+          status: 500
+          exists: false
+          expect_reject: true
+        - name: "HTTP 0 — curl never ran"  # the (g) signature
+          status: 0
+          exists: false
+          expect_reject: true
+        - name: "202 accepted"
+          status: 202
+          exists: false
+          expect_reject: false
+        - name: "201 created"
+          status: 201
+          exists: false
+          expect_reject: false
+        - name: "400 already exists"       # reclassified before the gate
+          status: 400
+          exists: true
+          expect_reject: false
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ---------------------------------------------------------------- TEST 2
+    - name: 'TEST 2: a 2xx with no Location fails instead of skipping the poll'
+      vars:
+        _noloc: >-
+          {{ (not item.exists)
+             and ((item.status | int) in [200, 201, 202, 204])
+             and ((item.location | length) == 0) }}
+      ansible.builtin.assert:
+        that:
+          - (_noloc | bool) == (item.expect_noloc | bool)
+        fail_msg: >-
+          {{ item.name }}: produced noloc={{ _noloc }},
+          expected {{ item.expect_noloc }}
+        quiet: true
+      loop:
+        - name: "202 with a task Location"
+          status: 202
+          location: "/mgmt/v1.2/rest/tasks/abc"
+          exists: false
+          expect_noloc: false
+        - name: "200 with NO Location"
+          status: 200
+          location: ""
+          exists: false
+          expect_noloc: true
+        - name: "403 — handled by TEST 1, not here"
+          status: 403
+          location: ""
+          exists: false
+          expect_noloc: false
+        - name: "already exists — nothing was posted"
+          status: 400
+          location: ""
+          exists: true
+          expect_noloc: false
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ---------------------------------------------------------------- TEST 3
+    # HTTP 200 is not proof of existence. This is the second path to the
+    # field failure: a 200 with a null body skipped the add.
+    - name: 'TEST 3: volume_already_exists needs an object, not just a 200'
+      vars:
+        _exists: >-
+          {{ ((item.status | int) == 200) and ((item.uuid | length) > 0) }}
+      ansible.builtin.assert:
+        that:
+          - (_exists | bool) == (item.expect | bool)
+        fail_msg: "{{ item.name }}: got {{ _exists }}, expected {{ item.expect }}"
+        quiet: true
+      loop:
+        - name: "200 with a uoid.uuid — a real volume"
+          status: 200
+          uuid: "c2ff96dd-74aa-4a42-8fe9-9a69525d3eb3"
+          expect: true
+        - name: "200 with a null/empty body — NOT a volume"
+          status: 200
+          uuid: ""
+          expect: false
+        - name: "404 — absent"
+          status: 404
+          uuid: ""
+          expect: false
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ---------------------------------------------------------------- TEST 4
+    # Source audit. The count guards exist so the audit cannot pass by
+    # matching nothing if the task names are reworded.
+    - name: 'TEST 4: add_volume.yml carries both gates and the verification'
+      ansible.builtin.assert:
+        that:
+          # Gate 1 — the POST status.
+          - "'not in [200, 201, 202, 204]' in _code"
+          # Gate 2 — the missing Location, as a failure not a skip.
+          - "_code is search('no task Location')"
+          # Gate 3 — existence requires a uuid.
+          - "'_hs_vol_check_uuid' in _code"
+          # Gate 4 — post-add verification by name.
+          - "'_hs_vol_verify' in _code"
+          - "_code is search('is not listed after the add')"
+          # Three fail tasks minimum: rejected, no-Location, does-not-resolve.
+          - (_code | regex_findall('ansible\\.builtin\\.fail') | length) >= 3
+        fail_msg: "add_volume.yml is missing a gate — see the header of this file"
+        quiet: true
+
+    # ---------------------------------------------------------------- TEST 5
+    # The verification is a read-only command whose output feeds a safety
+    # gate, so it must carry check_mode: false — otherwise --check skips it,
+    # registers stdout: '', and the gate reads a 0. It must also carry no_log,
+    # because its command line holds the credential.
+    - name: 'TEST 5: the verification GET is check-mode safe and no_log'
+      vars:
+        _verify_block: >-
+          {{ (_src.split('- name: "Verify volume')[1]).split('\n- name:')[0] }}
+      ansible.builtin.assert:
+        that:
+          - "'check_mode: false' in _verify_block"
+          - "'no_log: true' in _verify_block"
+          - "'when: not ansible_check_mode' in _verify_block"
+        fail_msg: >-
+          The verification GET must be check_mode: false (or --check registers
+          an empty stdout the gate reads as a 0), no_log (its command line
+          holds the password), and skipped under --check (nothing was created,
+          so a miss proves nothing).
+        quiet: true
+
+    # ---------------------------------------------------------------- TEST 6
+    # The failure messages print the API response body, and the Anvil echoes
+    # the Authorization header into it. Those prints must be redacted with
+    # the unanchored pattern — see test_api_body_redaction.yml.
+    - name: 'TEST 6: body prints in add_volume.yml are redacted, unanchored'
+      vars:
+        _body_prints: >-
+          {{ _code | regex_findall('empty response body') | length }}
+        _unanchored: >-
+          {{ _code | regex_findall('Basic <redacted>') | length }}
+        # The pattern lives here, as a YAML string, NOT inline in a Jinja
+        # literal. Inline it would pass through Python's string-literal
+        # escaping as well as YAML's, and the two layers are easy to get
+        # wrong in a way that silently matches nothing — which is how a
+        # banned-pattern audit passes while the pattern is still there.
+        # As written the value is literally: authorization:\\s\*Basic
+        _anchored: 'authorization:\\s\*Basic'
+      ansible.builtin.assert:
+        that:
+          - (_body_prints | int) >= 1
+          - (_unanchored | int) >= (_body_prints | int)
+          - (_code | regex_findall(_anchored) | length) == 0
+        fail_msg: >-
+          add_volume.yml prints {{ _body_prints }} API body/bodies but only
+          {{ _unanchored }} redaction(s), or uses the anchored pattern that
+          misses the Anvil's "authorization":"Basic ..." shape.
+        quiet: true
+
+    # ---------------------------------------------------------------- TEST 7
+    # The gates must come BEFORE the poll. A gate placed after it would fire
+    # only once the poll had already hung for retries x delay on a volume
+    # that was never created.
+    - name: 'TEST 7: the status gate precedes the completion poll'
+      vars:
+        _gate_at: "{{ _code.find('not in [200, 201, 202, 204]') }}"
+        _poll_at: "{{ _code.find('add to complete') }}"
+      ansible.builtin.assert:
+        that:
+          - (_gate_at | int) > 0
+          - (_poll_at | int) > 0
+          - (_gate_at | int) < (_poll_at | int)
+        fail_msg: >-
+          The POST status gate (offset {{ _gate_at }}) must precede the
+          completion poll (offset {{ _poll_at }}), or a rejected add still
+          waits out the full retry budget first.
+        quiet: true
+
+    # ---------------------------------------------------------------- TEST 8
+    # Real Jinja behaviour, checked against the URL the field run produced —
+    # not against my expectation of what urlencode does.
+    - name: 'TEST 8: urlencode leaves "/" in a volume name, so per-name URLs cannot work'
+      ansible.builtin.assert:
+        that:
+          - ('10.1.16.4::/nvme/tier0' | urlencode) == '10.1.16.4%3A%3A/nvme/tier0'
+          - "'/' in ('10.1.16.4::/nvme/tier0' | urlencode)"
+          # \{\{ so the needle is never itself templated.
+          - (_code | regex_findall('storage-volumes/\{\{') | length) == 0
+          - (_code | regex_findall('/storage-volumes"') | length) >= 2
+          # TEST 9 reproduces the selection logic, so it cannot see the file
+          # drift. These tie the file to what TEST 9 exercises: exact-name
+          # selection at both lookups, and the '::' anchor that keeps a
+          # 10.1.16.40 volume out of 10.1.16.4's listing.
+          - (_code | regex_findall("selectattr\\('name', 'equalto', volume_name\\)") | length) >= 2
+          - "\"(node_name | regex_escape) ~ '::'\" in _code"
+        fail_msg: >-
+          add_volume.yml addresses a storage volume by name in the URL path.
+          Volume names contain '/', which urlencode does not encode — list
+          /storage-volumes and select by name instead.
+        quiet: true
+
+    # ---------------------------------------------------------------- TEST 9
+    # The selection logic, verbatim from add_volume.yml, over the bodies the
+    # list call can return.
+    - name: 'TEST 9: list-and-select finds the volume, and only on its own node'
+      vars:
+        volume_name: "10.1.16.4::/nvme/tier0"
+        node_name: "10.1.16.4"
+        _is_list: >-
+          {{ item.body is sequence and item.body is not string
+             and item.body is not mapping }}
+        _match: >-
+          {{ ((item.body | selectattr('name', 'defined')
+                         | selectattr('name', 'equalto', volume_name) | list
+              | first) | default({}, true)) if _is_list else {} }}
+        _uuid: >-
+          {{ ((_match).uoid.uuid | default('', true))
+             if (_match is mapping) else '' }}
+        _on_node: >-
+          {{ (item.body | selectattr('name', 'defined') | map(attribute='name')
+              | select('search', '(^|:)' ~ (node_name | regex_escape) ~ '::')
+              | list) if _is_list else [] }}
+      ansible.builtin.assert:
+        that:
+          - _uuid == item.expect_uuid
+          - (_on_node | sort) == (item.expect_on_node | sort)
+        fail_msg: >-
+          {{ item.name }}: uuid={{ _uuid }} on_node={{ _on_node }},
+          expected {{ item.expect_uuid }} / {{ item.expect_on_node }}
+        quiet: true
+      loop:
+        - name: "present among others"
+          body:
+            - {name: "10.1.16.5::/nvme/tier0", uoid: {uuid: "u-5"}}
+            - {name: "10.1.16.4::/nvme/tier0", uoid: {uuid: "u-4"}}
+          expect_uuid: "u-4"
+          expect_on_node: ["10.1.16.4::/nvme/tier0"]
+        - name: "absent; a 10.1.16.40 volume must NOT count as this node's"
+          body:
+            - {name: "10.1.16.40::/nvme/tier0", uoid: {uuid: "u-40"}}
+            - {name: "AZ1:10.1.16.4::/nvme/other", uoid: {uuid: "u-x"}}
+          expect_uuid: ""
+          expect_on_node: ["AZ1:10.1.16.4::/nvme/other"]
+        - name: "an entry with no name is skipped, not fatal"
+          body:
+            - {_type: "STORAGE_VOLUME"}
+            - {name: "10.1.16.4::/nvme/tier0", uoid: {uuid: "u-4"}}
+          expect_uuid: "u-4"
+          expect_on_node: ["10.1.16.4::/nvme/tier0"]
+        - name: "error object instead of a list (e.g. a 401 body)"
+          body: {errorCode: 4001, message: "UNAUTHORIZED"}
+          expect_uuid: ""
+          expect_on_node: []
+        - name: "empty list"
+          body: []
+          expect_uuid: ""
+          expect_on_node: []
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: PASSED
+      ansible.builtin.debug:
+        msg: "test_volume_add_status PASSED (9 tests)"

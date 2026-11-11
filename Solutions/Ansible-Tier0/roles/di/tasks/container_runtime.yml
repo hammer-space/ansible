@@ -1,0 +1,31 @@
+---
+# Install the chosen container runtime on the target host.
+#
+# Validator allows 'containerd' as a passthrough — in k8s mode kubelet owns
+# the runtime, and this task is short-circuited upstream in main.yml. We keep
+# the validator permissive so re-invoking this file with a k8s-mode value
+# doesn't hard-fail.
+
+- name: Validate di_container_runtime
+  ansible.builtin.fail:
+    msg: >-
+      di_container_runtime='{{ di_container_runtime }}' is not supported.
+      Use 'podman', 'docker', or 'containerd' (containerd is k8s-mode only).
+  when: di_container_runtime not in ['podman', 'docker', 'containerd']
+
+- name: Skip host runtime install for containerd (kubelet manages it)
+  ansible.builtin.meta: end_host
+  when: di_container_runtime == 'containerd'
+
+- name: Install runtime-specific tasks
+  ansible.builtin.include_tasks: "container_runtime_{{ di_container_runtime }}.yml"
+
+- name: Verify {{ di_container_runtime }} is usable
+  ansible.builtin.command:
+    cmd: "{{ di_container_runtime }} --version"
+  register: runtime_version
+  changed_when: false
+
+- name: Display container runtime version
+  ansible.builtin.debug:
+    msg: "{{ runtime_version.stdout }}"

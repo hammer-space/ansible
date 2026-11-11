@@ -1,0 +1,311 @@
+---
+# Integration test for the `repo_root` variable.
+#
+# Three production bugs were caused by the same pattern: a role used
+# {{ playbook_dir }}/X expecting playbook_dir to be the repo root, but
+# site.yml imports plays/*.yml via import_playbook, which makes
+# playbook_dir resolve to .../plays/.
+#
+#   2026-05-15  plays/*.yml looked for vars/vault.yml at plays/vars/vault.yml
+#   2026-05-18  roles/di image_build copied Containerfile from plays/container/
+#   ----        roles/hammerspace_integration gpu_fabric_az.yml same pattern
+#
+# Fix: vars/main.yml defines `repo_root: "{{ playbook_dir }}/.."` once;
+# every controller-side file path uses `{{ repo_root }}/...`.
+#
+# This test mocks playbook_dir to plays/ and asserts repo_root resolves
+# correctly, and audits the tree for stray playbook_dir references.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_repo_root.yml -i localhost, -c local
+
+- name: repo_root resolution regression test
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  vars:
+    _test_passes: []
+    _test_failures: []
+
+  tasks:
+    # ========================================================================
+    # TEST 1: vars/main.yml defines repo_root conditionally on where the
+    # playbook lives (read the RAW file text — include_vars would render it).
+    # ========================================================================
+    - name: 'TEST 1: vars/main.yml defines repo_root literal'
+      vars:
+        # Build the expected literal WITHOUT having Ansible template it.
+        # Inner single quotes are doubled — YAML single-quoted style.
+        _expected: '{% raw %}repo_root: "{{ (playbook_dir | dirname) if (playbook_dir | basename) == ''plays'' else playbook_dir }}"{% endraw %}'
+        _old: '{% raw %}repo_root: "{{ playbook_dir }}/.."{% endraw %}'
+      block:
+        - name: Read vars/main.yml as text
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../vars/main.yml"
+          register: _vars_main_raw
+
+        - name: 'TEST 1 ASSERT: repo_root is defined conditionally'
+          ansible.builtin.assert:
+            that:
+              - _expected in (_vars_main_raw.content | b64decode)
+              # The unconditional form was only correct for plays/; a top-level
+              # playbook already has playbook_dir == repo root, so it resolved
+              # one level too high.
+              - _old not in (_vars_main_raw.content | b64decode)
+            fail_msg: |
+              vars/main.yml must contain (literally): {{ _expected }}
+              and must NOT contain the unconditional form: {{ _old }}
+              Actual head of file:
+              {{ (_vars_main_raw.content | b64decode).split('\n')[0:30] | join('\n') }}
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: repo_root defined conditionally in vars/main.yml'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 2: repo_root must resolve to the repo root from BOTH layouts —
+    # plays/ (site.yml's import_playbook) and the repo root itself
+    # (decommission_tier0.yml, preflight_check.yml, reset-tier0-host.yml).
+    #
+    # The second case is the 2026-09-03 incident: the unconditional
+    # `{{ playbook_dir }}/..` produced
+    #   python3: can't open file '.../Ansible-Tier0/../cleanup_instance_nodes.py'
+    # ========================================================================
+    - name: 'TEST 2: repo_root resolves from plays/ AND from the repo root'
+      block:
+        - name: Resolve repo_root the way vars/main.yml does
+          ansible.builtin.set_fact:
+            _resolved: >-
+              {{ (item | dirname) if (item | basename) == 'plays' else item }}
+          loop:
+            - "/home/rocky/ansible/Ansible-Tier0/plays"
+            - "/home/rocky/ansible/Ansible-Tier0"
+          register: _rr
+
+        - name: 'TEST 2 ASSERT: both layouts land on the repo root'
+          ansible.builtin.assert:
+            that:
+              - _paths | unique | length == 1
+              - _paths | first == '/home/rocky/ansible/Ansible-Tier0'
+              # No '/..' left in the path: the old form produced a working but
+              # ugly path from plays/ and a BROKEN one from the repo root.
+              - "'..' not in (_paths | first)"
+            fail_msg: |
+              repo_root does not resolve to the repo root from both layouts.
+              Got: {{ _paths }}
+              A top-level playbook has playbook_dir == the repo root already;
+              appending '/..' walks out of the repo.
+          vars:
+            _paths: "{{ _rr.results | map(attribute='ansible_facts._resolved') | map('trim') | list }}"
+
+        - name: 'TEST 2 ASSERT: a real repo file resolves from both'
+          ansible.builtin.assert:
+            that:
+              - (_paths | first ~ '/vars/vault.yml') == '/home/rocky/ansible/Ansible-Tier0/vars/vault.yml'
+              - (_paths | first ~ '/cleanup_instance_nodes.py') == '/home/rocky/ansible/Ansible-Tier0/cleanup_instance_nodes.py'
+          vars:
+            _paths: "{{ _rr.results | map(attribute='ansible_facts._resolved') | map('trim') | list }}"
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: repo_root resolves to the repo root from plays/ and from the repo root itself'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 5: a shipped repo_root fix does not reach a running scheduler.
+    #
+    # vars/main.yml is BOTH shipped logic and site config — it is where each
+    # site sets hammerspace_api_host — so operators keep a locally modified
+    # copy and `git pull` does not update it. After the conditional repo_root
+    # was fixed upstream, the very next run still failed with
+    #
+    #   python3: can't open file '.../Ansible-Tier0/../cleanup_instance_nodes.py'
+    #
+    # because the scheduler's vars/main.yml still had the old line.
+    #
+    # decommission_tier0.yml therefore PROBES for the script rather than
+    # trusting repo_root, and reports a stale definition instead of failing 28
+    # tasks later with four changes already made.
+    # ========================================================================
+    - name: 'TEST 5: decommission probes for the repo root rather than trusting it'
+      block:
+        - name: Read decommission_tier0.yml
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../decommission_tier0.yml"
+          register: _dc5
+
+        - name: Decode
+          ansible.builtin.set_fact:
+            _dc5_raw: "{{ _dc5.content | b64decode }}"
+
+        # These needles contain Jinja braces, so they are built under
+        # {% raw %} — otherwise Ansible templates them before the assert runs
+        # and compares against the CURRENT repo_root instead of the literal.
+        - name: Build the literals to search for
+          ansible.builtin.set_fact:
+            _re_bad_script: '{% raw %}\{\{ repo_root \}\}/cleanup_instance_nodes\.py{% endraw %}'
+            _re_bad_argv: '{% raw %}(?<!_dc_)repo_root ~ ''/cleanup_instance_nodes\.py''{% endraw %}'
+            _needle_good_vault: '{% raw %}{{ _dc_repo_root }}/vars/vault.yml{% endraw %}'
+
+        - name: 'TEST 5 ASSERT: the script path is probed and never taken on trust'
+          ansible.builtin.assert:
+            that:
+              - "'Locate cleanup_instance_nodes.py' in _dc5_raw"
+              - "'_dc_repo_root' in _dc5_raw"
+              # Every actual invocation must go through the probed value.
+              # Negative lookbehind: `repo_root ~ '/cleanup...` is a
+              # SUBSTRING of the correct `_dc_repo_root ~ '/cleanup...`, so a
+              # plain `not in` reports a false regression on the fixed file.
+              - _dc5_raw is not search(_re_bad_argv)
+              - _dc5_raw is not search(_re_bad_script)
+            fail_msg: |
+              REGRESSION: decommission_tier0.yml invokes
+              cleanup_instance_nodes.py through repo_root directly. A
+              scheduler with a locally modified vars/main.yml then keeps
+              failing after the fix has shipped.
+
+        - name: 'TEST 5 ASSERT: the vault load also uses the probed root'
+          ansible.builtin.assert:
+            that:
+              - _needle_good_vault in _dc5_raw
+            fail_msg: |
+              The vault include still uses repo_root. It carries
+              `failed_when: false`, so a wrong path silently loads NOTHING —
+              which is exactly why the stale definition went unnoticed for
+              months.
+
+        - name: 'TEST 5 ASSERT: a stale repo_root is reported, not silently patched'
+          ansible.builtin.assert:
+            that:
+              - "'stale repo_root' in _dc5_raw"
+              - "'_dc_repo_root != repo_root' in _dc5_raw"
+            fail_msg: |
+              Working around a stale repo_root without saying so hides the
+              problem from every OTHER top-level playbook, which still get the
+              wrong path. The workaround must warn.
+
+        - name: Simulate the probe against a stale repo_root
+          ansible.builtin.stat:
+            path: "{{ item }}/cleanup_instance_nodes.py"
+          register: _probe5
+          loop:
+            - "{{ playbook_dir }}/../.."          # stale: one level too high
+            - "{{ playbook_dir }}/../.."          # (repo root is ../..)
+          check_mode: false
+
+        - name: 'TEST 5 ASSERT: the probe finds the script at the real root'
+          ansible.builtin.assert:
+            that:
+              - _found | length > 0
+            fail_msg: |
+              The probe found no cleanup_instance_nodes.py under the repo
+              root, so this audit cannot be verifying anything.
+          vars:
+            _found: >-
+              {{ _probe5.results | selectattr('stat.exists')
+                 | map(attribute='item') | list }}
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 5: decommission probes for the repo root and warns when vars/main.yml is stale'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 5: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3: audit — no playbook_dir refs sneak into role tasks or plays
+    # (caught the 2026-05-18 Containerfile bug)
+    # ========================================================================
+    - name: 'TEST 3: audit roles/ and plays/ for stray playbook_dir'
+      block:
+        - name: Grep for playbook_dir in roles/ and plays/
+          ansible.builtin.shell:
+            cmd: |
+              grep -rn 'playbook_dir' \
+                "{{ playbook_dir }}/../../plays/" \
+                "{{ playbook_dir }}/../../roles/" 2>/dev/null \
+                | grep -vE '(memory|#|README|MEMORY)' \
+                | grep -v 'repo_root:' \
+                || true
+          register: _stray
+          changed_when: false
+
+        - name: 'TEST 3 ASSERT: no controller-path playbook_dir refs (use repo_root)'
+          ansible.builtin.assert:
+            that:
+              - (_stray.stdout | default('') | length) == 0
+            fail_msg: |
+              Stray `{{ '{{ playbook_dir }}' }}` references found in roles/ or plays/.
+              Replace with `{{ '{{ repo_root }}' }}` (defined in vars/main.yml).
+              Hits:
+              {{ _stray.stdout }}
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: no stray playbook_dir refs in roles/ or plays/'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 4: known repo-root-relative paths exist on disk
+    # (sanity — the files repo_root points at really do live at the repo root)
+    # ========================================================================
+    - name: 'TEST 4: known repo-root files exist'
+      block:
+        - name: Stat the files repo_root references
+          ansible.builtin.stat:
+            path: "{{ playbook_dir }}/../../{{ item }}"
+          register: _path_stat
+          loop:
+            - container/Containerfile
+            - vars/main.yml
+            - payload     # directory
+          loop_control:
+            label: "{{ item }}"
+
+        - name: 'TEST 4 ASSERT: all referenced paths exist'
+          ansible.builtin.assert:
+            that:
+              - item.stat.exists
+            fail_msg: "Missing at repo root: {{ item.item }}"
+          loop: "{{ _path_stat.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: container/, vars/, payload/ all exist at repo root'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          REPO_ROOT REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

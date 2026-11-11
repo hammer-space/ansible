@@ -1,0 +1,5 @@
+---
+# Default RAID setup OS variables
+
+raid_packages:
+  - mdadm

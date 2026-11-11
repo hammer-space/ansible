@@ -1,0 +1,174 @@
+---
+# DI Install role - Download/copy and install pd-di package
+
+
+- name: Create temporary directory for DI install
+  ansible.builtin.file:
+    path: "{{ di_tmp_dir }}"
+    state: directory
+    mode: "0755"
+
+# Download or copy tarball
+- name: Download DI tarball from URL
+  ansible.builtin.get_url:
+    url: "{{ di_tarball_url }}"
+    dest: "{{ di_tmp_dir }}/di-components.tar.gz"
+    mode: "0644"
+  when: di_rpm_source == "url"
+
+- name: Copy DI tarball from local path
+  ansible.builtin.copy:
+    src: "{{ di_tarball_local_path }}"
+    dest: "{{ di_tmp_dir }}/di-components.tar.gz"
+    mode: "0644"
+  when: di_rpm_source == "local"
+
+# Extract tarball
+- name: Extract DI tarball
+  ansible.builtin.shell:
+    cmd: |
+      cd {{ di_tmp_dir }}
+      gunzip -f di-components.tar.gz 2>/dev/null || true
+      tar xf di-components.tar 2>/dev/null || tar xf di-components.tar.gz
+  args:
+    creates: "{{ di_tmp_dir }}/di-components.tar"
+  when: di_rpm_source in ['url', 'local']
+
+# Directory-mode: copy loose packages + add_node.py straight from the controller.
+- name: Set target architecture for package filtering
+  ansible.builtin.set_fact:
+    _di_arch: "{{ ansible_architecture }}"
+
+- name: Enumerate local payload files (directory mode, architecture-filtered)
+  ansible.builtin.find:
+    paths: "{{ di_payload_local_dir }}"
+    patterns:
+      - "*.{{ _di_arch }}.rpm"
+      - "*.noarch.rpm"
+      - "*.deb"
+      - "add_node.py"
+  register: _local_payload
+  delegate_to: localhost
+  become: false
+  when: di_rpm_source == "directory"
+
+- name: Fail if local payload directory is empty
+  ansible.builtin.fail:
+    msg: >-
+      di_rpm_source=directory but no *.rpm / *.deb / add_node.py found under
+      {{ di_payload_local_dir }} on the Ansible controller.
+  when:
+    - di_rpm_source == "directory"
+    - (_local_payload.matched | default(0)) == 0
+
+# Catch the common footgun: RPMs dropped into payload/ for a Debian target,
+# or vice versa. Without this, the pd-di find/install task fails later with
+# a confusing "No pd-di package (*.deb) found" message.
+- name: Guard against payload / OS mismatch (directory mode)
+  ansible.builtin.fail:
+    msg: >-
+      di_rpm_source=directory but no *.{{ di_pkg_extension }} packages found in
+      {{ di_payload_local_dir }} on the controller. Target {{ inventory_hostname }}
+      is {{ ansible_os_family }} and expects .{{ di_pkg_extension }} payloads.
+      Supply matching packages or switch to di_rpm_source=url/local.
+  when:
+    - di_rpm_source == "directory"
+    - _local_payload.files | default([])
+        | map(attribute='path')
+        | select('match', '.*\\.' + di_pkg_extension + '$')
+        | list | length == 0
+
+- name: Copy payload files to target (directory mode)
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "{{ di_tmp_dir }}/{{ item.path | basename }}"
+    mode: "0644"
+  loop: "{{ _local_payload.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: di_rpm_source == "directory"
+
+# Find and install pd-di package
+- name: Find pd-di package for target architecture
+  ansible.builtin.find:
+    paths: "{{ di_tmp_dir }}"
+    patterns: "pd-di-*.{{ _di_arch }}.{{ di_pkg_extension }}"
+    recurse: true
+  register: pddi_package_files_arch
+
+- name: Fall back to any pd-di package (arch-agnostic)
+  ansible.builtin.find:
+    paths: "{{ di_tmp_dir }}"
+    patterns: "pd-di-*.{{ di_pkg_extension }}"
+    recurse: true
+  register: pddi_package_files_any
+  when: (pddi_package_files_arch.matched | default(0)) == 0
+
+- name: Set pd-di package result
+  ansible.builtin.set_fact:
+    _pddi_files: "{{ pddi_package_files_arch.files if (pddi_package_files_arch.matched | default(0)) > 0 else (pddi_package_files_any.files | default([])) }}"
+
+- name: Fail if no pd-di package found
+  ansible.builtin.fail:
+    msg: "No pd-di package (*.{{ di_pkg_extension }}) found in {{ di_tmp_dir }}"
+  when: _pddi_files | length == 0
+
+- name: Set pd-di package path
+  ansible.builtin.set_fact:
+    _pddi_pkg_path: "{{ _pddi_files | sort(attribute='path') | last | json_query('path') }}"
+
+- name: Display pd-di package to install
+  ansible.builtin.debug:
+    msg: "Installing pd-di from: {{ _pddi_pkg_path }}"
+
+- name: Install pd-di package (RedHat)
+  ansible.builtin.dnf:
+    name: "{{ _pddi_pkg_path }}"
+    state: present
+    disable_gpg_check: true
+  when: ansible_os_family == 'RedHat'
+
+- name: Install pd-di package (Debian)
+  ansible.builtin.apt:
+    deb: "{{ _pddi_pkg_path }}"
+    state: present
+  when: ansible_os_family == 'Debian'
+
+# Add cluster to /etc/hosts
+- name: Add Hammerspace cluster to /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: ".*{{ hammerspace_cluster_hostname }}$"
+    line: "{{ hammerspace_cluster_mgmt_ip }} {{ hammerspace_cluster_hostname }}"
+    state: present
+
+# Find add_node.py for later use
+- name: Find add_node.py in extracted files
+  ansible.builtin.find:
+    paths: "{{ di_tmp_dir }}"
+    patterns: "add_node.py"
+    recurse: true
+  register: add_node_script_files
+
+- name: Set add_node.py path (from tarball)
+  ansible.builtin.set_fact:
+    _add_node_script: "{{ add_node_script_files.files[0].path | default('') }}"
+  when: add_node_script_files.matched > 0
+
+- name: Copy add_node.py to /usr/local/bin if found in tarball
+  ansible.builtin.copy:
+    src: "{{ _add_node_script }}"
+    dest: /usr/local/bin/add_node.py
+    mode: "0755"
+    remote_src: true
+  when: _add_node_script | default('') | length > 0
+
+# Fallback: download add_node.py from URL if not bundled in the tarball
+- name: Download add_node.py from URL (fallback when not in tarball)
+  ansible.builtin.get_url:
+    url: "{{ di_add_node_script_url }}"
+    dest: /usr/local/bin/add_node.py
+    mode: "0755"
+  when:
+    - add_node_script_files.matched == 0
+    - di_add_node_script_url | default('') | length > 0

@@ -1,0 +1,693 @@
+---
+# Regression test for the HTTP 400 on volume group update:
+#
+#   TASK [hammerspace_integration : Fail if the volume group update was rejected]
+#   fatal: [172.20.16.5]: FAILED!
+#     Updating volume group 'vg-tier0' failed with HTTP 400.
+#
+# ROOT CAUSE
+# ----------
+# The PUT targeted the volume group NAME:
+#
+#   PUT {{ hs_api_url }}/volume-groups/vg-tier0
+#
+# The Hammerspace API addresses a resource for write by its UUID:
+#
+#   PUT https://<anvil>/mgmt/v1.2/rest/volume-groups/91b88e1a-08bb-...
+#
+# A GET by name works, so the read half of the read-modify-write looked
+# correct and only the write was rejected. Every other write in this role
+# already used .uoid.uuid (az_map, create_share, dns_update, ad_join,
+# set_location, create_s3_user); the three volume-group writers were the
+# outliers.
+#
+# SECOND DEFECT
+# -------------
+# The payload was rebuilt from scratch as {_type, name, expressions}. A PUT
+# REPLACES the resource, so that silently drops uoid, internalId and any
+# placement objectives the group carries — the objectives being the entire
+# reason the playbook refuses to create groups itself. The payload is now the
+# fetched object with only the locations replaced.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_volume_group_uuid.yml \
+#       -i localhost, -c local
+
+- name: Volume group UUID-addressing tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    # The volume-group WRITERS. volume_group_join.yml is the orchestrator — it
+    # builds the per-group plan and issues no PUT of its own; the write body
+    # it includes once per group is volume_group_join_one.yml, so that is the
+    # file these audits must cover. TEST 1's count guard is what caught the
+    # move rather than letting the audits pass vacuously on a file with no
+    # PUT in it.
+    _writers:
+      - roles/hammerspace_integration/tasks/volume_group_join_one.yml
+      - roles/hammerspace_integration/tasks/volume_group_leave.yml
+      - roles/hammerspace_integration/tasks/volume_group_add_volume.yml
+
+    # A realistic GET response: the fields a PUT must not drop.
+    _vg_fetched:
+      _type: "VOLUME_GROUP"
+      name: "vg-tier0"
+      uoid:
+        _type: "UOID"
+        uuid: "91b88e1a-08bb-4c92-a739-3cb82b106228"
+        objectType: "OBJECT_TYPE_VOLUME_GROUP"
+      internalId: 42
+      objectStoreLogicalVolumeExpression: "keep-me"
+      expressions:
+        - _type: "EXPRESSION"
+          operator: "IN"
+          locations:
+            - _type: "VOLUME_LOCATION"
+              storageVolume:
+                _type: "STORAGE_VOLUME"
+                name: "AZ1:node-1::/nvme/tier0"
+            # Not every location names a storage volume. Mapping
+            # 'storageVolume.name' over this entry is what produced
+            # "'dict object' has no attribute 'storageVolume'".
+            - _type: "VOLUME_LOCATION"
+              extendedInfo: {}
+              namePattern: "AZ2:*"
+
+  tasks:
+    # ========================================================================
+    # TEST 1 (audit): no volume-group WRITE may address the group by name.
+    # ========================================================================
+    - name: 'TEST 1: audit — every volume-group PUT targets a UUID'
+      block:
+        # NOTE: the awk program must stay on ONE line. A `>-` folded scalar
+        # does not fold lines that are indented deeper than the first, so a
+        # pretty-printed awk program arrives at the shell with real newlines
+        # and the file list becomes a separate command.
+        #
+        # Only WRITES are in scope. A GET by name is legitimate and is how
+        # each writer finds the group in the first place; awk therefore tracks
+        # whether the current task (tasks start at `- name:`) contains -X PUT,
+        # and only inspects the endpoint of those.
+        - name: Find any PUT still addressed by name
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} &&
+              awk '/^[[:space:]]*-[[:space:]]*name:/{put=0} /-X PUT/{put=1} put && /volume-groups\// && !/uuid/{print FILENAME ":" FNR ": " $0}'
+              {{ _writers | map('quote') | join(' ') }}
+          register: _by_name
+          changed_when: false
+          # Source audit, not a change. Without this the task is
+          # SKIPPED under --check, stdout is empty, and the assert
+          # below reads that as a regression. (2026-08-26 rule.)
+          check_mode: false
+
+        - name: 'TEST 1 ASSERT: no name-addressed endpoint remains in a writer'
+          ansible.builtin.assert:
+            that:
+              - (_by_name.stdout | trim) | length == 0
+            fail_msg: |
+              REGRESSION: a volume-group PUT is still addressed by NAME.
+              A GET by name is fine, but the API rejects a PUT to a name with
+              HTTP 400 — that is the vg-tier0 failure. Use .uoid.uuid.
+
+              {{ _by_name.stdout }}
+
+        - name: 'TEST 1 ASSERT: the audit can actually see the PUTs'
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} &&
+              awk '/^[[:space:]]*-[[:space:]]*name:/{put=0} /-X PUT/{put=1} put && /volume-groups\//{n++} END{print n+0}'
+              {{ _writers | map('quote') | join(' ') }}
+          register: _put_count
+          changed_when: false
+          # Source audit, not a change. Without this the task is
+          # SKIPPED under --check, stdout is empty, and the assert
+          # below reads that as a regression. (2026-08-26 rule.)
+          check_mode: false
+
+        - name: 'TEST 1 ASSERT: all three writers were inspected'
+          ansible.builtin.assert:
+            that:
+              # Guards against the awk silently matching nothing and the audit
+              # passing vacuously.
+              - (_put_count.stdout | trim | int) == 3
+            fail_msg: |
+              The audit found {{ _put_count.stdout | trim }} volume-group PUT
+              endpoints; expected 3 (join, leave, add_volume). Either a writer
+              was added or removed, or the awk no longer matches the task
+              layout and this audit is passing without checking anything.
+
+        - name: 'TEST 1 ASSERT: each writer resolves a uuid'
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} &&
+              grep -L 'uoid.uuid' {{ _writers | map('quote') | join(' ') }} || true
+          register: _no_uuid
+          changed_when: false
+          # Source audit, not a change. Without this the task is
+          # SKIPPED under --check, stdout is empty, and the assert
+          # below reads that as a regression. (2026-08-26 rule.)
+          check_mode: false
+
+        - name: 'TEST 1 ASSERT: no writer lacks a uuid lookup'
+          ansible.builtin.assert:
+            that:
+              - (_no_uuid.stdout | trim) | length == 0
+            fail_msg: |
+              These volume-group writers never read .uoid.uuid, so they cannot
+              be addressing the resource correctly:
+              {{ _no_uuid.stdout }}
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: audit — all 3 volume-group writers PUT to .uoid.uuid, none by name'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2: the payload must be the fetched object with locations replaced,
+    # so a PUT cannot drop fields the API set.
+    # ========================================================================
+    - name: 'TEST 2: the append payload preserves the fetched object'
+      block:
+        - name: Build the payload the way join.yml does
+          ansible.builtin.set_fact:
+            _payload: >-
+              {{ _vg_fetched | combine({'expressions':
+                   [ _expr0 | combine({'operator': 'IN',
+                                       'locations': _new_locations}) ]
+                 }) }}
+          vars:
+            _expr0: >-
+              {{ (_vg_fetched.expressions | default([])) | first
+                 | default({'_type': 'EXPRESSION'}, true) }}
+            _new_locations: >-
+              {{ _vg_fetched.expressions[0].locations + [{
+                   '_type': 'VOLUME_LOCATION',
+                   'storageVolume': {'_type': 'STORAGE_VOLUME',
+                                     'name': 'AZ1:node-2::/nvme/tier0'}}] }}
+
+        - name: 'TEST 2 ASSERT: identity and objectives survive the round trip'
+          ansible.builtin.assert:
+            that:
+              # Dropped by the old hand-built {_type, name, expressions} body.
+              - _payload.uoid.uuid == '91b88e1a-08bb-4c92-a739-3cb82b106228'
+              - _payload.internalId == 42
+              - _payload.objectStoreLogicalVolumeExpression == 'keep-me'
+              # Append-only: existing entries keep their order and position,
+              # including the one that names no storage volume.
+              - _payload.expressions[0].locations | length == 3
+              - _payload.expressions[0].locations[0].storageVolume.name == 'AZ1:node-1::/nvme/tier0'
+              - _payload.expressions[0].locations[1].namePattern == 'AZ2:*'
+              - _payload.expressions[0].locations[2].storageVolume.name == 'AZ1:node-2::/nvme/tier0'
+              - _payload.expressions[0].operator == 'IN'
+            fail_msg: |
+              The PUT payload does not round-trip the fetched object. A PUT
+              REPLACES the resource, so anything missing here is erased from
+              the group — including the placement objectives that are the
+              reason this playbook refuses to create groups itself.
+              Got: {{ _payload }}
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: payload round-trips uoid/internalId/objectives and appends'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3 (audit): a rejected PUT must print the API's response body. The
+    # curl tasks carry no_log because the command line holds the password, so
+    # without this the operator gets a bare status code — the same dead end as
+    # the 2026-09-03 Key Vault incident.
+    # ========================================================================
+    - name: 'TEST 3: audit — rejections surface the API response body'
+      block:
+        - name: Check each writer reports the body
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} &&
+              grep -L 'The API said' {{ _writers | map('quote') | join(' ') }} || true
+          register: _no_body
+          changed_when: false
+          # Source audit, not a change. Without this the task is
+          # SKIPPED under --check, stdout is empty, and the assert
+          # below reads that as a regression. (2026-08-26 rule.)
+          check_mode: false
+
+        - name: 'TEST 3 ASSERT: every writer prints the response body'
+          ansible.builtin.assert:
+            that:
+              - (_no_body.stdout | trim) | length == 0
+            fail_msg: |
+              These volume-group writers report a status code without the
+              response body:
+              {{ _no_body.stdout }}
+
+              The curl tasks are no_log (the command line contains the API
+              password), so the registered stdout is the only record of why
+              the API refused. HTTP 400 alone is not diagnosable.
+
+        - name: 'TEST 3 ASSERT: add_volume checks its PUT result at all'
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} &&
+              grep -c 'volume group update was rejected'
+              roles/hammerspace_integration/tasks/volume_group_add_volume.yml || true
+          register: _av_check
+          changed_when: false
+          # Source audit, not a change. Without this the task is
+          # SKIPPED under --check, stdout is empty, and the assert
+          # below reads that as a regression. (2026-08-26 rule.)
+          check_mode: false
+
+        - name: 'TEST 3 ASSERT: the add_volume result is not ignored'
+          ansible.builtin.assert:
+            that:
+              - (_av_check.stdout | trim | int) > 0
+            fail_msg: |
+              REGRESSION: volume_group_add_volume.yml registers its PUT result
+              and never reads the status. A rejected PUT then reports
+              "added to volume group" and the volume is silently left out.
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: audit — all writers surface the API body; add_volume checks its status'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 4: a location entry that names no storage volume must not crash the
+    # membership comparison, and must survive the PUT.
+    #
+    #   TASK [hammerspace_integration : Determine which volumes are not yet members]
+    #   fatal: [172.20.16.5]: FAILED!
+    #     The task includes an option with an undefined variable. The error
+    #     was: 'dict object' has no attribute 'storageVolume'
+    #
+    # The filter decides what is COMPARED. It must never decide what is
+    # WRITTEN BACK — dropping an unrecognised entry from the payload would
+    # delete it from the group, since a PUT replaces the resource.
+    # ========================================================================
+    - name: 'TEST 4: locations without storageVolume are tolerated and preserved'
+      block:
+        - name: Extract member names the way join.yml does
+          ansible.builtin.set_fact:
+            _names: >-
+              {{ _vg_fetched.expressions[0].locations
+                 | selectattr('storageVolume.name', 'defined')
+                 | map(attribute='storageVolume.name') | list }}
+            _locations: "{{ _vg_fetched.expressions[0].locations }}"
+
+        - name: 'TEST 4 ASSERT: only the nameable entry is compared'
+          ansible.builtin.assert:
+            that:
+              - _names == ['AZ1:node-1::/nvme/tier0']
+            fail_msg: |
+              Name extraction did not skip the entry with no storageVolume.
+              Unguarded this raises "'dict object' has no attribute
+              'storageVolume'" and fails a perfectly valid group.
+              Got: {{ _names }}
+
+        - name: Build the payload the way join.yml does
+          ansible.builtin.set_fact:
+            _payload4: >-
+              {{ _vg_fetched | combine({'expressions':
+                   [ (_vg_fetched.expressions | first)
+                     | combine({'operator': 'IN', 'locations': _new}) ]}) }}
+          vars:
+            _new: >-
+              {{ _locations + [{'_type': 'VOLUME_LOCATION',
+                                'storageVolume': {'_type': 'STORAGE_VOLUME',
+                                                  'name': 'AZ1:node-2::/nvme/tier0'}}] }}
+
+        - name: 'TEST 4 ASSERT: the unnameable entry survives the PUT payload'
+          ansible.builtin.assert:
+            that:
+              - _payload4.expressions[0].locations | length == 3
+              # Preserved verbatim, in place, not dropped by the filter.
+              - _payload4.expressions[0].locations[1].namePattern == 'AZ2:*'
+              - _payload4.expressions[0].locations[2].storageVolume.name == 'AZ1:node-2::/nvme/tier0'
+            fail_msg: |
+              An entry with no storageVolume was dropped from the PUT payload.
+              A PUT REPLACES the resource, so filtering it out of the payload
+              deletes it from the group. Filter what is COMPARED, never what is
+              written back.
+              Got: {{ _payload4.expressions[0].locations }}
+
+        - name: Compute a removal plan the way leave.yml does
+          ansible.builtin.set_fact:
+            _keep: "{{ _locations | reject('in', _remove_locs) | list }}"
+            _remove: "{{ _remove_locs | map(attribute='storageVolume.name') | list }}"
+          vars:
+            _remove_locs: >-
+              {{ _locations | selectattr('storageVolume.name', 'defined')
+                 | selectattr('storageVolume.name', 'in',
+                              ['AZ1:node-1::/nvme/tier0']) | list }}
+
+        - name: 'TEST 4 ASSERT: removal keeps the unnameable entry'
+          ansible.builtin.assert:
+            that:
+              - _remove == ['AZ1:node-1::/nvme/tier0']
+              # The pattern entry is not a volume being decommissioned, so it
+              # must be retained rather than quietly removed with the volume.
+              - _keep | length == 1
+              - _keep[0].namePattern == 'AZ2:*'
+            fail_msg: |
+              The removal plan mishandled an entry with no storageVolume.
+              keep={{ _keep }} remove={{ _remove }}
+
+        # Expression-level audit. A line-scoped grep reports false positives
+        # (the guard usually sits on the line above the access), and per-FILE
+        # presence is too coarse to notice one guard of several going missing
+        # — both were tried. The helper parses each Jinja expression and
+        # requires the guard to PRECEDE the access within it.
+        - name: Audit storageVolume.name guards in the writers
+          ansible.builtin.command:
+            argv: >-
+              {{ ['python3', playbook_dir ~ '/check_storagevolume_guards.py']
+                 + (_writers | map('regex_replace', '^', playbook_dir ~ '/../../') | list) }}
+          register: _sv_audit
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: 'TEST 4 ASSERT: every storageVolume.name access is guarded'
+          ansible.builtin.assert:
+            that:
+              - _sv_audit.rc == 0
+            fail_msg: |
+              REGRESSION: unguarded storageVolume.name access(es).
+
+              {{ _sv_audit.stdout }}
+
+              Each raises "'dict object' has no attribute 'storageVolume'" on
+              a group holding an entry that names no volume — a valid group
+              the playbook then refuses to touch.
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: locations without storageVolume are skipped in comparison and preserved in the payload'] }}"
+      rescue:
+        - name: Record TEST 4 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 5: the round-tripped payload must not be inlined in the shell
+    # command. It embeds the group's expanded volumes/nodes/logical volumes,
+    # so -d '<json>' places tens of kilobytes of arbitrary API-controlled text
+    # inside shell single quotes. One apostrophe ends the quoting and curl is
+    # never executed:
+    #
+    #   'vg-tier0' — HTTP 0
+    #     The API said: (empty response body)
+    #
+    # HTTP 0 with no body is the signature: -w always emits a code when curl
+    # actually runs, so no output at all means the command did not run.
+    # ========================================================================
+    - name: 'TEST 5: volume group payloads are passed as -d @file'
+      block:
+        - name: Look for inlined JSON payloads in the writers
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} && grep -n -- "-d '{{ '{' ~ '{' }}" {{ _writers | map('quote') | join(' ') }} || true
+          register: _inline
+          changed_when: false
+          check_mode: false
+
+        - name: 'TEST 5 ASSERT: no writer inlines its payload'
+          ansible.builtin.assert:
+            that:
+              - (_inline.stdout | trim) | length == 0
+            fail_msg: |
+              REGRESSION: a volume-group writer inlines its JSON payload into
+              the curl command line:
+
+              {{ _inline.stdout }}
+
+              The payload round-trips the fetched object, so it is large and
+              contains arbitrary API-controlled strings. A single apostrophe
+              in any of it terminates the shell quoting and curl never runs —
+              reported as HTTP 0 with an empty body. Write it to a file and
+              pass -d @file.
+
+        - name: Check each writer uses -d @ and cleans the file up
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} && grep -L -- "-d @" {{ _writers | map('quote') | join(' ') }} || true
+          register: _no_at
+          changed_when: false
+          check_mode: false
+
+        - name: 'TEST 5 ASSERT: every writer passes -d @file'
+          ansible.builtin.assert:
+            that:
+              - (_no_at.stdout | trim) | length == 0
+            fail_msg: |
+              These writers do not pass their payload as -d @file:
+              {{ _no_at.stdout }}
+
+        - name: Check the payload files are removed
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} && grep -L "state: absent" {{ _writers | map('quote') | join(' ') }} || true
+          register: _no_cleanup
+          changed_when: false
+          check_mode: false
+
+        - name: 'TEST 5 ASSERT: payload files are cleaned up'
+          ansible.builtin.assert:
+            that:
+              - (_no_cleanup.stdout | trim) | length == 0
+            fail_msg: |
+              These writers never remove their payload file:
+              {{ _no_cleanup.stdout }}
+
+              Cleanup must also come BEFORE the rejection check, which is a
+              hard failure — a removal task placed after it is skipped on
+              exactly the runs that created the file.
+
+        - name: 'TEST 5 ASSERT: an HTTP 0 result is explained, not just printed'
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} && grep -L "curl exit" {{ _writers | map('quote') | join(' ') }} || true
+          register: _no_rc
+          changed_when: false
+          check_mode: false
+
+        - name: 'TEST 5 ASSERT: the failure message reports curl exit code'
+          ansible.builtin.assert:
+            that:
+              - (_no_rc.stdout | trim) | length == 0
+            fail_msg: |
+              These writers report an HTTP status without curl's exit code:
+              {{ _no_rc.stdout }}
+
+              HTTP 0 means curl produced no output; only the exit code and
+              stderr distinguish "never ran" from "killed" from "connection
+              refused".
+
+        - name: Record TEST 5 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 5: payloads passed as -d @file, cleaned up, and HTTP 0 reports curl exit + stderr'] }}"
+      rescue:
+        - name: Record TEST 5 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 5: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 6: decommission relies on the delete cascading volume group
+    # membership (confirmed against the API 2026-09-03), so it must not run
+    # the explicit PUT by default — but it must still VERIFY the cascade.
+    # Dropping the check along with the PUT would silently give up the safety
+    # property the PUT existed for: no group left referencing a deleted volume.
+    # ========================================================================
+    - name: 'TEST 6: decommission verifies the cascade instead of pre-emptying'
+      block:
+        - name: Read the decommission playbook
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../decommission_tier0.yml"
+          register: _dc_src
+
+        - name: Decode
+          ansible.builtin.set_fact:
+            _dc_raw: "{{ _dc_src.content | b64decode }}"
+
+        - name: 'TEST 6 ASSERT: the explicit PUT path is opt-in'
+          ansible.builtin.assert:
+            that:
+              - "'tasks_from: volume_group_leave' in _dc_raw"
+              - "'decommission_explicit_volume_group_leave' in _dc_raw"
+            fail_msg: |
+              decommission_tier0.yml must still be ABLE to remove memberships
+              explicitly — a cluster whose API does not cascade needs it — but
+              gated behind decommission_explicit_volume_group_leave, default
+              false.
+
+        - name: 'TEST 6 ASSERT: the cascade is verified after the delete'
+          ansible.builtin.assert:
+            that:
+              # The safety property survives the simplification.
+              - "'Verify no volume group still references a deleted volume' in _dc_raw"
+              - "'_dc_dangling' in _dc_raw"
+              # Verification must be skipped under --check: nothing was
+              # deleted, so every volume is still a member.
+              - "'not ansible_check_mode' in _dc_raw"
+            fail_msg: |
+              REGRESSION: the explicit volume-group removal was dropped without
+              a verification replacing it. The PUT existed to guarantee no
+              group is left referencing a deleted volume; relying on the
+              cascade is fine, relying on it WITHOUT CHECKING is not.
+
+        - name: 'TEST 6 ASSERT: a surviving reference warns, not fails'
+          ansible.builtin.assert:
+            that:
+              # The volumes and nodes are already gone by then; failing would
+              # make a completed decommission look unfinished.
+              - "'WARNING' in _dc_raw"
+              - "'decommission_explicit_volume_group_leave=true' in _dc_raw"
+            fail_msg: |
+              A surviving group reference must be reported loudly and name the
+              flag that restores the explicit removal — but it must not fail
+              the play, because the deletion it follows has already happened.
+
+        - name: Record TEST 6 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 6: decommission lets the delete cascade, gates the PUT behind a flag, and verifies afterwards'] }}"
+      rescue:
+        - name: Record TEST 6 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 6: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 7: the post-delete cascade verification must not draw a conclusion
+    # from a run where the delete never happened, and must not print a literal
+    # backreference. Both were wrong on the first real decommission:
+    #
+    #   TASK [Warn if any volume group kept a reference]
+    #     WARNING: 1 volume group reference(s) survived the delete...
+    #       - vg-tier0 still holds \1
+    #   TASK [Fail if volume or node deletion reported an error]
+    #     cleanup_instance_nodes.py exited 2.
+    #     python3: can't open file '.../Ansible-Tier0/../cleanup_instance_nodes.py'
+    #
+    # The script never ran, so of course every volume was still a member —
+    # yet the warning announced "this cluster's API does not cascade".
+    # ========================================================================
+    - name: 'TEST 7: cascade verification is gated and formats correctly'
+      block:
+        - name: Read the decommission playbook
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../decommission_tier0.yml"
+          register: _dc_src7
+
+        - name: Decode
+          ansible.builtin.set_fact:
+            _dc_raw7: "{{ _dc_src7.content | b64decode }}"
+
+        - name: 'TEST 7 ASSERT: verification requires the delete to have succeeded'
+          ansible.builtin.assert:
+            that:
+              - "'_dc_cleanup.rc | default(1)) == 0' in _dc_raw7"
+            fail_msg: |
+              REGRESSION: the cascade verification is not gated on the
+              deletion succeeding. cleanup_instance_nodes.py carries
+              failed_when: false, so its failure is reported by a LATER task —
+              a delete that never ran leaves every volume in its group and the
+              verification then reports "the delete did not cascade", which is
+              a wrong diagnosis of a run that deleted nothing.
+
+        # Comment lines are stripped first: the file documents the old bug,
+        # so a naive substring search matches its own explanation.
+        - name: Strip comments from the playbook text
+          ansible.builtin.set_fact:
+            _dc_code7: "{{ _dc_raw7.split('\n') | reject('search', '^\\s*#') | join('\n') }}"
+
+        - name: 'TEST 7 ASSERT: no regex backreference is used to build strings'
+          ansible.builtin.assert:
+            that:
+              # Building the message with map('regex_replace', ...) and a
+              # backreference did not substitute; it printed a literal
+              # backslash-one into the operator-facing warning.
+              - "'regex_replace' not in _dc_code7"
+            fail_msg: |
+              The dangling-reference message builds strings with regex_replace
+              and a backreference. Collect {group, volumes} and format them in
+              the message template instead.
+
+
+        - name: Simulate the collection and rendering
+          ansible.builtin.set_fact:
+            _dangling: >-
+              {{ [{'group': 'vg-tier0',
+                   'volumes': ['AZ1:node-1::/nvme/tier0', 'AZ1:node-2::/nvme/tier0']}] }}
+
+        - name: 'TEST 7 ASSERT: the rendered warning names the volumes'
+          ansible.builtin.assert:
+            that:
+              - _rendered is search('vg-tier0')
+              - _rendered is search('AZ1:node-1::/nvme/tier0')
+              - _rendered is search('AZ1:node-2::/nvme/tier0')
+              # The count is the number of VOLUMES, not of groups.
+              - _count == 2
+              - "'\\1' not in _rendered"
+            fail_msg: |
+              The dangling-reference message does not render the group and its
+              volumes. Got count={{ _count }}:
+              {{ _rendered }}
+          vars:
+            _count: "{{ _dangling | map(attribute='volumes') | map('length') | sum }}"
+            _rendered: |
+              {% for d in _dangling %}
+                {{ d.group }}
+              {% for v in d.volumes %}    - {{ v }}
+              {% endfor %}
+              {% endfor %}
+
+        - name: Record TEST 7 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 7: cascade verification gated on delete success, message renders group + volumes'] }}"
+      rescue:
+        - name: Record TEST 7 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 7: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          VOLUME GROUP UUID TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

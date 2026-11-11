@@ -1,0 +1,34 @@
+---
+# iptables configuration tasks (fallback)
+
+- name: Allow DI ports through iptables
+  ansible.builtin.iptables:
+    chain: INPUT
+    protocol: "{{ item.proto }}"
+    destination_port: "{{ item.port }}"
+    jump: ACCEPT
+    comment: "Hammerspace DI"
+  loop: "{{ di_firewall_ports }}"
+  ignore_errors: true
+
+- name: Save iptables rules (RHEL/CentOS)
+  ansible.builtin.command: service iptables save
+  changed_when: true
+  failed_when: false
+  when: ansible_os_family == 'RedHat'
+
+- name: Save iptables rules (Debian/Ubuntu)
+  ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+  changed_when: true
+  failed_when: false
+  when: ansible_os_family == 'Debian'
+
+- name: Display iptables rules
+  ansible.builtin.command: iptables -L -n
+  register: iptables_rules
+  changed_when: false
+  failed_when: false
+
+- name: Display iptables configuration
+  ansible.builtin.debug:
+    var: iptables_rules.stdout_lines

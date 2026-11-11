@@ -1,0 +1,153 @@
+---
+# Auto-wire DI node IPs into Tier 0 NFS exports.
+# Imported by site.yml — runs BEFORE the DI play so exports are ready when DI registers.
+#
+# When di_auto_export is true (default) and the di_nodes inventory group is
+# populated, this play collects DI node IPs and ensures they have
+# no_root_squash NFS access on all storage_servers. This eliminates the manual
+# step of adding DI IPs to mover_nodes in vars/main.yml.
+#
+# It runs on EVERY site.yml run, not only when deploy_di is set. plays/storage.yml
+# regenerates /etc/exports from the template on every run, and the template does
+# not know about DI nodes — so a later run without -e deploy_di=true used to
+# silently drop the DI entries, and DI fell back to the 0.0.0.0/0 root_squash
+# entry (2026-09-18). Tagged nfs-exports as well, so `--tags nfs-exports` cannot
+# regenerate the file without re-adding them.
+
+- name: Auto-configure NFS exports for DI nodes
+  hosts: storage_servers
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - ../vars/main.yml
+
+  pre_tasks:
+    # vars/main.yml defines repo_root = "{{ playbook_dir }}/..", which handles
+    # the plays/-subdirectory resolution. See vars/main.yml header for context.
+    - name: Load vault variables (if available)
+      ansible.builtin.include_vars:
+        file: "{{ repo_root }}/vars/vault.yml"
+      failed_when: false
+      no_log: true
+
+    # Azure Key Vault (opt-in) — overrides vars/vault.yml when set. Must
+    # resolve BEFORE anything authenticates against the Anvil.
+    - name: Retrieve Hammerspace password from Azure Key Vault (optional)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: keyvault_password
+      when: (hammerspace_keyvault_uri | default('')) | length > 0
+
+  tasks:
+    # Gated on the inventory, NOT on deploy_di: once DI nodes exist they need
+    # the export on every run, whether or not DI is being (re)deployed now.
+    - name: Skip if auto-export is disabled or there are no DI nodes
+      ansible.builtin.meta: end_play
+      when: >-
+        not (di_auto_export | default(true) | bool)
+        or (groups['di_nodes'] | default([]) | length == 0)
+
+    - name: Collect DI node IPs from inventory
+      ansible.builtin.set_fact:
+        _di_node_ips: >-
+          {{ groups['di_nodes'] | default([])
+             | map('extract', hostvars, 'di_node_ip')
+             | select('defined')
+             | list }}
+        _di_node_ips_fallback: >-
+          {{ groups['di_nodes'] | default([])
+             | map('extract', hostvars, 'ansible_host')
+             | select('defined')
+             | list }}
+      run_once: true
+
+    - name: Merge DI IPs (prefer di_node_ip, fall back to ansible_host)
+      ansible.builtin.set_fact:
+        _di_ips_resolved: >-
+          {{ _di_node_ips if (_di_node_ips | length > 0)
+             else _di_node_ips_fallback }}
+      run_once: true
+
+    # IPs already in hammerspace_nodes / mover_nodes are on the template line
+    # with no_root_squash; adding them again would only produce a duplicate
+    # export entry.
+    - name: Identify DI IPs not already exported via hammerspace_nodes / mover_nodes
+      ansible.builtin.set_fact:
+        _di_ips_new: >-
+          {{ _di_ips_resolved
+             | difference(mover_nodes | default([]))
+             | difference(hammerspace_nodes | default([])) }}
+      run_once: true
+
+    - name: Skip if all DI IPs are already in hammerspace_nodes / mover_nodes
+      ansible.builtin.debug:
+        msg: "All DI node IPs are already in hammerspace_nodes / mover_nodes — no export changes needed."
+      when: _di_ips_new | length == 0
+      run_once: true
+
+    # mount_points is a fact set by nvme_discovery in plays/storage.yml. When
+    # this play runs on its own (--tags di-exports) it is undefined, and the
+    # old `when: mount_points is defined` silently did nothing. Fall back to
+    # the paths already in /etc/exports.
+    - name: Read the current exports
+      ansible.builtin.slurp:
+        src: /etc/exports
+      register: _di_exports_raw
+      failed_when: false
+
+    - name: Resolve the export paths
+      ansible.builtin.set_fact:
+        _di_export_paths: >-
+          {{ (mount_points | map(attribute='path') | list)
+             if mount_points is defined
+             else ((_di_exports_raw.content | default('') | b64decode)
+                   | regex_findall('^(/\\S+)\\s', multiline=True) | unique | list) }}
+
+    - name: Warn if no export paths could be resolved
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: no export paths found — mount_points is undefined and
+          /etc/exports has no entries. DI IPs were NOT added. Run the storage
+          play first (site.yml, or --tags nfs-exports).
+      when: _di_export_paths | length == 0
+
+    - name: Add DI node IPs to NFS exports
+      when: _di_ips_new | length > 0
+      block:
+        - name: Display new DI IPs being added to exports
+          ansible.builtin.debug:
+            msg: "Adding DI node IPs to NFS exports (no_root_squash): {{ _di_ips_new | join(', ') }}"
+          run_once: true
+
+        # The regexp is anchored to a WHOLE client token — `(^|\s)IP\(` — for
+        # two reasons. Unanchored, `10\.0\.12\.24` also matches inside
+        # `10.0.12.242`, and `.*IP` matches the TEMPLATE line whenever the IP
+        # appears anywhere on it; either way lineinfile REPLACES that line
+        # with this single-client one and every other client is gone.
+        - name: Add DI IPs to /etc/exports
+          ansible.builtin.lineinfile:
+            path: /etc/exports
+            regexp: "^{{ item.0 | regex_escape }}\\s+{{ item.1 | regex_escape }}\\("
+            line: "{{ item.0 }} {{ item.1 }}({{ hammerspace_export_opts | default('rw,no_root_squash,sync,secure,mp,no_subtree_check') }})"
+            insertafter: "^{{ item.0 | regex_escape }}\\s"
+            state: present
+          loop: "{{ _di_export_paths | product(_di_ips_new) | list }}"
+          loop_control:
+            label: "{{ item.0 }} -> {{ item.1 }}"
+          notify: reload nfs exports
+          # Skip pairs the template line already carries (a DI IP that is also
+          # in hammerspace_nodes/mover_nodes is filtered above; this catches a
+          # hand-added one) — a second entry for the same client is a
+          # "duplicated export entries" warning from exportfs.
+          when: >-
+            (_di_exports_raw.content | default('') | b64decode)
+            is not search('(?m)^' ~ (item.0 | regex_escape) ~ '\\s.*(^|\\s)' ~ (item.1 | regex_escape) ~ '\\(')
+
+  handlers:
+    - name: reload nfs exports
+      ansible.builtin.command:
+        cmd: exportfs -ra
+      changed_when: true
+
+  tags: [di, di-exports, nfs-exports]

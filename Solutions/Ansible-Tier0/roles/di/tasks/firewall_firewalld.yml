@@ -1,0 +1,34 @@
+---
+# Firewalld configuration tasks (RHEL/Rocky/CentOS)
+
+- name: Ensure firewalld is installed
+  ansible.builtin.package:
+    name: firewalld
+    state: present
+
+- name: Ensure firewalld is running
+  ansible.builtin.systemd:
+    name: firewalld
+    state: started
+    enabled: true
+
+- name: Add DI ports to firewalld
+  ansible.posix.firewalld:
+    port: "{{ item.port }}/{{ item.proto }}"
+    permanent: true
+    state: enabled
+    immediate: true
+  loop: "{{ di_firewall_ports }}"
+
+- name: Reload firewalld
+  ansible.builtin.command: firewall-cmd --reload
+  changed_when: true
+
+- name: Verify firewalld rules
+  ansible.builtin.command: firewall-cmd --list-all
+  register: firewalld_rules
+  changed_when: false
+
+- name: Display firewalld configuration
+  ansible.builtin.debug:
+    var: firewalld_rules.stdout_lines

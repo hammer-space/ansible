@@ -1,0 +1,85 @@
+---
+# NIC IRQ pinning to NUMA-local CPUs.
+#
+# For high-throughput NVMe-over-Fabrics / RDMA / 100Gbps+ TCP traffic, the
+# IRQs servicing the NIC RX/TX queues must run on CPUs on the same NUMA node
+# as the NIC. irqbalance moves these around dynamically — disable it and
+# pin manually.
+
+- name: Stop and disable irqbalance (it fights manual pinning)
+  ansible.builtin.systemd:
+    name: irqbalance
+    state: stopped
+    enabled: false
+  when: perf_irq_pinning_stop_irqbalance | default(true) | bool
+  failed_when: false
+
+- name: Auto-detect high-speed NICs when not specified
+  ansible.builtin.shell:
+    # Force bash: dash (Ubuntu /bin/sh) does not support `set -o pipefail`.
+    executable: /bin/bash
+    cmd: |
+      set -eo pipefail
+      for iface in $(ls /sys/class/net/); do
+        [ "$iface" = "lo" ] && continue
+        [ -d "/sys/class/net/$iface/device" ] || continue
+        speed=$(cat /sys/class/net/$iface/speed 2>/dev/null || echo 0)
+        # 25Gbps or faster
+        if [ "$speed" -ge 25000 ] 2>/dev/null; then
+          echo "$iface"
+        fi
+      done
+  register: _perf_auto_nics
+  changed_when: false
+  failed_when: false
+  when: (perf_irq_pin_interfaces | default([])) | length == 0
+
+- name: Resolve final interface list
+  ansible.builtin.set_fact:
+    _perf_pin_nics: >-
+      {{ perf_irq_pin_interfaces
+         if (perf_irq_pin_interfaces | default([])) | length > 0
+         else (_perf_auto_nics.stdout_lines | default([])) }}
+
+- name: Display NICs being pinned
+  ansible.builtin.debug:
+    msg: "IRQ pinning interfaces: {{ _perf_pin_nics | default([]) | join(', ') | default('none detected') }}"
+
+- name: Deploy hammerspace-irq-pin.sh helper script
+  ansible.builtin.template:
+    src: hammerspace-irq-pin.sh.j2
+    dest: /usr/local/sbin/hammerspace-irq-pin.sh
+    owner: root
+    group: root
+    mode: '0755'
+  when: _perf_pin_nics | length > 0
+
+- name: Deploy hammerspace-irq-pin systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hammerspace-irq-pin.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Hammerspace NIC IRQ pinning (NUMA-local)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/hammerspace-irq-pin.sh
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  when: _perf_pin_nics | length > 0
+  notify: reload systemd
+
+- name: Enable and start hammerspace-irq-pin service
+  ansible.builtin.systemd:
+    name: hammerspace-irq-pin.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: _perf_pin_nics | length > 0

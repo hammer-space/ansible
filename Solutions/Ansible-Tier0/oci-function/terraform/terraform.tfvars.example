@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars and customize
+
+compartment_id  = "ocid1.compartment.oc1..xxxxx"
+vcn_id          = "ocid1.vcn.oc1..xxxxx"
+subnet_id       = "ocid1.subnet.oc1..xxxxx"
+function_image  = "us-sanjose-1.ocir.io/mytenancy/tier0-functions/tier0-auto-deploy:latest"
+vault_secret_id = "ocid1.vaultsecret.oc1..xxxxx"
+hs_host         = "10.0.10.15"
+
+# Optional overrides
+# shape_filter  = "BM.GPU.GB200-v3.4"
+# deploy_mode   = "both"
+# repo_url      = "https://github.com/BeratUlualan/Ansible-Tier0.git"
+# repo_branch   = "main"
+# hs_user       = "admin"

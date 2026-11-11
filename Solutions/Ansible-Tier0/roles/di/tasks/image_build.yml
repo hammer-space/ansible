@@ -1,0 +1,152 @@
+---
+# Stage the pd-di payload (RPMs + add_node.py + Containerfile) on the target
+# host and build the container image. Dispatched from container_deploy.yml /
+# container_build.yml when di_image_source == 'build'. After this file runs,
+# an image tagged {{ di_container_image }} must exist locally.
+
+- name: Ensure build directory
+  ansible.builtin.file:
+    path: "{{ di_container_build_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure payload directory
+  ansible.builtin.file:
+    path: "{{ di_container_build_dir }}/payload"
+    state: directory
+    mode: "0755"
+
+- name: Copy Containerfile into build dir
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/container/Containerfile"
+    dest: "{{ di_container_build_dir }}/Containerfile"
+    mode: "0644"
+
+# ---------------------------------------------------------------------------
+# Stage payload: DI tarball RPMs + add_node.py
+# ---------------------------------------------------------------------------
+
+- name: Download DI tarball from URL
+  ansible.builtin.get_url:
+    url: "{{ di_tarball_url }}"
+    dest: "{{ di_container_build_dir }}/di-components.tar.gz"
+    mode: "0644"
+  when: di_rpm_source == "url"
+
+- name: Copy DI tarball from local path
+  ansible.builtin.copy:
+    src: "{{ di_tarball_local_path }}"
+    dest: "{{ di_container_build_dir }}/di-components.tar.gz"
+    mode: "0644"
+  when: di_rpm_source == "local"
+
+- name: Extract tarball into payload/
+  ansible.builtin.unarchive:
+    src: "{{ di_container_build_dir }}/di-components.tar.gz"
+    dest: "{{ di_container_build_dir }}/payload"
+    remote_src: true
+  when: di_rpm_source in ['url', 'local']
+
+- name: Flatten payload layout
+  # Tarballs commonly contain a nested folder; move RPMs and add_node.py up.
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      cd "{{ di_container_build_dir }}/payload"
+      find . -mindepth 2 \( -name '*.rpm' -o -name 'add_node.py' \) \
+          -exec mv -f -t . {} +
+      find . -mindepth 1 -type d -empty -delete
+    executable: /bin/bash
+  changed_when: false
+  when: di_rpm_source in ['url', 'local']
+
+# When di_rpm_source == "directory", copy loose RPMs and add_node.py from the
+# controller's payload dir straight into the remote build context.
+- name: Set target architecture for package filtering
+  ansible.builtin.set_fact:
+    _di_arch: "{{ ansible_architecture }}"
+
+- name: Enumerate local payload files (directory mode, architecture-filtered)
+  ansible.builtin.find:
+    paths: "{{ di_payload_local_dir }}"
+    patterns:
+      - "*.{{ _di_arch }}.rpm"
+      - "*.noarch.rpm"
+      - "add_node.py"
+  register: _local_payload
+  delegate_to: localhost
+  become: false
+  when: di_rpm_source == "directory"
+
+- name: Fail if local payload directory is empty
+  ansible.builtin.fail:
+    msg: >-
+      di_rpm_source=directory but no *.rpm / add_node.py found under
+      {{ di_payload_local_dir }} on the Ansible controller.
+  when:
+    - di_rpm_source == "directory"
+    - (_local_payload.matched | default(0)) == 0
+
+- name: Copy payload files to build dir (directory mode)
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "{{ di_container_build_dir }}/payload/{{ item.path | basename }}"
+    mode: "0644"
+  loop: "{{ _local_payload.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: di_rpm_source == "directory"
+
+- name: Check whether add_node.py is already in payload
+  ansible.builtin.stat:
+    path: "{{ di_container_build_dir }}/payload/add_node.py"
+  register: _addnode_stat
+
+- name: Download add_node.py fallback (if not in tarball)
+  ansible.builtin.get_url:
+    url: "{{ di_add_node_script_url }}"
+    dest: "{{ di_container_build_dir }}/payload/add_node.py"
+    mode: "0755"
+  when:
+    - not _addnode_stat.stat.exists
+    - di_add_node_script_url | default('') | length > 0
+
+- name: Confirm payload contains pd-di RPM for target architecture
+  ansible.builtin.find:
+    paths: "{{ di_container_build_dir }}/payload"
+    patterns: "pd-di-*.{{ _di_arch }}.rpm"
+  register: _pddi_rpms
+
+- name: Fall back to any pd-di RPM (arch-agnostic)
+  ansible.builtin.find:
+    paths: "{{ di_container_build_dir }}/payload"
+    patterns: "pd-di-*.rpm"
+  register: _pddi_rpms
+  when: _pddi_rpms.matched == 0
+
+- name: Fail if no pd-di RPM in payload
+  ansible.builtin.fail:
+    msg: >-
+      No pd-di-*.rpm found in {{ di_container_build_dir }}/payload.
+      Check di_tarball_url / di_tarball_local_path.
+  when: (_pddi_rpms.matched | default(1)) == 0
+
+# ---------------------------------------------------------------------------
+# Build image
+# ---------------------------------------------------------------------------
+
+- name: Set container platform for build
+  ansible.builtin.set_fact:
+    _di_container_platform: "{{ 'linux/arm64' if ansible_architecture == 'aarch64' else 'linux/amd64' }}"
+
+- name: "Build container image with {{ di_container_runtime }} ({{ _di_container_platform }})"
+  ansible.builtin.command:
+    cmd: >-
+      {{ di_container_runtime }} build
+      --platform {{ _di_container_platform }}
+      --build-arg BASE_IMAGE={{ di_container_base_image }}
+      -t {{ di_container_image }}
+      -f {{ di_container_build_dir }}/Containerfile
+      {{ di_container_build_dir }}
+  register: build_result
+  changed_when: true

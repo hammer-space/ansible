@@ -1,0 +1,58 @@
+#cloud-config
+# =============================================================================
+# Tier 0 + DI Cloud-Config for OCI
+# =============================================================================
+# Use this as instance user_data in OCI (Console, CLI, or Terraform).
+# The instance self-provisions Tier 0 storage + optional DI on first boot.
+#
+# Terraform example:
+#   resource "oci_core_instance" "tier0" {
+#     ...
+#     metadata = {
+#       user_data = base64encode(file("cloud-init/tier0-cloud-config.yaml"))
+#     }
+#   }
+#
+# OCI CLI example:
+#   oci compute instance launch ... \
+#     --user-data-file cloud-init/tier0-cloud-config.yaml
+# =============================================================================
+
+# Write the bootstrap config file (sourced by the script)
+write_files:
+  - path: /etc/tier0-bootstrap.conf
+    permissions: '0600'
+    content: |
+      # Tier 0 Bootstrap Configuration
+      # Customize these for your environment
+
+      # Git repo (HTTPS — no SSH key needed)
+      ANSIBLE_REPO_URL="https://github.com/BeratUlualan/Ansible-Tier0.git"
+      ANSIBLE_REPO_BRANCH="main"
+
+      # Hammerspace cluster
+      HAMMERSPACE_API_HOST="10.0.10.15"
+      HAMMERSPACE_API_USER="admin"
+      HAMMERSPACE_API_PASSWORD="changeme"
+
+      # DI deployment
+      DEPLOY_DI="false"
+      DI_DEPLOYMENT_TYPE="container"
+      DI_IMAGE_SOURCE="build"
+
+runcmd:
+  # Source config and run bootstrap
+  - |
+    set -e
+    source /etc/tier0-bootstrap.conf
+    export ANSIBLE_REPO_URL ANSIBLE_REPO_BRANCH
+    export HAMMERSPACE_API_HOST HAMMERSPACE_API_USER HAMMERSPACE_API_PASSWORD
+    export DEPLOY_DI DI_DEPLOYMENT_TYPE DI_IMAGE_SOURCE
+
+    # Download and run the bootstrap script from the repo
+    curl -fsSL "https://raw.githubusercontent.com/BeratUlualan/Ansible-Tier0/${ANSIBLE_REPO_BRANCH}/cloud-init/tier0-bootstrap.sh" \
+      -o /tmp/tier0-bootstrap.sh
+    chmod +x /tmp/tier0-bootstrap.sh
+    /tmp/tier0-bootstrap.sh
+
+final_message: "Tier 0 bootstrap completed after $UPTIME seconds"

@@ -1,0 +1,283 @@
+---
+# Tests for NFS export hardening (2026-09-18).
+#
+# Field report: a Hammerspace-side host (DSX/DI) landed on the 0.0.0.0/0
+# root_squash entry until its IP was listed explicitly. The colleague's
+# explanation ("entries after 0.0.0.0/0 are ignored") is not how exports(5)
+# works — matching is by entry TYPE, line order only decides between entries
+# of the same type — but chasing it turned up real defects:
+#
+#   1. plays/di_exports.yml ended the play unless deploy_di was true. The
+#      storage play regenerates /etc/exports from the template on EVERY run,
+#      and the template knows nothing about DI nodes — so any later run
+#      without -e deploy_di=true dropped the DI entries.
+#   2. Its lineinfile regexp was `^path\s.*IP` (unanchored). `10\.0\.12\.24`
+#      matches inside `10.0.12.242`, and `.*IP` matches the template line
+#      whenever the IP is anywhere on it — lineinfile then REPLACES that line
+#      with the single-client one and every other client is gone.
+#   3. mover_nodes shipped with an example IP, exporting every volume
+#      no_root_squash to whatever host holds 10.0.12.242 at the site.
+#   4. `exportfs -ra` exits 0 after skipping an entry it cannot export; only
+#      stderr says so, and it was never read.
+#   5. A subnet listed after 0.0.0.0/0 in client_subnets is dead (same type,
+#      first match wins) — nothing said so.
+#   6. Node + volumes register on ansible_default_ipv4 with no hint that a
+#      multi-NIC host may have picked the management NIC.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_nfs_exports_hardening.yml \
+#       -i localhost, -c local
+
+- name: NFS export hardening tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _repo: "{{ playbook_dir }}/../.."
+
+    # A template-generated exports file: one line per path, all clients on it.
+    _exports_content: |
+      # /etc/exports - NFS export configuration
+      /hammerspace/hsvol0 10.0.10.15(rw,no_root_squash,sync,mp) 10.0.12.242(rw,no_root_squash,sync,mp) 0.0.0.0/0(rw,root_squash,sync,mp)
+      /hammerspace/hsvol1 10.0.10.15(rw,no_root_squash,sync,mp) 10.0.12.242(rw,no_root_squash,sync,mp) 0.0.0.0/0(rw,root_squash,sync,mp)
+
+  tasks:
+    # ========================================================================
+    # TEST 1: the lineinfile regexp must match only a dedicated single-client
+    # line, never the template line, and never an IP that is a PREFIX of
+    # another (10.0.12.24 vs 10.0.12.242).
+    # ========================================================================
+    - name: 'TEST 1: di_exports regexp is anchored to a whole client token'
+      block:
+        - name: Evaluate old and new regexps against the template line
+          ansible.builtin.set_fact:
+            _path: /hammerspace/hsvol0
+            _ip_prefix: 10.0.12.24
+            _ip_present: 10.0.12.242
+            _ip_new: 10.0.12.99
+          # Templated in a second step so the escaped values are available.
+
+        - name: Compute matches
+          ansible.builtin.set_fact:
+            # Old form: `^path\s.*IP` — the 2026-09-18 defect.
+            _old_matches_prefix: "{{ _exports_content is search('(?m)^' ~ (_path | regex_escape) ~ '\\s.*' ~ (_ip_prefix | regex_escape)) }}"
+            # New form: `^path\s+IP\(` — a dedicated line for exactly this client.
+            _new_matches_prefix: "{{ _exports_content is search('(?m)^' ~ (_path | regex_escape) ~ '\\s+' ~ (_ip_prefix | regex_escape) ~ '\\(') }}"
+            _new_matches_present: "{{ _exports_content is search('(?m)^' ~ (_path | regex_escape) ~ '\\s+' ~ (_ip_present | regex_escape) ~ '\\(') }}"
+            _new_matches_dedicated: "{{ (_path ~ ' ' ~ _ip_new ~ '(rw)') is search('^' ~ (_path | regex_escape) ~ '\\s+' ~ (_ip_new | regex_escape) ~ '\\(') }}"
+            # The skip guard: is this client already on the path's line?
+            _skip_present: "{{ _exports_content is search('(?m)^' ~ (_path | regex_escape) ~ '\\s.*(^|\\s)' ~ (_ip_present | regex_escape) ~ '\\(') }}"
+            _skip_prefix: "{{ _exports_content is search('(?m)^' ~ (_path | regex_escape) ~ '\\s.*(^|\\s)' ~ (_ip_prefix | regex_escape) ~ '\\(') }}"
+            _skip_new: "{{ _exports_content is search('(?m)^' ~ (_path | regex_escape) ~ '\\s.*(^|\\s)' ~ (_ip_new | regex_escape) ~ '\\(') }}"
+
+        - name: 'TEST 1 ASSERT'
+          ansible.builtin.assert:
+            that:
+              # Demonstrates the defect: the old regexp would have REPLACED the
+              # template line for a prefix IP.
+              - _old_matches_prefix | bool
+              # The new regexp matches neither the template line nor a prefix...
+              - not (_new_matches_prefix | bool)
+              - not (_new_matches_present | bool)
+              # ...only a dedicated single-client line.
+              - _new_matches_dedicated | bool
+              # The skip guard sees the present IP, not its prefix, not a new one.
+              - _skip_present | bool
+              - not (_skip_prefix | bool)
+              - not (_skip_new | bool)
+            fail_msg: |
+              REGRESSION in the di_exports lineinfile matching.
+              old matches prefix: {{ _old_matches_prefix }} (expected true — the defect)
+              new matches prefix: {{ _new_matches_prefix }} / present: {{ _new_matches_present }} (expected false, false)
+              new matches dedicated line: {{ _new_matches_dedicated }} (expected true)
+              skip present/prefix/new: {{ _skip_present }}/{{ _skip_prefix }}/{{ _skip_new }} (expected true/false/false)
+              An unanchored regexp lets lineinfile replace the whole template
+              line with a single-client entry — every other client is gone.
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: regexp anchored to `path IP(` — no prefix match, no template-line match; skip guard exact'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2: export paths fall back to /etc/exports when mount_points is
+    # undefined (the play run on its own).
+    # ========================================================================
+    - name: 'TEST 2: export path fallback parses /etc/exports'
+      block:
+        - name: Parse exactly as di_exports.yml does
+          ansible.builtin.set_fact:
+            _paths: "{{ _exports_content | regex_findall('^(/\\S+)\\s', multiline=True) | unique | list }}"
+
+        - name: 'TEST 2 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _paths == ['/hammerspace/hsvol0', '/hammerspace/hsvol1']
+            fail_msg: "REGRESSION: path fallback parsed {{ _paths }}; comment lines must be skipped and paths deduplicated."
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: export paths recovered from /etc/exports when mount_points is undefined'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3: the shadowed-subnet computation.
+    # ========================================================================
+    - name: 'TEST 3: client_subnets entries after 0.0.0.0/0 are flagged'
+      block:
+        - name: Compute shadowed entries for three configurations
+          ansible.builtin.set_fact:
+            _shadowed_a: >-
+              {{ (_s_a[(_s_a.index('0.0.0.0/0') + 1):] if '0.0.0.0/0' in _s_a else []) | select('search', '/') | list }}
+            _shadowed_b: >-
+              {{ (_s_b[(_s_b.index('0.0.0.0/0') + 1):] if '0.0.0.0/0' in _s_b else []) | select('search', '/') | list }}
+            _shadowed_c: >-
+              {{ (_s_c[(_s_c.index('0.0.0.0/0') + 1):] if '0.0.0.0/0' in _s_c else []) | select('search', '/') | list }}
+          vars:
+            _s_a: ['0.0.0.0/0', '10.200.104.0/24', '10.1.1.5']
+            _s_b: ['10.200.104.0/24', '0.0.0.0/0']
+            _s_c: ['10.200.104.0/24']
+
+        - name: 'TEST 3 ASSERT'
+          ansible.builtin.assert:
+            that:
+              # Subnet after 0.0.0.0/0 -> dead. Single host after it -> fine (different type).
+              - _shadowed_a == ['10.200.104.0/24']
+              # Subnet BEFORE 0.0.0.0/0 is matched first -> nothing shadowed.
+              - _shadowed_b == []
+              # No catch-all at all.
+              - _shadowed_c == []
+            fail_msg: "REGRESSION: shadowed = {{ _shadowed_a }} / {{ _shadowed_b }} / {{ _shadowed_c }}; expected ['10.200.104.0/24'] / [] / []"
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: subnet after 0.0.0.0/0 flagged; single host after it and subnet before it are not'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 4 (audit): structural guarantees across the four files.
+    # ========================================================================
+    - name: 'TEST 4: audit di_exports.yml, nfs_setup, vars/main.yml, hammerspace_integration'
+      block:
+        - name: Read the files
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          loop:
+            - "{{ _repo }}/plays/di_exports.yml"
+            - "{{ _repo }}/roles/nfs_setup/tasks/main.yml"
+            - "{{ _repo }}/vars/main.yml"
+            - "{{ _repo }}/roles/hammerspace_integration/tasks/main.yml"
+            - "{{ _repo }}/VARIABLE_REFERENCE.md"
+          register: _t4_src
+
+        - name: Decode
+          ansible.builtin.set_fact:
+            _di: "{{ _t4_src.results[0].content | b64decode }}"
+            _nfs: "{{ _t4_src.results[1].content | b64decode }}"
+            _vars: "{{ _t4_src.results[2].content | b64decode }}"
+            _hs: "{{ _t4_src.results[3].content | b64decode }}"
+            _ref: "{{ _t4_src.results[4].content | b64decode }}"
+
+        - name: Isolate the end_play gate and the lineinfile task
+          ansible.builtin.set_fact:
+            _di_gate: "{{ _di | regex_search('- name: Skip if(?:.|\\n)*?(?=\\n    - name:)') }}"
+            _di_line: "{{ _di | regex_search('- name: Add DI IPs to /etc/exports(?:.|\\n)*?(?=\\n  handlers:)') }}"
+            _nfs_exportfs: "{{ _nfs | regex_search('- name: Export NFS shares(?:.|\\n)*?(?=\\n- name:)') }}"
+
+        # Built under {% raw %} — a needle containing {{ }} is templated
+        # before assert sees it (2026-09-03 (j) test-authoring trap). YAML
+        # single quotes keep the doubled backslashes the task file uses.
+        - name: 'TEST 4 ASSERT'
+          vars:
+            _di_needle: '{% raw %}regexp: "^{{ item.0 | regex_escape }}\\s+{{ item.1 | regex_escape }}\\("{% endraw %}'
+            _di_bad_needle: '{% raw %}\\s.*{{ item.1{% endraw %}'
+          ansible.builtin.assert:
+            that:
+              # (1) gate on the inventory, not on deploy_di
+              - _di_gate | length > 0
+              - "_di_gate is not search('deploy_di')"
+              - "_di_gate is search(\"groups\\\\['di_nodes'\\\\]\")"
+              - "_di is search('tags: \\\\[di, di-exports, nfs-exports\\\\]')"
+              # (2) anchored regexp + skip guard + hammerspace_nodes excluded
+              - _di_needle in _di_line
+              - _di_bad_needle not in _di_line
+              - "_di_line is search('is not search')"
+              - "_di is search('difference\\\\(hammerspace_nodes')"
+              - "_di is search('regex_findall')"
+              # (3) no example IP shipped in mover_nodes
+              - "_vars is search('^mover_nodes: \\\\[\\\\]', multiline=True)"
+              - "_vars is not search('^mover_nodes:\\\\n  - ', multiline=True)"
+              # (4) exportfs stderr is read and gated
+              - _nfs_exportfs | length > 0
+              - "_nfs_exportfs is search('register: _nfs_exportfs')"
+              - "_nfs_exportfs is search('failed_when: false')"
+              - "_nfs is search('nfs_exportfs_strict \\\\| default\\\\(true\\\\)')"
+              - "_nfs is search('_nfs_exportfs.stderr \\\\| default')"
+              - "_vars is search('^nfs_exportfs_strict: true', multiline=True)"
+              - "_ref is search('nfs_exportfs_strict')"
+              # (5) shadowed-subnet warning + precedence documented
+              - "_nfs is search('shadowed by 0.0.0.0/0')"
+              - "_vars is search('single host')"
+              # (6) multi-NIC registration warning
+              - "_hs is search('hammerspace_node_ip is not defined')"
+              - "_hs is search('ansible_all_ipv4_addresses \\\\| default\\\\(\\\\[\\\\]\\\\)\\\\) \\\\| length > 1')"
+            fail_msg: |
+              REGRESSION in export hardening. Required:
+                di_exports.yml: end_play gated on groups['di_nodes'] (never deploy_di); tags include nfs-exports;
+                  lineinfile regexp `^{{ '{{' }} item.0 | regex_escape {{ '}}' }}\s+{{ '{{' }} item.1 | regex_escape {{ '}}' }}\(`;
+                  skip guard (`is not search`); hammerspace_nodes excluded; regex_findall path fallback
+                vars/main.yml: `mover_nodes: []`; exports(5) precedence note; `nfs_exportfs_strict: true`
+                nfs_setup: exportfs registered + failed_when false; fail gated on nfs_exportfs_strict and stderr;
+                  shadowed-subnet warning
+                hammerspace_integration: multi-NIC warning on ansible_all_ipv4_addresses when hammerspace_node_ip unset
+                VARIABLE_REFERENCE.md documents nfs_exportfs_strict
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: audit — inventory gate, anchored regexp, empty mover_nodes, exportfs stderr gate, shadow warning, multi-NIC warning'] }}"
+      rescue:
+        - name: Record TEST 4 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          NFS EXPORT HARDENING TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

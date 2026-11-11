@@ -1,0 +1,308 @@
+---
+# Regression test: creating a volume group (hammerspace_create_volume_groups).
+#
+# FIELD REPORT (2026-11-05, CycleCloud scheduler, Slurm prolog)
+# -------------------------------------------------------
+#   -e hammerspace_volume_group=tier0-${SLURM_JOB_ID}_${TIMESTAMP}
+#   -e hammerspace_create_volume_groups=true
+# failed at "Fail if the configured volume group does not exist" (HTTP 404).
+# The flag only acted on the hammerspace_volume_groups LIST; it never looked
+# at hammerspace_volume_group, so nothing was created and the join 404'd.
+#
+# Now, with the flag on, the join creates a MISSING group with this run's
+# volumes as its members. Pinned here:
+#
+#   1. The create file itself, run against a mock Anvil: success is verified
+#      by the group being LISTED with a uuid; a rejected POST fails with the
+#      body redacted; an accepted POST whose group never appears fails.
+#      The old file printed "created successfully" for all three.
+#   2. A `block`'s `when` is re-evaluated for every task inside it. The first
+#      version gated the block on `_vgc_status == 404`, and the lookup inside
+#      sets it to 200 — so the success path silently skipped its own
+#      verification. Caught by the mock run, pinned by TEST 1.
+#   3. The join: flag on -> create and join is a no-op; flag off, or the
+#      STRING "false" from `-e ...=false` -> the 404 is still a hard failure.
+#   4. Source audits: every curl in the create file is no_log; no fixed
+#      /tmp header path; place-on waits only for a group created this run.
+#
+# The mock's responses are written for this test. It proves the GATING; it
+# does not prove a real Anvil accepts the POST body (see the mock's header).
+#
+# Usage:
+#   ansible-playbook tests/integration/test_volume_group_create.yml -i localhost, -c local
+
+- name: Volume group create regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _role_tasks: "{{ playbook_dir }}/../../roles/hammerspace_integration/tasks"
+    _create_src: "{{ lookup('file', _role_tasks ~ '/volume_group_create.yml') }}"
+    _join_src: "{{ lookup('file', _role_tasks ~ '/volume_group_join_one.yml') }}"
+    _t0po_src: "{{ lookup('file', _role_tasks ~ '/tier0_place_on_group.yml') }}"
+    _main_src: "{{ lookup('file', _role_tasks ~ '/main.yml') }}"
+    # Comment lines stripped: the files explain the bugs in prose.
+    _create_code: "{{ _create_src.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+    _join_code: "{{ _join_src.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+    _t0po_code: "{{ _t0po_src.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+    _main_code: "{{ _main_src.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+
+    # What the role tasks need to talk to the mock.
+    hammerspace_api_user: admin
+    hammerspace_api_password: "Mock-Passw0rd!"
+    hammerspace_task_queue_throttle: false
+    hammerspace_volume_group_create_wait_retries: 2
+    hammerspace_volume_group_create_wait_delay: 0
+    # base64("admin:Mock-Passw0rd!") — must never appear in a failure message.
+    _cred_b64: "{{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+
+  tasks:
+    # -------------------------------------------------------------- TEST 8
+    # Runs BEFORE the mock cases: TEST 4 set_facts _hs_vg_created_groups,
+    # and a host fact outranks these task vars.
+    # The decision expression, verbatim. Waits only for a group THIS run
+    # created; any other miss is a misconfiguration and fails at once.
+    - name: 'TEST 8: place-on waits only for a group created in this run'
+      vars:
+        hammerspace_volume_group: "{{ item.group }}"
+        _hs_vg_created_groups: "{{ item.created }}"
+        hammerspace_tier0_place_on_objective: "{{ item.override }}"
+        _t0po_wait: >-
+          {{ (hammerspace_volume_group | default('') | trim) in (_hs_vg_created_groups | default([]))
+             and (hammerspace_tier0_place_on_objective | default('')) | length == 0 }}
+        _t0po_expr: '_t0po_wait: >-\s*\n\s*\{\{ \(hammerspace_volume_group \| default\(''''\) \| trim\) in \(_hs_vg_created_groups \| default\(\[\]\)\)\s*\n\s*and \(hammerspace_tier0_place_on_objective \| default\(''''\)\) \| length == 0 \}\}'
+      ansible.builtin.assert:
+        that:
+          - (_t0po_wait | bool) == item.expect
+          - "'_t0po_wait | bool' in _t0po_code"
+          # The source must hold THIS expression, not merely contain it.
+          - _t0po_code is search(_t0po_expr)
+        fail_msg: "{{ item.name }}: wait={{ _t0po_wait }}, expected {{ item.expect }}"
+        quiet: true
+      loop:
+        - {name: "group created this run", group: "tier0-118_x", created: ["tier0-118_x"], override: "", expect: true}
+        - {name: "existing group", group: "vg-tier0", created: [], override: "", expect: false}
+        - {name: "explicit objective", group: "tier0-118_x", created: ["tier0-118_x"], override: "place-on-x", expect: false}
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Pick a free port for the mock Anvil
+      ansible.builtin.command:
+        cmd: python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])"
+      register: _port
+      changed_when: false
+      check_mode: false
+
+    - name: Start the mock Anvil
+      ansible.builtin.shell:
+        cmd: >-
+          nohup python3 {{ (playbook_dir ~ '/mock_anvil_volume_groups.py') | quote }}
+          {{ _port.stdout | trim }} >/dev/null 2>&1 & echo $!
+      register: _mock
+      changed_when: false
+      check_mode: false
+
+    - name: Wait for the mock Anvil
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ _port.stdout | trim | int }}"
+        timeout: 10
+
+    - name: Point the role at the mock
+      ansible.builtin.set_fact:
+        hs_api_url: "http://127.0.0.1:{{ _port.stdout | trim }}/mgmt/v1.2/rest"
+
+    - name: Run the cases, then stop the mock
+      block:
+        # ------------------------------------------------------------ TEST 1
+        - name: 'TEST 1: create, wait for the task, verify the group is listed'
+          ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_create.yml"
+          vars:
+            volume_group_config:
+              name: "tier0-118_2026-11-05-17-06-31"
+              volumes: ["10.1.16.5::/nvme/tier0"]
+
+        - name: 'TEST 1 ASSERT: created, listed, and its members are this run''s volumes'
+          ansible.builtin.assert:
+            that:
+              - _vgc_created | bool
+              - (_vgc_status | int) == 200
+              - _vgc_json.uoid.uuid == 'uuid-tier0-118_2026-11-05-17-06-31'
+              # The join reads membership exactly like this; after a create
+              # it must find every volume and write nothing.
+              - >-
+                (_vgc_json.expressions[0].locations | default([])
+                 | selectattr('storageVolume.name', 'defined')
+                 | map(attribute='storageVolume.name') | list)
+                == ['10.1.16.5::/nvme/tier0']
+              - _vgc_json.expressions[0].operator == 'IN'
+            fail_msg: >-
+              The create path did not end in a verified, listed group
+              (created={{ _vgc_created }}, status={{ _vgc_status }}). If
+              created is false with status 200, the block is gated on a fact
+              the block itself changes — see the comment above the block.
+            quiet: true
+
+        # ------------------------------------------------------------ TEST 2
+        - name: 'TEST 2: a rejected POST fails, with the credential redacted'
+          block:
+            - name: Create a group the mock rejects
+              ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_create.yml"
+              vars:
+                volume_group_config:
+                  name: "tier0-reject"
+                  volumes: ["10.1.16.5::/nvme/tier0"]
+
+            - name: 'TEST 2 FAIL: a rejected create was reported as success'
+              ansible.builtin.fail:
+                msg: The mock returned HTTP 400 and the create did not fail.
+          rescue:
+            - name: 'TEST 2 ASSERT: the rejection is reported, not the password'
+              ansible.builtin.assert:
+                that:
+                  - "'HTTP 400' in ansible_failed_result.msg"
+                  - "'Basic <redacted>' in ansible_failed_result.msg"
+                  - _cred_b64 not in ansible_failed_result.msg
+                  - hammerspace_api_password not in ansible_failed_result.msg
+                  - "'did not fail' not in ansible_failed_result.msg"
+                fail_msg: "{{ ansible_failed_result.msg | default('') }}"
+                quiet: true
+
+        # ------------------------------------------------------------ TEST 3
+        - name: 'TEST 3: an accepted POST whose group never appears fails'
+          block:
+            - name: Create a group the mock never lists
+              ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_create.yml"
+              vars:
+                volume_group_config:
+                  name: "tier0-never"
+                  volumes: ["10.1.16.5::/nvme/tier0"]
+
+            - name: 'TEST 3 FAIL: an unlisted group was reported as created'
+              ansible.builtin.fail:
+                msg: The mock never listed the group and the create did not fail.
+          rescue:
+            - name: 'TEST 3 ASSERT: failed on the listing check'
+              ansible.builtin.assert:
+                that:
+                  - "'still not listed' in ansible_failed_result.msg"
+                fail_msg: "{{ ansible_failed_result.msg | default('') }}"
+                quiet: true
+
+        # ------------------------------------------------------------ TEST 4
+        - name: 'TEST 4: join with the flag on creates the group; the join writes nothing'
+          ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_join_one.yml"
+          vars:
+            hammerspace_create_volume_groups: "true"   # as `-e ...=true` passes it
+            _vgj: {group: "tier0-119_join", volumes: ["10.1.16.6::/nvme/tier0"], hosts: ["10.1.16.6"]}
+
+        - name: 'TEST 4 ASSERT: created, recorded for place-on, nothing to add'
+          ansible.builtin.assert:
+            that:
+              - "'tier0-119_join' in (_hs_vg_created_groups | default([]))"
+              - (_vg_status | int) == 200
+              - _vg_to_add | length == 0
+            fail_msg: >-
+              created_groups={{ _hs_vg_created_groups | default([]) }}
+              status={{ _vg_status }} to_add={{ _vg_to_add | default('?') }}
+            quiet: true
+
+        # ------------------------------------------------------------ TEST 5
+        - name: 'TEST 5: with the flag off — including the STRING "false" — a 404 still fails'
+          block:
+            - name: Join a missing group with hammerspace_create_volume_groups="false"
+              ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_join_one.yml"
+              vars:
+                hammerspace_create_volume_groups: "false"   # truthy without | bool
+                _vgj: {group: "tier0-120_off", volumes: ["10.1.16.7::/nvme/tier0"], hosts: ["10.1.16.7"]}
+
+            - name: 'TEST 5 FAIL: a missing group was created or skipped with the flag off'
+              ansible.builtin.fail:
+                msg: The flag was "false" and the join did not fail on the 404.
+          rescue:
+            - name: 'TEST 5 ASSERT: hard failure, nothing created'
+              ansible.builtin.assert:
+                that:
+                  - "'does not exist' in ansible_failed_result.msg"
+                  - "'tier0-120_off' not in (_hs_vg_created_groups | default([]))"
+                fail_msg: "{{ ansible_failed_result.msg | default('') }}"
+                quiet: true
+
+      always:
+        - name: Stop the mock Anvil
+          ansible.builtin.command:
+            cmd: kill {{ _mock.stdout | trim | int }}
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+    # -------------------------------------------------------------- TEST 6
+    - name: 'TEST 6: source audit of the create path'
+      vars:
+        # One chunk per task, so a no_log on a NEIGHBOURING task cannot count.
+        _curl_chunks: "{{ _create_code.split('- name:') | select('search', 'curl -s') | list }}"
+        _curl_tasks: "{{ _curl_chunks | length }}"
+        _no_log_curls: "{{ _curl_chunks | select('search', 'no_log: true') | list | length }}"
+      ansible.builtin.assert:
+        that:
+          # Every curl carries the password on its command line.
+          - (_curl_tasks | int) == 4
+          - (_no_log_curls | int) == 4
+          - "'/tmp/hs_vg_create_headers' not in _create_code"
+          - "'-d @' in _create_code"
+          - "'not in [200, 201, 202]' in _create_code"
+          - "'not in [200, 404]' in _create_code"
+          - "'still not listed' in _create_code"
+          # Gate decided once, never re-read inside the block.
+          - "'when: _vgc_do_create | bool' in _create_code"
+          - _create_code is not search('block:(?:(?!\\n- name:)[\\s\\S])*?_vgc_status \\| int\\) == 404\\s*\\n\\s*- not ansible_check_mode\\s*\\n\\s*block:')
+          - "'created successfully' not in _create_code"
+          # Temp files are removed BEFORE the hard rejection failure.
+          - >-
+            (_create_code.find('temp files"') | int) >= 0
+          - >-
+            (_create_code.find('temp files"') | int)
+            < (_create_code.find('Fail if creating volume group') | int)
+        fail_msg: >-
+          volume_group_create.yml lost a gate, a no_log, the per-run temp
+          files, or the listing verification ({{ _curl_tasks }} curl tasks,
+          {{ _no_log_curls }} with no_log).
+        quiet: true
+
+    # -------------------------------------------------------------- TEST 7
+    - name: 'TEST 7: the join only creates on a 404 with the flag, as a bool'
+      vars:
+        _gate: >-
+          include_tasks: volume_group_create.yml(?:(?!\n- name:)[\s\S])*?_vg_status \| int\) == 404(?:(?!\n- name:)[\s\S])*?hammerspace_create_volume_groups \| default\(false\) \| bool
+      ansible.builtin.assert:
+        that:
+          - _join_code is search(_gate)
+          - "'-X POST' not in _join_code"
+          - (_join_code | regex_findall('not _vg_would_create') | length) == 2
+          - "'hammerspace_create_volume_groups | default(false) | bool' in _main_code"
+          - _main_code is not search('hammerspace_create_volume_groups \| default\(false\)\s*\n')
+        fail_msg: >-
+          The join's create is not gated on (404 AND flag | bool), the POST
+          moved into the join file, check mode no longer skips both failures,
+          or main.yml reads the flag without | bool.
+        quiet: true
+
+    # -------------------------------------------------------------- TEST 9
+    # The waits are no_log + failed_when: false + until. If an exhausted
+    # `until` failed the task anyway, the failure would be CENSORED and the
+    # reason lost (2026-09-03). Holds on ansible-core 2.14 and 2.20.
+    - name: 'TEST 9: an exhausted until with failed_when false does not fail the play'
+      ansible.builtin.command: echo 404
+      register: _exhausted
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+      until: (_exhausted.stdout | int) == 200
+      retries: 2
+      delay: 0
+
+    - name: PASSED
+      ansible.builtin.debug:
+        msg: "test_volume_group_create PASSED (9 tests)"

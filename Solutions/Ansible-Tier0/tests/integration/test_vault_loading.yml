@@ -1,0 +1,257 @@
+---
+# Regression test for the vault-loading failure mode.
+#
+# Symptom (2026-08-25, Azure CycleCloud controller):
+#   TASK [Validate Hammerspace API configuration]
+#   fatal: [localhost]: FAILED!
+#     assertion: hammerspace_api_password is defined
+#     evaluated_to: false
+#     msg: Hammerspace API configuration missing.
+#          Please set in vars/main.yml: ...
+#   ...on a host whose vars/main.yml was entirely correct.
+#
+# Cause: `vars/main.yml` maps the password to the vault variable —
+#     hammerspace_api_password: "{{ vault_hammerspace_api_password }}"
+# so loading vars/main.yml ALONE leaves the key present but its value
+# referencing an undefined var. `hammerspace_api_password is defined` then
+# evaluates FALSE, and the fail_msg blames vars/main.yml — the one file that
+# is not at fault. `preflight_check.yml` loaded vars/main.yml via vars_files
+# but never included vars/vault.yml; every other API-touching playbook did.
+#
+# This is the same class as the 2026-05-15 plays/ incident, where the split
+# into plays/ broke `{{ playbook_dir }}/vars/vault.yml` resolution and the
+# password went silently undefined.
+#
+# Fix: preflight_check.yml gained the standard pre_tasks include:
+#     - name: Load vault variables (if available)
+#       ansible.builtin.include_vars:
+#         file: "{{ repo_root }}/vars/vault.yml"
+#       failed_when: false
+#
+# TEST 3 is the regression-prevention case: it audits EVERY playbook in the
+# repo, so a new playbook that talks to the API without loading the vault
+# fails here rather than in front of a customer.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_vault_loading.yml \
+#       -i localhost, -c local
+
+- name: Vault-loading regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _repo: "{{ playbook_dir }}/../.."
+
+  tasks:
+    # ========================================================================
+    # TEST 1: the root-cause invariant — a var whose VALUE references an
+    # undefined variable is NOT "defined" as far as `is defined` is concerned.
+    # This is why the error message is so misleading.
+    # ========================================================================
+    - name: 'TEST 1: value referencing an undefined var is not `is defined`'
+      block:
+        - name: Evaluate the guard against an unresolvable value
+          ansible.builtin.set_fact:
+            _r_unresolved: "{{ _pw is defined }}"
+          vars:
+            _pw: "{{ vault_hammerspace_api_password }}"
+
+        - name: Evaluate the guard once the vault var exists
+          ansible.builtin.set_fact:
+            _r_resolved: "{{ _pw is defined }}"
+          vars:
+            vault_hammerspace_api_password: "s3cret"
+            _pw: "{{ vault_hammerspace_api_password }}"
+
+        - name: 'TEST 1 ASSERT: false without the vault var, true with it'
+          ansible.builtin.assert:
+            that:
+              - not (_r_unresolved | bool)
+              - _r_resolved | bool
+            fail_msg: |
+              `x is defined` must be FALSE when x's value references an
+              undefined variable, and TRUE once it resolves.
+              unresolved={{ _r_unresolved }} resolved={{ _r_resolved }}
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: unresolvable value is not `is defined` (root cause)'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 2: vars/main.yml still maps the password to the vault variable.
+    # If this mapping is ever removed the audit in TEST 3 becomes pointless,
+    # so assert the premise explicitly rather than assuming it.
+    # ========================================================================
+    - name: 'TEST 2: vars/main.yml maps the password to the vault var'
+      block:
+        - name: Read vars/main.yml
+          ansible.builtin.slurp:
+            src: "{{ _repo }}/vars/main.yml"
+          register: _main_src
+
+        - name: 'TEST 2 ASSERT: mapping present'
+          ansible.builtin.assert:
+            that:
+              - "'vault_hammerspace_api_password' in (_main_src.content | b64decode)"
+            fail_msg: |
+              vars/main.yml no longer references vault_hammerspace_api_password.
+              If the password is now sourced differently, update this test and
+              the vault-loading audit in TEST 3.
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: vars/main.yml maps password -> vault var'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 3: AUDIT — every playbook that loads vars/main.yml AND references
+    # the API credentials must also load vars/vault.yml. This is the case that
+    # would have caught preflight_check.yml before it shipped.
+    # ========================================================================
+    - name: 'TEST 3: audit — API playbooks all load the vault'
+      block:
+        - name: Enumerate playbooks
+          ansible.builtin.find:
+            paths:
+              - "{{ _repo }}"
+              - "{{ _repo }}/plays"
+            patterns: "*.yml"
+            recurse: false
+          register: _pb_files
+
+        - name: Read every playbook
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          loop: "{{ _pb_files.files }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          register: _pb_src
+
+        # A playbook is in scope when it loads vars/main.yml and touches the
+        # API credentials. Inventories and non-playbook YAML are excluded by
+        # the vars/main.yml condition.
+        # Explicit loop rather than a chained selectattr/zip: the chained
+        # form silently yields a malformed value instead of a list, which
+        # makes the audit look like it failed when it never ran.
+        #
+        # The vault check requires vault.yml to appear near an `include_vars`
+        # or `vars_files` key — NOT merely somewhere in the file. A bare
+        # `'vault.yml' in txt` is a false negative: a playbook that only
+        # MENTIONS vault.yml in a comment or a fail_msg (as this repo's
+        # preflight_check.yml now does) would pass the audit while never
+        # loading it. Caught by negative-testing this test.
+        - name: Find in-scope playbooks missing the vault include
+          ansible.builtin.set_fact:
+            _missing_vault: >-
+              {%- set out = [] -%}
+              {%- for r in _pb_src.results -%}
+                {%- set txt = r.content | b64decode -%}
+                {%- if 'vars/main.yml' in txt
+                       and ('hammerspace_api_password' in txt
+                            or 'hammerspace_api_user' in txt
+                            or 'hs_api_url' in txt)
+                       and not (txt | regex_search('(include_vars|vars_files)[\s\S]{0,160}?vault\.yml')) -%}
+                  {%- if out.append(r.item.path | basename) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ out }}
+
+        - name: 'TEST 3 ASSERT: no playbook talks to the API without the vault'
+          ansible.builtin.assert:
+            that:
+              - _missing_vault | length == 0
+            fail_msg: |
+              These playbooks load vars/main.yml and use the Hammerspace API
+              credentials, but never include vars/vault.yml:
+
+                {{ _missing_vault | join(', ') }}
+
+              hammerspace_api_password will be silently undefined and the
+              "Hammerspace API configuration missing" assert will fire,
+              pointing at vars/main.yml even though it is correct.
+
+              Add to the play:
+                pre_tasks:
+                  - name: Load vault variables (if available)
+                    ansible.builtin.include_vars:
+                      file: "{{ '{{' }} repo_root {{ '}}' }}/vars/vault.yml"
+                    failed_when: false
+                    no_log: true
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: audit — all ' ~ (_pb_src.results | length) ~ ' playbooks load the vault where needed'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 4: preflight_check.yml specifically — it runs on `hosts: localhost`,
+    # so it fails identically no matter which inventory is passed. Assert the
+    # include is present and that it uses repo_root (so the file survives being
+    # moved into plays/, which is exactly what broke this in 2026-05-15).
+    # ========================================================================
+    - name: 'TEST 4: preflight_check.yml loads the vault via repo_root'
+      block:
+        - name: Read preflight_check.yml
+          ansible.builtin.slurp:
+            src: "{{ _repo }}/preflight_check.yml"
+          register: _pf_src
+
+        - name: 'TEST 4 ASSERT: include present, uses repo_root, tolerates absence'
+          ansible.builtin.assert:
+            that:
+              - "'vars/vault.yml' in (_pf_src.content | b64decode)"
+              - "'repo_root' in (_pf_src.content | b64decode)"
+              - "'failed_when: false' in (_pf_src.content | b64decode)"
+            fail_msg: |
+              preflight_check.yml must load vars/vault.yml via
+              {{ '{{' }} repo_root {{ '}}' }} with failed_when: false.
+              Without it, `ansible-playbook preflight_check.yml -i <any>`
+              fails on the localhost play before the inventory is ever used.
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: preflight_check.yml loads vault via repo_root'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          VAULT-LOADING REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

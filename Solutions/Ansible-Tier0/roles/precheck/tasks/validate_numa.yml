@@ -1,0 +1,82 @@
+---
+# NUMA Node Balance Check
+# Validates that storage drives are evenly distributed across NUMA nodes
+# Skipped when hardware RAID mode is active (_precheck_hw_raid)
+
+- name: Gather NUMA node information for NVMe devices
+  ansible.builtin.shell: |
+    for dev in /dev/nvme*n1; do
+      if [ -b "$dev" ]; then
+        name=$(basename "$dev" | sed 's/n1$//')
+        numa=$(cat /sys/class/nvme/$name/device/numa_node 2>/dev/null || echo "-1")
+        echo "$name:$numa"
+      fi
+    done
+  register: numa_info_raw
+  changed_when: false
+  when: storage_type | default('nvme') in ['nvme', 'all']
+
+- name: Gather NUMA node information for SCSI/SATA devices
+  ansible.builtin.shell: |
+    for dev in /sys/block/sd*; do
+      if [ -d "$dev" ]; then
+        name=$(basename "$dev")
+        size=$(cat "$dev/size" 2>/dev/null || echo "0")
+        if [ "$size" != "0" ] && [ -b "/dev/$name" ]; then
+          numa=$(cat "$dev/device/numa_node" 2>/dev/null || echo "-1")
+          echo "$name:$numa"
+        fi
+      fi
+    done
+  register: scsi_numa_info_raw
+  changed_when: false
+  when: storage_type | default('nvme') in ['hdd', 'ssd', 'scsi', 'all']
+
+- name: Combine NUMA info from all device types
+  ansible.builtin.set_fact:
+    combined_numa_info: "{{ (numa_info_raw.stdout_lines | default([])) + (scsi_numa_info_raw.stdout_lines | default([])) }}"
+
+- name: Build NUMA device count
+  ansible.builtin.set_fact:
+    numa_device_counts: {}
+
+- name: Count devices per NUMA node (excluding boot)
+  ansible.builtin.set_fact:
+    numa_device_counts: >-
+      {{
+        numa_device_counts | combine({
+          item.split(':')[1]: (numa_device_counts[item.split(':')[1]] | default(0) | int) + 1
+        })
+      }}
+  loop: "{{ combined_numa_info | default([]) }}"
+  when:
+    - item | length > 0
+    - item.split(':')[0] != (boot_device_check.stdout | trim)
+
+- name: Display NUMA balance status
+  ansible.builtin.debug:
+    msg: |
+      NUMA Node Balance:
+      {% for numa, count in numa_device_counts.items() %}
+        NUMA {{ numa }}: {{ count }} drives
+      {% endfor %}
+
+      {% set counts = numa_device_counts.values() | list %}
+      {% if counts | length > 1 and counts | max != counts | min %}
+      WARNING: NUMA nodes are imbalanced!
+      Max: {{ counts | max }} drives, Min: {{ counts | min }} drives
+      This may impact performance. Consider balancing drives across NUMA nodes.
+      {% else %}
+      NUMA balance: OK ({{ counts | first | default(0) }} drives per node)
+      {% endif %}
+
+- name: Warn on NUMA imbalance
+  ansible.builtin.debug:
+    msg: |
+      WARNING: NUMA node imbalance detected!
+      For optimal performance, each NUMA node should have the same number of drives.
+      Current distribution: {{ numa_device_counts }}
+  when:
+    - numa_device_counts | length > 1
+    - (numa_device_counts.values() | list | max) != (numa_device_counts.values() | list | min)
+    - warn_on_numa_imbalance | default(true)

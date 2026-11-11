@@ -1,0 +1,139 @@
+---
+# Detect disks the playbook must NOT recreate, split into three lists:
+#
+#   _protected_disks  (STRICT) — disks hosting the OS, root, /boot, swap, or
+#                                any SYSTEM mountpoint. Never touched.
+#                                Boot-drive incident driver: empty detection
+#                                used to silently allow mkfs on the boot NVMe.
+#
+#   _md_member_disks  (ADOPT)  — disks that are members of an existing md
+#                                array. NOT excluded from discovery; raid_setup
+#                                detects existing membership and remaps
+#                                mount_points to the actual /dev/mdN instead
+#                                of recreating the array.
+#
+#   _lvm_pv_disks     (INFO)   — disks that back LVM PVs. Informational only;
+#                                PVs that host mounted FS or swap are already
+#                                in _protected_disks via the mount/swap walk.
+#
+# All three come from one pass of files/scan_disks.sh, which resolves mounts
+# through MAJ:MIN + the sysfs topology. See that script's header for why the
+# old `findmnt -o SOURCE` + `[ -b $src ]` approach silently returned empty on
+# hosts whose root SOURCE is not a literal block-device path (/dev/root, btrfs
+# subvolumes, unevaluated UUID= sources) — the 2026-08-26 Azure HBv3 failure.
+#
+# Hard-fails if _protected_disks is empty (defense-in-depth against the
+# 2026-05-14 boot-drive incident).
+
+# check_mode: false is LOAD-BEARING, not an optimisation.
+#
+# command/shell/script do not support check mode, so under `--check` Ansible
+# SKIPS them. A skipped task still registers its variable — as {skipped: true}
+# with no stdout — so `_disk_scan.stdout_lines | default([])` quietly yields []
+# and every classification list comes back empty. The boot-drive gate below
+# then fires on a SIMULATED empty result and aborts the dry run, which is
+# exactly the 2026-08-26 report: `ok=28 changed=4`, all four lists `(none)`,
+# and `/proc/mounts entries: 12` (facts DO gather under --check).
+#
+# This task only reads /sys, /proc, findmnt and pvs — it has no side effects,
+# so running it for real during a dry run is both safe and necessary.
+- name: Scan and classify block devices (protected / md member / LVM PV / root)
+  ansible.builtin.script:
+    cmd: scan_disks.sh
+  register: _disk_scan
+  changed_when: false
+  check_mode: false
+
+- name: Set protected / md-member / LVM facts
+  ansible.builtin.set_fact:
+    _protected_disks: >-
+      {{ _disk_scan.stdout_lines | default([]) | select('match', '^PROTECTED ')
+         | map('regex_replace', '^PROTECTED ', '') | reject('equalto', '') | list }}
+    _md_member_disks: >-
+      {{ _disk_scan.stdout_lines | default([]) | select('match', '^MD ')
+         | map('regex_replace', '^MD ', '') | reject('equalto', '') | list }}
+    _lvm_pv_disks: >-
+      {{ _disk_scan.stdout_lines | default([]) | select('match', '^LVMPV ')
+         | map('regex_replace', '^LVMPV ', '') | reject('equalto', '') | list }}
+    _root_disk_candidates: >-
+      {{ _disk_scan.stdout_lines | default([]) | select('match', '^ROOT ')
+         | map('regex_replace', '^ROOT ', '') | reject('equalto', '') | list }}
+
+- name: Set _detected_boot_device fact (back-compat with downstream filters)
+  ansible.builtin.set_fact:
+    _detected_boot_device: >-
+      {{ _root_disk_candidates[0] | default(_protected_disks[0] | default('')) }}
+
+- name: Display disk classification
+  ansible.builtin.debug:
+    msg: |
+      Disk classification (boot-drive safety):
+        STRICT protected (boot / mounted FS / swap — NEVER touched):
+        {% for d in _protected_disks %}  - /dev/{{ d }}
+        {% else %}  (none — detection returned empty)
+        {% endfor %}
+        Existing md array members (will be ADOPTED, not recreated):
+        {% for d in _md_member_disks %}  - /dev/{{ d }}
+        {% else %}  (none)
+        {% endfor %}
+        LVM PV disks (informational):
+        {% for d in _lvm_pv_disks %}  - /dev/{{ d }}
+        {% else %}  (none)
+        {% endfor %}
+        Primary boot disk: {{ _detected_boot_device | default('UNKNOWN') }}
+
+# Only runs on the failure path. The previous version of this file printed
+# `findmnt root: '{{ _root_disk_raw.stdout }}'`, which was the ALREADY-RESOLVED
+# disk name, not findmnt's output — so an empty list produced a log with no
+# evidence of why. Capture the raw mount/swap topology instead, so the next
+# report is diagnosable from the log alone.
+- name: Collect boot-detection diagnostics (only when detection came back empty)
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -uo pipefail
+      export LC_ALL=C LANG=C
+      echo "--- command -v ---"
+      for c in findmnt lsblk pvs; do
+          printf '%s: %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo MISSING)"
+      done
+      echo "--- findmnt TARGET,SOURCE,MAJ:MIN,FSTYPE ---"
+      findmnt -n -o TARGET,SOURCE,MAJ:MIN,FSTYPE 2>&1 | head -40
+      echo "--- /proc/self/mountinfo (first 40) ---"
+      head -40 /proc/self/mountinfo 2>&1
+      echo "--- /proc/swaps ---"
+      cat /proc/swaps 2>&1
+      echo "--- /sys/class/block ---"
+      ls -1 /sys/class/block 2>&1 | head -40
+      echo "--- lsblk ---"
+      lsblk -nrpo NAME,TYPE,MOUNTPOINT 2>&1 | head -40
+  register: _boot_detect_diag
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: _protected_disks | length == 0
+
+- name: FAIL if no protected disks were detected (refusing to risk the boot drive)
+  ansible.builtin.fail:
+    msg: |
+      Boot / protected-disk detection returned an EMPTY list (no system
+      mountpoint and no swap resolved to a physical disk). Refusing to
+      proceed — running RAID / mkfs without an exclusion list could wipe
+      the OS disk.
+
+      scan_disks.sh stdout:
+      {{ _disk_scan.stdout | default('', true) | trim | default('<empty>', true) }}
+      scan_disks.sh stderr:
+      {{ _disk_scan.stderr | default('', true) | trim | default('<empty>', true) }}
+
+      Host topology at time of failure:
+      {{ _boot_detect_diag.stdout
+         if (_boot_detect_diag.stdout is defined
+             and _boot_detect_diag.stdout | length > 0)
+         else '<diagnostics not collected — the task was skipped>' }}
+
+      If you are intentionally provisioning a diskless / netboot system,
+      set allow_empty_protected_disks: true in vars/main.yml (NOT recommended).
+  when:
+    - _protected_disks | length == 0
+    - not (allow_empty_protected_disks | default(false) | bool)

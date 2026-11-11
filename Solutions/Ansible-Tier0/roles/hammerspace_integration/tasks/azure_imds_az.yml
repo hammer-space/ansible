@@ -1,0 +1,91 @@
+---
+# Azure AZ / fault-domain detection via Instance Metadata Service (IMDS)
+#
+# Azure equivalent of the OCI fault-domain hostvar that inventory.oci.yml
+# supplies. Two distinct placement concepts exist on Azure and IMDS is the
+# only source that exposes both:
+#
+#   zone                 - Availability Zone ("1", "2", "3"). EMPTY STRING on
+#                          non-zonal VMs (availability sets, or a region with
+#                          no zone support). This is the real fault boundary.
+#   platformFaultDomain  - Fault domain within an availability set / VMSS.
+#                          ZERO-BASED ("0", "1", "2"), always present.
+#
+# Mapping (see _cloud_az_detected in vars/main.yml):
+#   zone "2"                -> AZ2      (1-based already, used verbatim)
+#   platformFaultDomain "1" -> AZ2      (0-based, so +1)
+#
+# zone wins when both are present. Falling back to fault domain keeps
+# non-zonal Azure deployments (availability sets) from collapsing every node
+# into hammerspace_default_az.
+#
+# Requires:
+#   - Running on an Azure VM (IMDS is link-local, 169.254.169.254)
+#   - hammerspace_azure_imds_az: true in vars/main.yml
+#
+# Safe to leave enabled on non-Azure hosts: the request is short-timeout and
+# failed_when:false, so a non-Azure node just yields empty facts and the AZ
+# chain falls through to its other sources.
+
+- name: Query Azure IMDS for compute metadata
+  ansible.builtin.uri:
+    url: "http://169.254.169.254/metadata/instance/compute?api-version={{ azure_imds_api_version | default('2021-02-01') }}"
+    headers:
+      Metadata: "true"
+    use_proxy: false
+    return_content: true
+    timeout: "{{ azure_imds_timeout | default(5) }}"
+  register: _azure_imds_raw
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  delegate_to: "{{ inventory_hostname }}"
+
+# NOTE: `X.key | default(Y)` does NOT rescue a MISSING dict key — Ansible
+# raises "'dict object' has no attribute 'key'" at access time and `default`
+# never runs (the 2026-07-21 sunrpc incident). On a failed request the uri
+# module's result has NO `json` key at all, and IMDS payloads vary by API
+# version, so every attribute below is guarded with `is defined` instead.
+- name: Parse Azure IMDS compute metadata
+  ansible.builtin.set_fact:
+    _azure_imds: "{{ _azure_imds_raw.json if _azure_imds_raw.json is defined else {} }}"
+    _azure_imds_status: "{{ _azure_imds_raw.status if _azure_imds_raw.status is defined else 0 }}"
+
+# `zone` is "" (empty string) on non-zonal VMs — NOT absent — so the
+# consumption site tests length, not `is defined`. `platformFaultDomain` is a
+# STRING in the IMDS payload ("0"), hence the explicit int cast there.
+- name: Set Azure AZ facts from IMDS
+  ansible.builtin.set_fact:
+    azure_zone: "{{ (_azure_imds.zone if 'zone' in _azure_imds else '') | string | trim }}"
+    azure_fault_domain: "{{ (_azure_imds.platformFaultDomain if 'platformFaultDomain' in _azure_imds else '') | string | trim }}"
+    azure_location: "{{ (_azure_imds.location if 'location' in _azure_imds else '') | string | trim }}"
+    azure_vm_size: "{{ (_azure_imds.vmSize if 'vmSize' in _azure_imds else '') | string | trim }}"
+    azure_resource_group: "{{ (_azure_imds.resourceGroupName if 'resourceGroupName' in _azure_imds else '') | string | trim }}"
+
+- name: Display Azure IMDS placement
+  ansible.builtin.debug:
+    msg: >-
+      {% if (_azure_imds_status | int) != 200 %}
+      Azure IMDS not reachable (status
+      {{ _azure_imds_status }}) — not an Azure VM, or
+      IMDS blocked. AZ will fall through to the other detection methods.
+      {% else %}
+      Azure {{ azure_location }} / {{ azure_vm_size }} /
+      rg={{ azure_resource_group }} —
+      zone={{ azure_zone if azure_zone | length > 0 else 'none (non-zonal)' }},
+      faultDomain={{ azure_fault_domain if azure_fault_domain | length > 0 else 'n/a' }}
+      → {{ (_cloud_az_detected | default('', true) | trim) | default('no AZ derived', true) }}
+      {% endif %}
+
+- name: Warn when an Azure VM is non-zonal and has no fault domain
+  ansible.builtin.debug:
+    msg: >-
+      Azure IMDS returned neither a zone nor a platform fault domain. Every
+      node will map to hammerspace_default_az
+      ({{ hammerspace_default_az | default('AZ1') }}), which defeats AZ-aware
+      volume placement. Deploy the VMs into availability zones, or set
+      hammerspace_node_az explicitly per host in the inventory.
+  when:
+    - (_azure_imds_status | int) == 200
+    - azure_zone | length == 0
+    - azure_fault_domain | length == 0

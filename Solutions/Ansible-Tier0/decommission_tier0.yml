@@ -1,0 +1,623 @@
+---
+# =============================================================================
+# decommission_tier0.yml
+# Remove Tier 0 nodes and their volumes from Hammerspace — DATA IS NOT TOUCHED
+# =============================================================================
+#
+# Reverses the Hammerspace-side registration performed by site.yml:
+#   1. Find the node's storage volumes via the Hammerspace API
+#   2. Delete the volumes — which also removes them from any volume group
+#   3. Delete the node
+#   4. Verify no volume group still references a deleted volume
+#
+# Deleting a volume removes it from its volume groups, so this playbook does
+# NOT rewrite the groups first. It confirms the cascade happened instead. Set
+# decommission_explicit_volume_group_leave=true to restore the old behaviour
+# of removing memberships with an explicit PUT before the delete.
+#
+# WHAT THIS PLAYBOOK DOES NOT DO — by design:
+#   - it does not unmount anything
+#   - it does not stop NFS, remove exports or edit /etc/fstab
+#   - it does not stop or destroy RAID arrays, wipe superblocks or blkdiscard
+#   - it does not delete the export directory or ANY file on any node
+#   - it does not delete the Azure VM or VMSS instance
+#   - it does not delete volume groups, even ones it empties
+#
+# It never connects to the storage nodes at all: every task is delegated to the
+# controller and talks only to the Hammerspace API. The nodes keep serving
+# their filesystems; they simply stop being registered.
+#
+# For a full host-side teardown (unmount, destroy arrays, wipe drives) use
+# reset-tier0-host.yml instead — that one IS destructive to data, and must not
+# be used on existing-mount deployments where the array belongs to the cloud
+# provider.
+#
+# Usage:
+#   # Preview — always do this first
+#   ansible-playbook decommission_tier0.yml -i inventory.azure_rm.yml \
+#     --limit 'hb120v3*' --check
+#
+#   # Execute
+#   ansible-playbook decommission_tier0.yml -i inventory.azure_rm.yml \
+#     --limit 'hb120v3*' -e decommission_confirm=true
+#
+# The confirmation flag is mandatory. Without it the play stops before making
+# any change.
+
+- name: Decommission Tier 0 nodes from Hammerspace (data preserved)
+  hosts: storage_servers
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    # Mandatory safety flag — must be passed as -e decommission_confirm=true
+    decommission_confirm: false
+
+  pre_tasks:
+    # ------------------------------------------------------------------ #
+    # Resolve the repo root BEFORE anything uses it.
+    #
+    # vars/main.yml defines `repo_root`, but that same file is where each site
+    # sets its own hammerspace_api_host — so operators keep a locally modified
+    # copy and `git pull` does not update it. A fix shipped in vars/main.yml
+    # therefore does not reach a running scheduler: the 2026-09-03 bug
+    # (`repo_root: "{{ playbook_dir }}/.."`, one level too high for a
+    # top-level playbook) kept producing
+    #
+    #   python3: can't open file '.../Ansible-Tier0/../cleanup_instance_nodes.py'
+    #
+    # on the next run, after it had been fixed upstream.
+    #
+    # So the path is probed rather than trusted, and a stale definition is
+    # reported up front instead of failing 28 tasks and four changes later.
+    # ------------------------------------------------------------------ #
+    - name: Locate cleanup_instance_nodes.py
+      ansible.builtin.stat:
+        path: "{{ item }}/cleanup_instance_nodes.py"
+      register: _dc_script_probe
+      loop:
+        - "{{ repo_root }}"
+        - "{{ playbook_dir }}"
+      loop_control:
+        label: "{{ item }}"
+      delegate_to: localhost
+      run_once: true
+      check_mode: false
+
+    - name: Resolve the repository root for this run
+      ansible.builtin.set_fact:
+        _dc_repo_root: >-
+          {{ (_dc_script_probe.results | selectattr('stat.exists')
+              | map(attribute='item') | list | first) | default('', true) }}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fail if the repository layout could not be resolved
+      ansible.builtin.fail:
+        msg: |
+          cleanup_instance_nodes.py was not found under either candidate root:
+
+            repo_root:    {{ repo_root }}
+            playbook_dir: {{ playbook_dir }}
+
+          This playbook must run from a complete checkout of Ansible-Tier0.
+          If the file really is missing, re-clone or
+          `git checkout cleanup_instance_nodes.py`.
+      when: _dc_repo_root | length == 0
+      delegate_to: localhost
+      run_once: true
+
+    - name: Warn that vars/main.yml has a stale repo_root
+      ansible.builtin.debug:
+        msg: |
+          NOTE: vars/main.yml resolves repo_root to
+            {{ repo_root }}
+          but the repository is actually at
+            {{ _dc_repo_root }}
+
+          This run works around it. Every OTHER top-level playbook
+          (preflight_check.yml, reset-tier0-host.yml) still gets the wrong
+          path — and they use it to load vars/vault.yml with
+          `failed_when: false`, so the vault silently loads NOTHING and the
+          API password comes from wherever else it can.
+
+          Fix the local vars/main.yml line to the shipped definition:
+
+            repo_root: "<< (playbook_dir | dirname) if (playbook_dir | basename) == 'plays' else playbook_dir >>"
+
+          (with << >> written as Jinja braces).
+      when: _dc_repo_root != repo_root
+      delegate_to: localhost
+      run_once: true
+
+    - name: Load vault variables (if available)
+      ansible.builtin.include_vars:
+        file: "{{ _dc_repo_root }}/vars/vault.yml"
+      failed_when: false
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Require hammerspace_api_host (set with -e hammerspace_api_host=<anvil-ip>)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: require_api_host
+      tags: [always]
+
+    # Azure Key Vault (opt-in) — overrides vars/vault.yml when set. Must
+    # resolve BEFORE anything authenticates against the Anvil.
+    - name: Retrieve Hammerspace password from Azure Key Vault (optional)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: keyvault_password
+      when: (hammerspace_keyvault_uri | default('')) | length > 0
+
+    - name: Verify Hammerspace API settings are present
+      ansible.builtin.assert:
+        that:
+          - hammerspace_api_host is defined
+          - hammerspace_api_user is defined
+          - hammerspace_api_password is defined
+        fail_msg: |
+          Hammerspace API settings are incomplete. Check vars/main.yml, and
+          that vars/vault.yml defines vault_hammerspace_api_password (or set
+          hammerspace_keyvault_uri, or pass -e hammerspace_api_password=...).
+      delegate_to: localhost
+      run_once: true
+
+  tasks:
+    # Each host contributes BOTH identifiers. The node is matched in
+    # Hammerspace by either, which is what makes `--limit <ip>` work exactly
+    # like it does for deployment.
+    #
+    # This also closes a real gap: the inventory naming scheme can differ
+    # between the deploy run and the decommission run (VMSS instance names
+    # change on every scale-set recreation, and `hostnames:` may be switched to
+    # IPs later). Matching on the registered mgmtIpAddress as well as the name
+    # means decommission still finds the node instead of silently removing
+    # nothing.
+    - name: Resolve the API base URL and this host's identifiers
+      ansible.builtin.set_fact:
+        hs_api_url: "https://{{ hammerspace_api_host }}:{{ hammerspace_api_port | default(8443) }}/mgmt/v1.2/rest"
+        _dc_node_name: "{{ hammerspace_node_name | default(inventory_hostname) }}"
+        # ansible_host is an inventory var, so it is available without facts.
+        # The azure_rm inventory sets it to the private IP.
+        _dc_node_ip: "{{ hammerspace_node_ip | default(ansible_host | default(inventory_hostname)) }}"
+      delegate_to: localhost
+
+    - name: Collect the identifiers being decommissioned
+      ansible.builtin.set_fact:
+        _dc_want_names: >-
+          {{ ansible_play_hosts | map('extract', hostvars, '_dc_node_name')
+             | select('defined') | list | unique | sort }}
+        _dc_want_ips: >-
+          {{ ansible_play_hosts | map('extract', hostvars, '_dc_node_ip')
+             | select('defined') | list | unique | sort }}
+      delegate_to: localhost
+      run_once: true
+
+    - name: List the registered Hammerspace nodes
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "{{ hs_api_url }}/nodes"
+      register: _dc_nodes_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fail if the node list could not be read
+      ansible.builtin.fail:
+        msg: |
+          Could not list nodes from {{ hs_api_url }}.
+          Nothing has been changed. Check API reachability and credentials.
+      when: (_dc_nodes_raw.stdout | default('') | trim) | length == 0
+      delegate_to: localhost
+      run_once: true
+
+    - name: Index the registered nodes by name and by management IP
+      ansible.builtin.set_fact:
+        _dc_reg_names: >-
+          {{ (_dc_nodes_raw.stdout | from_json)
+             | selectattr('name', 'defined') | map(attribute='name') | list }}
+        _dc_reg_ips: >-
+          {{ (_dc_nodes_raw.stdout | from_json)
+             | selectattr('mgmtIpAddress.address', 'defined')
+             | map(attribute='mgmtIpAddress.address') | list }}
+      delegate_to: localhost
+      run_once: true
+
+    # Per-host, so the comparison uses THIS host's identifiers rather than a
+    # cross-host expression that silently mismatches when hammerspace_node_name
+    # differs from inventory_hostname.
+    - name: Decide whether this host is registered
+      ansible.builtin.set_fact:
+        # | bool so the comparison below is a real boolean — under a folded
+        # scalar the string "False" would otherwise be truthy.
+        _dc_matched: >-
+          {{ ((_dc_node_name in _dc_reg_names) or (_dc_node_ip in _dc_reg_ips)) | bool }}
+        _dc_resolved: >-
+          {{ ((_dc_nodes_raw.stdout | from_json)
+              | selectattr('name', 'defined')
+              | selectattr('name', 'equalto', _dc_node_name)
+              | map(attribute='name') | list)
+             + ((_dc_nodes_raw.stdout | from_json)
+                | selectattr('name', 'defined')
+                | selectattr('mgmtIpAddress.address', 'defined')
+                | selectattr('mgmtIpAddress.address', 'equalto', _dc_node_ip)
+                | map(attribute='name') | list) }}
+      delegate_to: localhost
+
+    # The names Hammerspace actually knows — never the inventory's idea of
+    # them. Everything downstream uses these.
+    - name: Collect the resolved node names
+      ansible.builtin.set_fact:
+        _dc_nodes: >-
+          {{ ansible_play_hosts | map('extract', hostvars, '_dc_resolved')
+             | select('defined') | map('list') | sum(start=[]) | unique | sort }}
+        # `extract` is a FILTER, not a test — select('extract', ...) raises
+        # "No test named 'extract'". Go through hostvars and selectattr.
+        _dc_unmatched: >-
+          {{ ansible_play_hosts | map('extract', hostvars)
+             | selectattr('_dc_matched', 'defined')
+             | selectattr('_dc_matched', 'equalto', false)
+             | map(attribute='inventory_hostname') | list }}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fail if any selected host is not registered in Hammerspace
+      ansible.builtin.fail:
+        msg: |
+          {{ _dc_unmatched | length }} of the selected host(s) matched no
+          registered Hammerspace node, by name or by management IP:
+
+          {% for h in _dc_unmatched %}    - {{ h }}
+          {% endfor %}
+
+          Searched names : {{ _dc_want_names | join(', ') }}
+          Searched IPs   : {{ _dc_want_ips | join(', ') }}
+          Matched nodes  : {{ _dc_nodes | join(', ') | default('(none)', true) }}
+
+          Nothing has been changed. Either those nodes are already
+          decommissioned, or the inventory selection does not correspond to what
+          is registered. List what the cluster actually has:
+
+            python3 {{ _dc_repo_root }}/cleanup_instance_nodes.py \
+              --host {{ hammerspace_api_host }} --user {{ hammerspace_api_user }} \
+              --password '<password>' --list-nodes
+      when: _dc_unmatched | length > 0
+      delegate_to: localhost
+      run_once: true
+
+    # ------------------------------------------------------------------ #
+    # Discover what actually exists, before deciding anything
+    # ------------------------------------------------------------------ #
+    # Volumes are looked up from the API rather than derived from
+    # mount_points, so this also catches volumes from earlier runs, from a
+    # different mount layout, or created by hand.
+    - name: List all storage volumes
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "{{ hs_api_url }}/storage-volumes"
+      register: _dc_vols_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fail if the volume list could not be read
+      ansible.builtin.fail:
+        msg: |
+          Could not list storage volumes from {{ hs_api_url }}.
+          Nothing has been changed. Check API reachability and credentials.
+      when: (_dc_vols_raw.stdout | default('') | trim) | length == 0
+      delegate_to: localhost
+      run_once: true
+
+    # Matches the same two ways cleanup_instance_nodes.py does: the
+    # "[AZ:]nodename::path" name convention, and the volume's node reference.
+    - name: Select the volumes belonging to the target nodes
+      ansible.builtin.set_fact:
+        _dc_volumes: >-
+          {{ (_dc_vols_raw.stdout | from_json)
+             | selectattr('name', 'defined')
+             | selectattr('name', 'search', '(^|:)(' ~ (_dc_nodes | join('|')) ~ ')::')
+             | map(attribute='name') | list | unique | sort }}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Show the decommission plan
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          TIER 0 DECOMMISSION PLAN (Hammerspace only)
+          ============================================
+          Anvil            : {{ hammerspace_api_host }}
+          Nodes to remove  : {{ _dc_nodes | join(', ') }}
+          Volumes to remove: {{ _dc_volumes | length }}
+          {% for v in _dc_volumes %}    - {{ v }}
+          {% endfor %}
+
+          Order: remove from volume groups -> delete volumes -> delete nodes
+
+          NOT touched: filesystems, mounts, exports, RAID arrays, the export
+          directory and its contents, and the Azure VMs themselves. Every node
+          keeps serving its data; it just stops being registered.
+          ============================================
+      delegate_to: localhost
+      run_once: true
+
+    - name: Stop if the confirmation flag was not given
+      ansible.builtin.fail:
+        msg: |
+          Refusing to proceed without explicit confirmation.
+
+          Re-run with:
+            -e decommission_confirm=true
+
+          The plan above shows exactly what would be removed from Hammerspace.
+          No data on any node is affected either way.
+      when: not (decommission_confirm | bool)
+      delegate_to: localhost
+      run_once: true
+
+    - name: Report when there is nothing registered to remove
+      ansible.builtin.debug:
+        msg: >-
+          No storage volumes found for {{ _dc_nodes | join(', ') }} — the nodes
+          may already be decommissioned. Node deletion is still attempted below.
+      when: _dc_volumes | length == 0
+      delegate_to: localhost
+      run_once: true
+
+    # ------------------------------------------------------------------ #
+    # 1. Volume group membership.
+    #
+    #    Handled by the delete itself (see below); the explicit PUT path is
+    #    opt-in and the cascade is verified after the delete.
+    # ------------------------------------------------------------------ #
+    - name: Fail if no target node names could be resolved
+      ansible.builtin.fail:
+        msg: |
+          No node names resolved from the inventory selection, so there is
+          nothing to decommission. Check --limit.
+
+          This is a hard stop on purpose: cleanup_instance_nodes.py accepts no
+          filter and then matches NOTHING, so an empty list would report
+          success while doing nothing at all.
+      when: _dc_nodes | length == 0
+      delegate_to: localhost
+      run_once: true
+
+    # Deleting a storage volume removes it from every volume group that holds
+    # it — confirmed against the API on 2026-09-03. The explicit read-modify-
+    # write PUT this used to perform was therefore redundant, and it was also
+    # the fragile step: a PUT has to round-trip the whole group object, which
+    # embeds the expanded volumes, and getting that wrong risks erasing the
+    # group's placement objectives.
+    #
+    # So the default is to let the delete cascade and VERIFY afterwards rather
+    # than to pre-emptively rewrite the groups. The old path is kept behind a
+    # flag for a cluster whose API does not cascade; if the verification below
+    # ever fires, that is the flag to set.
+    - name: Remove the volumes from every volume group that holds them
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: volume_group_leave
+      vars:
+        _vgl_volumes: "{{ _dc_volumes }}"
+      when:
+        - _dc_volumes | length > 0
+        - decommission_explicit_volume_group_leave | default(false) | bool
+
+    # ------------------------------------------------------------------ #
+    # 2 + 3. Delete volumes, then nodes.
+    #
+    # cleanup_instance_nodes.py is reused rather than reimplemented: it already
+    # handles the async task Location header, waits for the volume to actually
+    # disappear, and treats 404 as success for re-runs.
+    # ------------------------------------------------------------------ #
+    - name: Delete the volumes and nodes from Hammerspace
+      # One --node per target, so ONLY these exact nodes can match. --prefix,
+      # --contains and --pattern are deliberately never used: a loose filter
+      # here deletes other people's nodes. Note the script's filter group is
+      # NOT argparse-required, and with no filter it matches nothing — so the
+      # explicit emptiness guard above is what keeps this honest rather than
+      # silently doing nothing.
+      #
+      # The password goes via HAMMERSPACE_PASSWORD, not --password, so it never
+      # appears in the controller's process list.
+      ansible.builtin.command:
+        argv: >-
+          {{ ['python3', _dc_repo_root ~ '/cleanup_instance_nodes.py',
+              '--host', hammerspace_api_host,
+              '--port', (hammerspace_api_port | default(8443)) | string,
+              '--user', hammerspace_api_user,
+              '--yes']
+             + (['--node'] | product(_dc_nodes) | map('list') | flatten | list) }}
+      environment:
+        HAMMERSPACE_PASSWORD: "{{ hammerspace_api_password }}"
+      register: _dc_cleanup
+      changed_when: _dc_cleanup.rc == 0
+      failed_when: false
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+      when: not ansible_check_mode
+
+    - name: Show the cleanup output
+      ansible.builtin.debug:
+        msg: "{{ (_dc_cleanup.stdout | default('')).split('\n') }}"
+      when:
+        - not ansible_check_mode
+        - _dc_cleanup.stdout is defined
+      delegate_to: localhost
+      run_once: true
+
+    # ------------------------------------------------------------------ #
+    # 4. Verify the cascade. The whole point of the old pre-emptive PUT was
+    #    that no volume group should be left referencing a volume that no
+    #    longer exists. Relying on the delete to do it is fine; relying on it
+    #    WITHOUT CHECKING is not, so the safety property is now verified
+    #    rather than assumed.
+    #
+    #    Skipped under --check: nothing was deleted, so every volume is still
+    #    a member and the check would fail on a simulation.
+    # ------------------------------------------------------------------ #
+    - name: Verify no volume group still references a deleted volume
+      when:
+        - not ansible_check_mode
+        - _dc_volumes | length > 0
+        # Only meaningful if the deletion actually ran. cleanup_instance_nodes.py
+        # carries failed_when: false so its own failure is reported by the task
+        # AFTER this one; without this guard a delete that never happened (rc 2,
+        # script not found) leaves every volume in its group and this block
+        # concludes "this cluster's API does not cascade" — a wrong diagnosis
+        # from a run where nothing was deleted at all.
+        - (_dc_cleanup.rc | default(1)) == 0
+      delegate_to: localhost
+      run_once: true
+      become: false
+      block:
+        - name: Re-read every volume group
+          ansible.builtin.shell:
+            cmd: >-
+              curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+              {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+              -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+              "{{ hs_api_url }}/volume-groups"
+          register: _dc_vg_raw
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: Parse the volume group list
+          ansible.builtin.set_fact:
+            _dc_vg_status: "{{ (_dc_vg_raw.stdout_lines | default(['0']))[-1] | default('0') }}"
+            _dc_vg_all: >-
+              {{ ((_dc_vg_raw.stdout_lines | default(['[]']))[:-1]
+                  | join('\n') | trim | default('[]', true)) | from_json }}
+
+        - name: Warn if the volume groups could not be re-read
+          ansible.builtin.debug:
+            msg: >-
+              Could not re-read volume groups (HTTP {{ _dc_vg_status }}), so the
+              cascade was not verified. The volumes and nodes ARE deleted. Check
+              group membership by hand:
+              curl -sk -u '{{ hammerspace_api_user }}:<password>'
+              '{{ hs_api_url }}/volume-groups' | jq -r '.[].name'
+          when: _dc_vg_status | int != 200
+
+        # Collected as {group, volumes} dicts and formatted in the message.
+        # An earlier version built the strings with
+        # map('regex_replace', '^(.*)$', name ~ ' still holds \\1') and the
+        # backreference never substituted — the warning printed a literal
+        # "vg-tier0 still holds \\1". Don't reach for regex_replace to
+        # concatenate.
+        - name: Collect any remaining references to the deleted volumes
+          ansible.builtin.set_fact:
+            _dc_dangling: >-
+              {{ (_dc_dangling | default([])) + ([{
+                   'group': item.name | default('?'),
+                   'volumes': _dc_hits
+                 }] if (_dc_hits | length > 0) else []) }}
+          vars:
+            _dc_hits: >-
+              {{ (item.expressions[0].locations | default([]))
+                 | selectattr('storageVolume.name', 'defined')
+                 | selectattr('storageVolume.name', 'in', _dc_volumes)
+                 | map(attribute='storageVolume.name') | list }}
+          loop: "{{ _dc_vg_all | selectattr('expressions', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.name | default('?') }}"
+          when: _dc_vg_status | int == 200
+
+        - name: Report the volume groups are clean
+          ansible.builtin.debug:
+            msg: >-
+              Verified: no volume group references any of the
+              {{ _dc_volumes | length }} deleted volume(s). The delete removed
+              the memberships.
+          when:
+            - _dc_vg_status | int == 200
+            - (_dc_dangling | default([])) | length == 0
+
+        # Not fatal: the volumes and nodes are already gone, so failing here
+        # would just make a completed decommission look unfinished. It is loud
+        # instead, and names the flag that restores the explicit removal.
+        - name: Warn if any volume group kept a reference
+          ansible.builtin.debug:
+            msg: |
+              WARNING: {{ _dc_dangling | map(attribute='volumes') | map('length') | sum }}
+              volume group reference(s) survived the delete:
+              {% for d in _dc_dangling %}
+                {{ d.group }}
+              {% for v in d.volumes %}    - {{ v }}
+              {% endfor %}
+              {% endfor %}
+              The volumes and nodes ARE deleted; only the group membership is
+              stale, so this run did its job. But the delete did not cascade
+              here, which it normally does — a volume in more than one group is
+              the case to check first.
+
+              Re-run future decommissions with:
+
+                -e decommission_explicit_volume_group_leave=true
+
+              To clear the stale entries now, run the same flag against the
+              already-deleted volumes, or remove them in the UI.
+          when: (_dc_dangling | default([])) | length > 0
+
+    - name: Fail if volume or node deletion reported an error
+      ansible.builtin.fail:
+        msg: |
+          cleanup_instance_nodes.py exited {{ _dc_cleanup.rc }}.
+
+          Volume group membership has already been updated, so re-running is
+          safe — the group step is idempotent and the deletion step treats an
+          already-deleted volume or node as success.
+
+          stderr:
+          {{ _dc_cleanup.stderr | default('(none)') }}
+      when:
+        - not ansible_check_mode
+        - _dc_cleanup.rc | default(0) != 0
+      delegate_to: localhost
+      run_once: true
+
+  post_tasks:
+    - name: Decommission summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          DECOMMISSION COMPLETE (Hammerspace only)
+          ============================================
+          Nodes removed   : {{ _dc_nodes | join(', ') }}
+          Volumes removed : {{ _dc_volumes | length }}
+
+          Untouched, as intended:
+            - every filesystem and mount on every node
+            - the export directory and all of its contents
+            - RAID arrays, /etc/fstab, NFS exports
+            - the Azure VMs / VMSS instances
+            - all volume groups (emptied ones were kept)
+
+          To re-register these nodes later, re-run site.yml.
+          ============================================
+      delegate_to: localhost
+      run_once: true
+      when: decommission_confirm | bool

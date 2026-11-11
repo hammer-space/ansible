@@ -1,0 +1,214 @@
+---
+# Precheck role - Validate OS, network, and existing state
+
+- name: Display target host information
+  ansible.builtin.debug:
+    msg: |
+      Host: {{ inventory_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      OS Family: {{ ansible_os_family }}
+      Architecture: {{ ansible_architecture }}
+
+- name: Validate OS family is supported
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family in ['RedHat', 'Debian']
+    fail_msg: >-
+      Unsupported OS family '{{ ansible_os_family }}'.
+      DI RPM installation supports RedHat (el8/el9) and Debian/Ubuntu.
+
+- name: Validate architecture is supported (x86_64 or aarch64)
+  ansible.builtin.assert:
+    that:
+      - ansible_architecture in ['x86_64', 'aarch64']
+    fail_msg: >-
+      Unsupported architecture '{{ ansible_architecture }}'.
+      DI RPM is available for x86_64 and aarch64.
+
+- name: Set DI node name
+  ansible.builtin.set_fact:
+    _di_node_name: "{{ di_node_name | default(inventory_hostname) }}"
+
+- name: Set DI node IP
+  ansible.builtin.set_fact:
+    _di_node_ip: "{{ di_node_ip | default(ansible_default_ipv4.address) }}"
+
+- name: Detect AZ for this DI node
+  ansible.builtin.set_fact:
+    _di_node_az: >-
+      {%- if di_node_az is defined -%}
+        {{ di_node_az }}
+      {%- elif group_names | default([]) | select('match', '^AZ[0-9]+$') | list | length > 0 -%}
+        {{ (group_names | default([]) | select('match', '^AZ[0-9]+$') | list)[0] }}
+      {%- else -%}
+        unassigned
+      {%- endif -%}
+
+- name: Display node configuration
+  ansible.builtin.debug:
+    msg: |
+      DI Node Name: {{ _di_node_name }}
+      DI Node IP: {{ _di_node_ip }}
+      DI Node AZ: {{ _di_node_az }}
+      Cluster Mgmt IP: {{ hammerspace_cluster_mgmt_ip }}
+
+# -------------------------------------------------------------------------
+# AZ distribution check (runs once across all di_nodes)
+# Collects AZs from all DI hosts and validates minimum spread.
+# -------------------------------------------------------------------------
+
+- name: Collect AZ assignments across all DI nodes
+  ansible.builtin.set_fact:
+    _all_di_azs: >-
+      {{ groups['di_nodes'] | default([])
+         | map('extract', hostvars, '_di_node_az')
+         | select('defined')
+         | reject('equalto', 'unassigned')
+         | list }}
+  run_once: true
+
+- name: Calculate unique AZ count
+  ansible.builtin.set_fact:
+    _di_unique_azs: "{{ _all_di_azs | unique | sort }}"
+    _di_unassigned_count: >-
+      {{ groups['di_nodes'] | default([])
+         | map('extract', hostvars, '_di_node_az')
+         | select('defined')
+         | select('equalto', 'unassigned')
+         | list | length }}
+  run_once: true
+
+- name: Display DI AZ distribution
+  ansible.builtin.debug:
+    msg: |
+      DI AZ Distribution:
+        Total DI nodes: {{ groups['di_nodes'] | default([]) | length }}
+        Unique AZs: {{ _di_unique_azs | length }} — {{ _di_unique_azs | join(', ') }}
+        Nodes without AZ: {{ _di_unassigned_count }}
+      Minimum required AZs: {{ di_min_az_count | default(1) }}
+  run_once: true
+
+- name: Warn if DI nodes have no AZ assignment
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _di_unassigned_count }} DI node(s) have no AZ assignment.
+      Add them to AZ groups (AZ1, AZ2, ...) in inventory for proper distribution.
+  when:
+    - _di_unassigned_count | int > 0
+    - di_min_az_count | default(1) | int > 1
+  run_once: true
+
+- name: Fail if DI nodes are not spread across enough AZs
+  ansible.builtin.fail:
+    msg: >-
+      DI nodes are only in {{ _di_unique_azs | length }} AZ(s) ({{ _di_unique_azs | join(', ') }})
+      but di_min_az_count requires {{ di_min_az_count }}.
+      Distribute DI nodes across more AZ groups in your inventory.
+  when:
+    - di_enforce_az_distribution | default(false) | bool
+    - _di_unique_azs | length < (di_min_az_count | default(1) | int)
+  run_once: true
+
+- name: Warn if DI AZ count is below recommendation
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: DI nodes are in {{ _di_unique_azs | length }} AZ(s) but
+      di_min_az_count recommends {{ di_min_az_count }}.
+      Consider spreading DI nodes across more AZs for redundancy.
+  when:
+    - not (di_enforce_az_distribution | default(false) | bool)
+    - di_min_az_count | default(1) | int > 1
+    - _di_unique_azs | length < (di_min_az_count | default(1) | int)
+  run_once: true
+
+- name: Check network connectivity to Hammerspace cluster
+  ansible.builtin.command:
+    cmd: "ping -c 2 -W 5 {{ hammerspace_cluster_mgmt_ip }}"
+  register: ping_result
+  changed_when: false
+  failed_when: false
+
+- name: Warn if cluster is unreachable
+  ansible.builtin.debug:
+    msg: "WARNING: Cannot ping Hammerspace cluster at {{ hammerspace_cluster_mgmt_ip }}. Deployment may fail during registration."
+  when: ping_result.rc != 0
+
+- name: Check if pd-di is already installed
+  ansible.builtin.command:
+    cmd: rpm -q pd-di
+  register: pddi_installed
+  changed_when: false
+  failed_when: false
+  when: ansible_os_family == 'RedHat'
+
+- name: Check if pd-di is already installed (Debian)
+  ansible.builtin.command:
+    cmd: dpkg -l pd-di
+  register: pddi_installed_deb
+  changed_when: false
+  failed_when: false
+  when: ansible_os_family == 'Debian'
+
+- name: Set pd-di installation state
+  ansible.builtin.set_fact:
+    _pddi_already_installed: >-
+      {{ (pddi_installed.rc | default(1) == 0) or (pddi_installed_deb.rc | default(1) == 0) }}
+
+- name: Display pd-di installation status
+  ansible.builtin.debug:
+    msg: "pd-di is {{ 'already installed' if _pddi_already_installed | bool else 'not yet installed' }}"
+
+- name: Check if pd-di service is running
+  ansible.builtin.systemd:
+    name: pd-di
+  register: pddi_service
+  failed_when: false
+
+- name: Display pd-di service status
+  ansible.builtin.debug:
+    msg: "pd-di service: {{ pddi_service.status.ActiveState | default('not found') }}"
+  when: pddi_service.status is defined
+
+# -------------------------------------------------------------------------
+# Kubernetes-mode precheck (controller-side).
+# Validates kubeconfig is readable, kubectl is on PATH, and the operator
+# has namespace-create rights.
+# -------------------------------------------------------------------------
+
+- name: Kubernetes precheck
+  when: di_deployment_type | default('host') == 'kubernetes'
+  delegate_to: localhost
+  become: false
+  run_once: true
+  block:
+    - name: Check kubeconfig exists
+      ansible.builtin.stat:
+        path: "{{ di_k8s_kubeconfig }}"
+      register: _di_k8s_kubeconfig_stat
+
+    - name: Fail if kubeconfig missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ di_k8s_kubeconfig }}. Set di_k8s_kubeconfig or KUBECONFIG env."
+      when: not _di_k8s_kubeconfig_stat.stat.exists
+
+    - name: Probe kubectl
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig {{ di_k8s_kubeconfig }} version --client=true -o json
+      register: _di_k8s_kubectl_probe
+      changed_when: false
+      failed_when: _di_k8s_kubectl_probe.rc != 0
+
+    - name: Probe namespace-create permission
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig {{ di_k8s_kubeconfig }} auth can-i create namespaces
+      register: _di_k8s_perm_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if namespace-create permission denied
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: kubectl auth can-i create namespaces returned
+          '{{ _di_k8s_perm_probe.stdout | trim }}'. Namespace must already exist
+          OR your kubeconfig needs broader rights.
+      when: (_di_k8s_perm_probe.stdout | trim) != 'yes'

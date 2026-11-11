@@ -1,0 +1,131 @@
+---
+# Provide the pd-di container image (build on target OR load prebuilt),
+# run it, register the node from inside.
+# Assumes container_runtime role has already installed the chosen runtime.
+
+# ---------------------------------------------------------------------------
+# Provide image: build on target, or load tarball / pull from registry.
+# Selected by di_image_source (build | url | local | registry).
+# ---------------------------------------------------------------------------
+
+- name: "Provide pd-di image (di_image_source={{ di_image_source | default('build') }})"
+  ansible.builtin.include_tasks:
+    file: "image_{{ 'build' if (di_image_source | default('build')) == 'build' else 'load' }}.yml"
+
+# ---------------------------------------------------------------------------
+# Run container
+# ---------------------------------------------------------------------------
+
+- name: Stop any existing pd-di container
+  ansible.builtin.command:
+    cmd: "{{ di_container_runtime }} rm -f {{ di_container_name }}"
+  register: rm_result
+  changed_when: rm_result.rc == 0
+  failed_when: false
+
+- name: "Start {{ di_container_name }} container"
+  ansible.builtin.command:
+    cmd: >-
+      {{ di_container_runtime }} run -d
+      --name {{ di_container_name }}
+      {{ di_container_systemd_flag }}
+      {{ '--privileged' if di_container_privileged | bool else '' }}
+      {{ '--network host' if di_container_host_network | bool else '' }}
+      {{ '--memory ' ~ di_container_memory if di_container_memory | default('') | length > 0 else '' }}
+      {{ '--cpus ' ~ di_container_cpus if di_container_cpus | default('') | length > 0 else '' }}
+      --restart {{ di_container_restart_policy }}
+      --cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add SYS_PTRACE
+      --tmpfs /run --tmpfs /tmp
+      -v /sys/fs/cgroup:/sys/fs/cgroup:rw
+      -v /lib/modules:/lib/modules:ro
+      --add-host {{ hammerspace_cluster_hostname }}:{{ hammerspace_cluster_mgmt_ip }}
+      {{ di_container_image }}
+  register: run_result
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# Register node, then start pd-di.
+#
+# Ordering note: pd-di requires /opt/pd/di (its DATA_MOVER UUID file) to exist
+# before it can start. add_node.py creates that file as a side effect. So we
+# register first, then enable+start pd-di. The Containerfile intentionally
+# does NOT enable pd-di at image build time to avoid a 12-retry restart loop
+# on a fresh container.
+# ---------------------------------------------------------------------------
+
+- name: Patch add_node.py POST to use ignoreIpConflicts (for co-located Tier 0 + DI)
+  ansible.builtin.command:
+    cmd: >-
+      {{ di_container_runtime }} exec {{ di_container_name }}
+      sed -i "/def post/,/def [a-z]/s|endpoint='nodes'|endpoint='nodes?ignoreIpConflicts=true'|"
+      /usr/local/bin/add_node.py
+  changed_when: true
+  failed_when: false
+  when:
+    - di_ignore_ip_conflicts | default(true) | bool
+    - not (node_already_registered | default(false) | bool)
+
+- name: Register DI node with Hammerspace (via add_node.py inside container)
+  ansible.builtin.command:
+    cmd: >-
+      {{ di_container_runtime }} exec {{ di_container_name }}
+      python3 /usr/local/bin/add_node.py
+      -i {{ di_node_ip | default(ansible_default_ipv4.address) }}
+      -l {{ di_node_netmask_prefix }}
+      -d
+      -u {{ hammerspace_api_user }}
+      -p {{ hammerspace_api_password }}
+      -n {{ di_node_name | default(inventory_hostname) }}
+  register: register_result
+  no_log: true
+  changed_when: register_result.rc == 0
+  failed_when: false
+  when: not (node_already_registered | default(false) | bool)
+
+- name: Enable and start pd-di inside the container
+  ansible.builtin.command:
+    cmd: "{{ di_container_runtime }} exec {{ di_container_name }} systemctl enable --now pd-di"
+  register: pddi_enable
+  changed_when: true
+  failed_when: false
+
+- name: Wait for pd-di to be active inside the container
+  ansible.builtin.command:
+    cmd: "{{ di_container_runtime }} exec {{ di_container_name }} systemctl is-active pd-di"
+  register: pddi_active
+  retries: 12
+  delay: 5
+  until: pddi_active.stdout == 'active'
+  changed_when: false
+  failed_when: false
+
+- name: Warn if pd-di did not become active
+  ansible.builtin.debug:
+    msg: >-
+      pd-di inside {{ di_container_name }} is '{{ pddi_active.stdout | default('unknown') }}'.
+      Check '{{ di_container_runtime }} logs {{ di_container_name }}' and
+      '{{ di_container_runtime }} exec {{ di_container_name }} journalctl -xeu pd-di'.
+  when: pddi_active.stdout | default('') != 'active'
+
+# Surface add_node.py errors without exposing the full command line (which
+# contains the API password). stderr/stdout from the script itself is safe.
+- name: Show registration failure detail (sanitized)
+  ansible.builtin.debug:
+    msg: |-
+      add_node.py registration failed for {{ di_node_name | default(inventory_hostname) }}:
+        stderr: {{ register_result.stderr | default('(none)') }}
+        stdout: {{ register_result.stdout | default('(none)') }}
+  when:
+    - not (node_already_registered | default(false) | bool)
+    - register_result.rc | default(0) != 0
+    - "'already exists' not in (register_result.stderr | default(''))"
+
+- name: Fail if registration failed
+  ansible.builtin.fail:
+    msg: >-
+      DI node registration failed for {{ di_node_name | default(inventory_hostname) }}
+      (rc={{ register_result.rc | default('?') }}). See prior debug for sanitized output.
+  when:
+    - not (node_already_registered | default(false) | bool)
+    - register_result.rc | default(0) != 0
+    - "'already exists' not in (register_result.stderr | default(''))"

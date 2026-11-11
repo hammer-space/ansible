@@ -1,0 +1,23 @@
+---
+# Main playbook for Hammerspace Tier 0 / LSS deployment.
+# Based on Hammerspace Tier 0 Deployment Guide v1.0
+#
+# Usage:
+#   ansible-playbook -i inventory.yml site.yml
+#   ansible-playbook -i inventory.yml site.yml --tags raid,storage
+#   ansible-playbook -i inventory.yml site.yml --tags di -e deploy_di=true
+#
+# Composition (each file is a single Ansible play):
+#   plays/storage.yml            - RAID, filesystems, NFS, firewall, HS integration
+#                                  (runs on storage_servers)
+#   plays/hammerspace_serial.yml - Serialized HS integration when
+#                                  hammerspace_serial > 0 (no-op otherwise)
+#   plays/di_exports.yml         - Auto-wire DI node IPs into Tier 0 NFS exports
+#                                  (no-op unless deploy_di + di_auto_export)
+#   plays/di.yml                 - Deploy pd-di on di_nodes
+#                                  (no-op unless deploy_di=true)
+
+- import_playbook: plays/storage.yml
+- import_playbook: plays/hammerspace_serial.yml
+- import_playbook: plays/di_exports.yml
+- import_playbook: plays/di.yml

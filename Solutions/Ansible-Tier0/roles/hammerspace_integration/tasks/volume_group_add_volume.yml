@@ -1,0 +1,172 @@
+---
+# Add a volume to an existing volume group
+# Called from main.yml after volumes are added
+# Uses the volume group's existing configuration and appends the new volume
+
+- name: "Get existing volume group {{ volume_group_update.group_name }}"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      "{{ hs_api_url }}/volume-groups/{{ volume_group_update.group_name | urlencode }}"
+  register: vg_existing_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Parse existing volume group result"
+  ansible.builtin.set_fact:
+    vg_existing_check:
+      status: "{{ (vg_existing_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((vg_existing_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+
+- name: "Skip if volume group {{ volume_group_update.group_name }} does not exist"
+  ansible.builtin.debug:
+    msg: "Volume group '{{ volume_group_update.group_name }}' not found - skipping"
+  when: vg_existing_check.status | int == 404
+
+- name: "Add volume to volume group {{ volume_group_update.group_name }}"
+  when: vg_existing_check.status | int == 200
+  block:
+    - name: "Wait for task queue before updating volume group {{ volume_group_update.group_name }}"
+      ansible.builtin.include_tasks: task_queue_wait.yml
+      when: hammerspace_task_queue_throttle | default(true)
+
+    - name: "Build updated volume group payload"
+      ansible.builtin.set_fact:
+        _vg_existing_locations: "{{ vg_existing_check.json.expressions[0].locations | default([]) }}"
+        _vg_new_volume_location:
+          _type: "VOLUME_LOCATION"
+          extendedInfo: {}
+          storageVolume:
+            _type: "STORAGE_VOLUME"
+            extendedInfo: {}
+            name: "{{ volume_group_update.volume_name }}"
+
+    - name: "Check if volume {{ volume_group_update.volume_name }} already in group"
+      ansible.builtin.set_fact:
+        # 'defined' first: an entry that names no storage volume raises
+        # "'dict object' has no attribute 'storageVolume'" otherwise.
+        _volume_already_in_group: >-
+          {{ _vg_existing_locations
+             | selectattr('storageVolume.name', 'defined')
+             | selectattr('storageVolume.name', 'equalto', volume_group_update.volume_name)
+             | list | length > 0 }}
+
+    - name: "Skip volume group update (volume already in group)"
+      ansible.builtin.debug:
+        msg: "Volume '{{ volume_group_update.volume_name }}' already in volume group '{{ volume_group_update.group_name }}'"
+      when: _volume_already_in_group
+
+    # PUT targets the UUID, as every other write in this role does. A GET by
+    # name works, which is why the read half looked correct while the write
+    # returned HTTP 400.
+    - name: "Resolve the volume group UUID"
+      ansible.builtin.set_fact:
+        _vg_add_uuid: "{{ vg_existing_check.json.uoid.uuid | default('') }}"
+
+    - name: "Fail if the volume group has no UUID"
+      ansible.builtin.fail:
+        msg: |
+          Volume group '{{ volume_group_update.group_name }}' was returned
+          without a uoid.uuid, so there is no identifier to PUT to.
+
+          Response keys: {{ vg_existing_check.json.keys() | list }}
+      when:
+        - not _volume_already_in_group
+        - _vg_add_uuid | length == 0
+
+    # The payload is the fetched object with only the locations replaced. A PUT
+    # replaces the resource, so a hand-built three-key body drops uoid,
+    # internalId and any placement objectives the group carries.
+    - name: "Build volume group update payload"
+      ansible.builtin.set_fact:
+        _vg_update_payload: >-
+          {{ vg_existing_check.json | combine({'expressions':
+               [ _vg_add_expr0 | combine({'operator': 'IN',
+                   'locations': _vg_existing_locations + [_vg_new_volume_location]}) ]
+             }) }}
+      vars:
+        _vg_add_expr0: >-
+          {{ (vg_existing_check.json.expressions | default([])) | first
+             | default({'_type': 'EXPRESSION'}, true) }}
+      when: not _volume_already_in_group
+
+    # Payload in a FILE, not on the command line: it round-trips the whole
+    # fetched volume group object, so inlining it puts tens of kilobytes of
+    # arbitrary API-controlled text inside shell single quotes. One apostrophe
+    # ends the quoting and curl never runs, which surfaces as "HTTP 0" with an
+    # empty body because -w always emits a code when curl does run.
+    - name: "Create the volume group payload file"
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .json
+      register: _vg_add_payload_file
+      when:
+        - not _volume_already_in_group
+        - not ansible_check_mode
+
+    - name: "Populate the volume group payload file"
+      ansible.builtin.copy:
+        content: "{{ _vg_update_payload | to_json }}"
+        dest: "{{ _vg_add_payload_file.path }}"
+        mode: "0600"
+      when:
+        - not _volume_already_in_group
+        - not ansible_check_mode
+
+    - name: "Update volume group {{ volume_group_update.group_name }} with new volume"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          -X PUT -H "Content-Type: application/json"
+          -d @{{ _vg_add_payload_file.path | quote }}
+          "{{ hs_api_url }}/volume-groups/{{ _vg_add_uuid | urlencode }}"
+      register: vg_update_result
+      changed_when: true
+      failed_when: false
+      no_log: true
+      when:
+        - not _volume_already_in_group
+        - not ansible_check_mode
+
+    - name: "Remove the volume group payload file"
+      ansible.builtin.file:
+        path: "{{ _vg_add_payload_file.path }}"
+        state: absent
+      when:
+        - not _volume_already_in_group
+        - not ansible_check_mode
+        - _vg_add_payload_file.path is defined
+
+    # The result used to go unchecked: the status line was never read, so a
+    # rejected PUT still reported "added to volume group" below and the volume
+    # was quietly left out of the group.
+    - name: "Fail if the volume group update was rejected"
+      ansible.builtin.fail:
+        msg: |
+          Adding volume '{{ volume_group_update.volume_name }}' to volume group
+          '{{ volume_group_update.group_name }}' failed with HTTP
+          {{ (vg_update_result.stdout_lines | default(['0']))[-1] | default('0') }}
+          (curl exit {{ vg_update_result.rc | default('?') }}).
+
+          PUT {{ hs_api_url }}/volume-groups/{{ _vg_add_uuid }}
+
+          The API said:
+            {{ (vg_update_result.stdout_lines | default([]))[:-1] | join('\n  ') | trim | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+
+          The volume itself is registered; only its group membership failed.
+      when:
+        - not _volume_already_in_group
+        - not ansible_check_mode
+        - ((vg_update_result.stdout_lines | default(['0']))[-1] | default('0') | int) not in [200, 201, 202]
+
+    - name: "Display volume group update status"
+      ansible.builtin.debug:
+        msg: >-
+          Volume '{{ volume_group_update.volume_name }}'
+          {% if _volume_already_in_group %}already in{% else %}added to{% endif %}
+          volume group '{{ volume_group_update.group_name }}'

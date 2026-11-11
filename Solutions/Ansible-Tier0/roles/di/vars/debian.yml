@@ -1,0 +1,13 @@
+---
+# Debian/Ubuntu specific variables
+
+# OS packages for DI dependencies
+di_os_packages:
+  - lttng-tools
+  - liblttng-ust-dev
+  - libjemalloc-dev
+  - babeltrace2
+  - python3-pip
+
+# Package extension for DI install
+di_pkg_extension: "deb"

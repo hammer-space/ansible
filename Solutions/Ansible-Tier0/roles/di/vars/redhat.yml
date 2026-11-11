@@ -1,0 +1,13 @@
+---
+# RedHat/Rocky/CentOS specific variables
+
+# OS packages for DI dependencies
+di_os_packages:
+  - platform-python
+  - lttng-tools
+  - lttng-ust
+  - jemalloc
+  - pip
+
+# Package extension for DI install
+di_pkg_extension: "rpm"

@@ -1,0 +1,384 @@
+---
+# Append this run's volumes to ONE already-existing volume group — or, when
+# hammerspace_create_volume_groups is true and the group does not exist,
+# create it with this run's volumes as its members (see below).
+#
+# Called only from volume_group_join.yml, once per distinct group, with:
+#   _vgj.group   - the volume group name
+#   _vgj.volumes - the volume names to append to it
+#
+# Every guarantee of the single-group version is preserved per group; see
+# volume_group_join.yml for the contract and for why the write is run_once.
+#
+# CROSS-ITERATION FACT BLEED
+# --------------------------
+# This file is included in a loop, and `set_fact` persists for the whole play —
+# a fact set on iteration 1 is still set on iteration 2. Any task here that is
+# skipped (by `when`, or under --check) therefore leaves the PREVIOUS group's
+# value in place, and a later task reading it would report group 2's result
+# using group 1's data. So the per-group facts are cleared up front rather than
+# assumed fresh. The same applies across plays when hammerspace_serial splits
+# the run into batches.
+
+- name: "Reset the per-group facts for {{ _vgj.group }}"
+  ansible.builtin.set_fact:
+    _vg_status: 0
+    _vg_json: {}
+    _vg_uuid: ""
+    _vg_existing_locations: []
+    _vg_existing_names: []
+    _vg_to_add: []
+    _vg_new_locations: []
+    _vg_payload: {}
+    _vg_payload_file: {}
+    _vg_put_raw: {}
+    _vg_verify_raw: {}
+    _vg_final_names: []
+    _vg_would_create: false
+
+- name: "Wait for task queue before updating volume group {{ _vgj.group }}"
+  ansible.builtin.include_tasks: task_queue_wait.yml
+  when: hammerspace_task_queue_throttle | default(true)
+
+- name: "Get the existing volume group {{ _vgj.group }}"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      "{{ hs_api_url }}/volume-groups/{{ _vgj.group | urlencode }}"
+  register: _vg_get_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Parse the volume group response
+  ansible.builtin.set_fact:
+    _vg_status: "{{ (_vg_get_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+    _vg_json: "{{ ((_vg_get_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+
+# OPT-IN CREATION (hammerspace_create_volume_groups: true)
+# -------------------------------------------------------
+# Off by default, and the 404 below stays a hard failure when it is off: a
+# group made here carries only the auto-created objectives, not whatever
+# policy an operator would have set up in the UI.
+#
+# When on (per-job groups from a Slurm prolog), the group is created WITH this
+# run's volumes. The volumes exist by now (add_volume.yml verified each), so
+# there is no empty group and no name pattern to get wrong. The join below
+# then finds every volume already a member and writes nothing.
+#
+# Only a 404 creates. Any other status is not "missing" — that falls through
+# to the failure below with the status it got.
+- name: "Create volume group {{ _vgj.group }} with this run's volumes"
+  ansible.builtin.include_tasks: volume_group_create.yml
+  vars:
+    volume_group_config:
+      name: "{{ _vgj.group }}"
+      volumes: "{{ _vgj.volumes }}"
+  when:
+    - (_vg_status | int) == 404
+    - hammerspace_create_volume_groups | default(false) | bool
+
+- name: "Use the volume group {{ _vgj.group }} just created"
+  ansible.builtin.set_fact:
+    _vg_status: "{{ _vgc_status }}"
+    _vg_json: "{{ _vgc_json }}"
+    _hs_vg_created_groups: "{{ (_hs_vg_created_groups | default([])) + [_vgj.group] }}"
+  when:
+    - (_vg_status | int) == 404
+    - hammerspace_create_volume_groups | default(false) | bool
+    - _vgc_created | default(false) | bool
+
+# --check sends no POST, so the group is still missing. Report the plan
+# instead of failing on a 404 the real run would not hit.
+- name: "Note that {{ _vgj.group }} would be created (check mode)"
+  ansible.builtin.set_fact:
+    _vg_would_create: true
+  when:
+    - ansible_check_mode
+    - (_vg_status | int) == 404
+    - hammerspace_create_volume_groups | default(false) | bool
+
+# Deliberately a hard failure. The group carries the placement
+# objectives; if it is missing, the volumes are deployed but orphaned,
+# and a silent skip would hide that until someone audits objectives.
+- name: Fail if the configured volume group does not exist
+  ansible.builtin.fail:
+    msg: |
+      {% if (_vg_status | int) == 404 %}
+      Volume group '{{ _vgj.group }}' does not exist
+      (HTTP {{ _vg_status }}).
+
+      hammerspace_volume_group names a group that must ALREADY exist
+      unless hammerspace_create_volume_groups is true. It is off here, so
+      nothing was created: a group made by the playbook carries only the
+      auto-created objectives, not the placement policy an operator sets
+      up in the UI.
+      {% else %}
+      Volume group '{{ _vgj.group }}' could not be read
+      (HTTP {{ _vg_status }}), so it is unknown whether it exists and
+      nothing was created. Check the API host, credentials and the Anvil.
+      {% endif %}
+
+      Either create it first in the UI, or set
+      hammerspace_create_volume_groups: true to have this run create it
+      with its own volumes as members, or clear hammerspace_volume_group
+      to skip group membership entirely.
+
+      This group was named by: {{ _vgj.hosts | default([]) | join(', ') | default('(play default)', true) }}
+
+      Existing groups:
+        curl -sk -u '{{ hammerspace_api_user }}:<password>' \
+          '{{ hs_api_url }}/volume-groups' | jq -r '.[].name'
+  when:
+    - _vg_status | int != 200
+    - not _vg_would_create
+
+# Every other PUT in this role targets .../uoid.uuid (az_map,
+# create_share, dns_update, ad_join, set_location, create_s3_user).
+# This file used to PUT to the group NAME. A GET by name works, so the
+# read half looked fine and the write half returned HTTP 400.
+- name: Resolve the volume group UUID
+  ansible.builtin.set_fact:
+    _vg_uuid: "{{ _vg_json.uoid.uuid | default('') }}"
+
+- name: Fail if the volume group has no UUID
+  ansible.builtin.fail:
+    msg: |
+      The API returned volume group '{{ _vgj.group }}'
+      without a uoid.uuid, so there is no identifier to PUT to.
+
+      Response keys: {{ _vg_json.keys() | list }}
+
+      Inspect the object:
+        curl -sk -u '{{ hammerspace_api_user }}:<password>' \
+          '{{ hs_api_url }}/volume-groups/{{ _vgj.group | urlencode }}' | jq .
+  when:
+    - _vg_uuid | length == 0
+    - not _vg_would_create
+
+# `selectattr('storageVolume.name', 'defined')` is load-bearing.
+#
+# Not every entry in `locations` names a storage volume. A group can
+# carry pattern-based or otherwise-shaped entries, and mapping
+# 'storageVolume.name' over those raises
+#
+#   'dict object' has no attribute 'storageVolume'
+#
+# which is a hard failure on a group that is perfectly valid.
+#
+# Unrecognised entries are EXCLUDED from the name comparison but kept
+# verbatim in _vg_existing_locations, so the PUT payload still carries
+# them. Filtering here decides what we compare; it must never decide
+# what we write back.
+- name: Determine which volumes are not yet members
+  ansible.builtin.set_fact:
+    _vg_existing_locations: "{{ _vg_json.expressions[0].locations | default([]) }}"
+    _vg_existing_names: >-
+      {{ _vg_json.expressions[0].locations | default([])
+         | selectattr('storageVolume.name', 'defined')
+         | map(attribute='storageVolume.name') | list }}
+
+# Surfaced rather than silently tolerated: if a group holds entries we
+# cannot name, the membership comparison below is only as complete as
+# the entries it could read, and an operator should know that.
+- name: Note volume group entries that name no storage volume
+  ansible.builtin.debug:
+    msg: >-
+      Volume group '{{ _vgj.group }}' holds
+      {{ _vg_opaque | length }} location entry/entries with no
+      storageVolume.name. They are preserved verbatim in the update but
+      excluded from the membership comparison. Types seen:
+      {{ _vg_opaque | map(attribute='_type') | list | unique | join(', ') | default('(no _type)', true) }}
+  vars:
+    _vg_opaque: >-
+      {{ _vg_existing_locations
+         | rejectattr('storageVolume.name', 'defined') | list }}
+  when: _vg_opaque | length > 0
+
+- name: Compute the additions
+  ansible.builtin.set_fact:
+    _vg_to_add: "{{ _vgj.volumes | difference(_vg_existing_names) }}"
+
+- name: Report when every volume is already a member
+  ansible.builtin.debug:
+    msg: >-
+      All {{ _vgj.volumes | length }} volume(s) for
+      '{{ _vgj.group }}' are already members — no change.
+  when: _vg_to_add | length == 0
+
+- name: "Apply the additions to {{ _vgj.group }}"
+  when: _vg_to_add | length > 0
+  block:
+    - name: Show exactly what will change
+      ansible.builtin.debug:
+        msg: |
+          Volume group: {{ _vgj.group }}
+            existing members (preserved): {{ _vg_existing_names | length }}
+          {% for v in _vg_existing_names %}    - {{ v }}
+          {% endfor %}
+            adding: {{ _vg_to_add | length }}
+          {% for v in _vg_to_add %}    + {{ v }}
+          {% endfor %}
+
+    # existing + new, in that order. Existing entries are carried over
+    # verbatim rather than rebuilt, so any fields the API sets on them
+    # survive the round trip.
+    - name: Build the new location list
+      ansible.builtin.set_fact:
+        _vg_new_locations: >-
+          {{ _vg_existing_locations + (_vg_to_add | map('regex_replace', '^(.*)$',
+             '{"_type": "VOLUME_LOCATION", "extendedInfo": {}, "storageVolume":
+             {"_type": "STORAGE_VOLUME", "extendedInfo": {}, "name": "\1"}}')
+             | map('from_json') | list) }}
+
+    # The payload is the OBJECT THE API JUST RETURNED with only the
+    # locations replaced — not a fresh dict with three keys. A PUT to
+    # /volume-groups/<uuid> replaces the resource, so a hand-built body
+    # silently drops uoid, internalId and any placement objectives the
+    # group carries. Round-tripping the fetched object keeps them.
+    - name: Build the append-only payload
+      ansible.builtin.set_fact:
+        _vg_payload: >-
+          {{ _vg_json | combine({'expressions':
+               [ _vg_expr0 | combine({'operator': 'IN',
+                                      'locations': _vg_new_locations}) ]
+             }) }}
+      vars:
+        _vg_expr0: >-
+          {{ (_vg_json.expressions | default([])) | first
+             | default({'_type': 'EXPRESSION'}, true) }}
+
+    # The payload goes in a FILE, not on the command line. It is the
+    # whole volume group object round-tripped (so a PUT, which
+    # REPLACES the resource, cannot drop placement objectives), and
+    # that object embeds the expanded volumes, their nodes and logical
+    # volumes. Inlining tens of kilobytes of arbitrary API-controlled
+    # text inside shell single quotes means one apostrophe anywhere in
+    # it ends the quoting and curl never runs — which shows up as
+    # "HTTP 0 / (empty response body)", because -w always emits a code
+    # when curl actually runs.
+    - name: Write the volume group payload to a file
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .json
+      register: _vg_payload_file
+      when: not ansible_check_mode
+
+    - name: Populate the payload file
+      ansible.builtin.copy:
+        content: "{{ _vg_payload | to_json }}"
+        dest: "{{ _vg_payload_file.path }}"
+        mode: "0600"
+      when: not ansible_check_mode
+
+    - name: "Update volume group {{ _vgj.group }}"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          -X PUT -H "Content-Type: application/json"
+          -d @{{ _vg_payload_file.path | quote }}
+          "{{ hs_api_url }}/volume-groups/{{ _vg_uuid | urlencode }}"
+      register: _vg_put_raw
+      changed_when: true
+      failed_when: false
+      no_log: true
+      when: not ansible_check_mode
+
+    # Before the rejection check below, which is a hard failure.
+    - name: Remove the payload file
+      ansible.builtin.file:
+        path: "{{ _vg_payload_file.path }}"
+        state: absent
+      when:
+        - not ansible_check_mode
+        - _vg_payload_file.path is defined
+
+    - name: Fail if the volume group update was rejected
+      ansible.builtin.fail:
+        msg: |
+          Updating volume group '{{ _vgj.group }}' failed
+          with HTTP {{ (_vg_put_raw.stdout_lines | default(['0']))[-1] | default('0') }}
+          (curl exit {{ _vg_put_raw.rc | default('?') }}).
+
+          PUT {{ hs_api_url }}/volume-groups/{{ _vg_uuid }}
+
+          The API said:
+            {{ (_vg_put_raw.stdout_lines | default([]))[:-1] | join('\n  ') | trim | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+
+          No volumes were added to this group. Existing members are
+          unaffected — the update is a single atomic PUT that either applies
+          or does not. Any OTHER volume group in this run was updated
+          independently; re-running is safe, the join is append-only.
+
+          The curl task carries no_log (its command line holds the API
+          password), so the body above is the only record of what the
+          API objected to — it is reproduced here deliberately. The
+          Anvil echoes request headers inside some error bodies —
+          as a JSON object ("authorization":"Basic ..."), not as a
+          header block — so the redaction matches `Basic <base64>`
+          wherever it appears rather than anchoring on `authorization:`.
+          {% if ((_vg_put_raw.stdout_lines | default(['0']))[-1] | default('0') | int) == 0 %}
+
+          HTTP 0 with no body means curl produced no output at all —
+          `-w` always emits a code when curl runs. So curl did not run,
+          or was killed. stderr:
+            {{ (_vg_put_raw.stderr | default('') | regex_replace('Basic [A-Za-z0-9+/=]+', 'Basic <redacted>')) | trim | default('(none)', true) }}
+          {% endif %}
+      when:
+        - not ansible_check_mode
+        - ((_vg_put_raw.stdout_lines | default(['0']))[-1] | default('0') | int) not in [200, 201, 202]
+
+    # Re-read rather than trusting the PUT: confirms the additions
+    # landed AND that nothing else was lost to a concurrent writer.
+    - name: Verify group membership after the update
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "{{ hs_api_url }}/volume-groups/{{ _vgj.group | urlencode }}"
+      register: _vg_verify_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: Parse verified membership
+      ansible.builtin.set_fact:
+        _vg_final_names: >-
+          {{ (_vg_verify_raw.stdout | default('{}') | from_json).expressions[0].locations
+             | default([]) | selectattr('storageVolume.name', 'defined')
+             | map(attribute='storageVolume.name') | list }}
+      when: not ansible_check_mode
+
+    - name: Fail if any expected member is missing after the update
+      ansible.builtin.fail:
+        msg: |
+          Volume group '{{ _vgj.group }}' is missing
+          {{ _vg_missing | length }} expected member(s) after the update:
+          {{ _vg_missing | join(', ') }}
+
+          Both the pre-existing members and this run's volumes should be
+          present. A missing entry usually means something else wrote to
+          this group at the same time (another playbook run, or the UI).
+      vars:
+        _vg_missing: >-
+          {{ (_vg_existing_names + _vg_to_add) | difference(_vg_final_names) }}
+      when:
+        - not ansible_check_mode
+        - ((_vg_existing_names + _vg_to_add) | difference(_vg_final_names)) | length > 0
+
+    - name: Report the final membership
+      ansible.builtin.debug:
+        msg: >-
+          Volume group '{{ _vgj.group }}' now has
+          {{ _vg_final_names | default([]) | length }} member(s)
+          ({{ _vg_existing_names | length }} pre-existing preserved,
+          {{ _vg_to_add | length }} added).
+      when: not ansible_check_mode

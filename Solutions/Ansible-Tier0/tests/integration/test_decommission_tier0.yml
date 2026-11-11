@@ -1,0 +1,331 @@
+---
+# Tests for decommission_tier0.yml — Hammerspace-side removal that must leave
+# all data intact.
+#
+# The customer's requirement is narrow and absolute: decommission from
+# Hammerspace, do NOT delete the data. The array at /nvme belongs to Azure and
+# keeps serving; only the registration goes away.
+#
+# That makes the dangerous direction "this playbook grew a destructive step",
+# not "it failed". A stray unmount, wipefs or rm would destroy customer data
+# while the play still reports success. TEST 1 is the guard against that and is
+# the reason this file exists.
+#
+# The sibling playbook reset-tier0-host.yml IS destructive by design, so the
+# two must not be confused — TEST 4 checks the header says so.
+#
+# Live API calls cannot run in CI, so these cover the safety contract, the
+# ordering, and the targeting.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_decommission_tier0.yml \
+#       -i localhost, -c local
+
+- name: Tier 0 decommission safety tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _pb: "{{ playbook_dir }}/../../decommission_tier0.yml"
+    _leave: "{{ playbook_dir }}/../../roles/hammerspace_integration/tasks/volume_group_leave.yml"
+
+  tasks:
+    - name: Read the decommission playbook and the group-leave task file
+      ansible.builtin.set_fact:
+        _dc: "{{ lookup('file', _pb) }}"
+        _vgl: "{{ lookup('file', _leave) }}"
+
+    - name: Strip comments so audits read behaviour, not prose
+      ansible.builtin.set_fact:
+        _dc_code: "{{ _dc.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+        _vgl_code: "{{ _vgl.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+
+    # ========================================================================
+    # TEST 1: NOTHING that touches data may appear in the executable body.
+    # ========================================================================
+    - name: 'TEST 1: the playbook contains no data-destructive operation'
+      block:
+        - name: 'TEST 1 ASSERT: no destructive verbs anywhere in the code'
+          ansible.builtin.assert:
+            that:
+              - "'mkfs' not in _dc_code"
+              - "'wipefs' not in _dc_code"
+              - "'blkdiscard' not in _dc_code"
+              - "'mdadm' not in _dc_code"
+              - "'umount' not in _dc_code"
+              - "'ansible.posix.mount' not in _dc_code"
+              - "'state: absent' not in _dc_code"
+              - "'rm -rf' not in _dc_code"
+              - "'ansible.builtin.file' not in _dc_code"
+            fail_msg: |
+              REGRESSION: decommission_tier0.yml gained an operation that can
+              destroy data. This playbook must only unregister from
+              Hammerspace — the array and the export directory belong to the
+              customer and keep serving.
+
+              For host-side teardown use reset-tier0-host.yml, which is
+              explicitly destructive and separate.
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: no mkfs/wipefs/blkdiscard/mdadm/umount/mount/file/rm anywhere in the code'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2: ordering and targeting
+    # ========================================================================
+    - name: 'TEST 2: groups are left before volumes are deleted, and targeting is exact'
+      block:
+        - name: 'TEST 2 ASSERT: volume_group_leave precedes cleanup_instance_nodes'
+          ansible.builtin.assert:
+            that:
+              # Anchored on task NAMES, not on the script filename: the
+              # filename also appears in fail_msg prose inside a block scalar,
+              # which comment-stripping does not remove, so a substring compare
+              # measured the wrong occurrence.
+              # Leaving groups first is what stops a group being left holding a
+              # reference to a volume that no longer exists.
+              - "_dc_code.index('Remove the volumes from every volume group')
+                 < _dc_code.index('Delete the volumes and nodes from Hammerspace')"
+            fail_msg: |
+              REGRESSION: volumes would be deleted before being removed from
+              their volume groups, leaving dangling references.
+
+        - name: 'TEST 2 ASSERT: only exact --node targeting is used'
+          ansible.builtin.assert:
+            that:
+              - "'--node' in _dc_code"
+              # A loose filter here would delete OTHER nodes in the cluster.
+              - "'--prefix' not in _dc_code"
+              - "'--contains' not in _dc_code"
+              - "'--pattern' not in _dc_code"
+            fail_msg: |
+              REGRESSION: decommission must target nodes by exact name.
+              cleanup_instance_nodes.py's --prefix/--contains/--pattern match
+              broadly and would delete nodes that were never selected.
+
+        - name: 'TEST 2 ASSERT: an empty node list is a hard stop'
+          ansible.builtin.assert:
+            that:
+              - "'_dc_nodes | length == 0' in _dc_code"
+            fail_msg: |
+              REGRESSION: the empty-node-list guard is gone. The script's filter
+              group is NOT argparse-required and matches NOTHING when no filter
+              is passed, so an empty list would report success while silently
+              doing nothing.
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: leave-groups precedes delete; exact --node targeting only; empty selection is fatal'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3: confirmation gate and no host contact
+    # ========================================================================
+    - name: 'TEST 3: confirmation is mandatory and nodes are never contacted'
+      block:
+        - name: 'TEST 3 ASSERT: refuses to run without decommission_confirm'
+          ansible.builtin.assert:
+            that:
+              - "'decommission_confirm: false' in _dc_code"
+              - "'not (decommission_confirm | bool)' in _dc_code"
+            fail_msg: |
+              REGRESSION: the confirmation gate is missing or no longer defaults
+              to false. Deleting cluster registration must be deliberate.
+
+        - name: 'TEST 3 ASSERT: every task is delegated to the controller'
+          ansible.builtin.assert:
+            that:
+              # No SSH to storage nodes at all — nothing on them is touched,
+              # and decommission works even for a node that is already gone.
+              # Quoted: these contain ': ', which YAML would otherwise read as
+              # a mapping rather than a conditional string.
+              - "(_dc_code | regex_findall('delegate_to')) | length >= 8"
+              - "'gather_facts: false' in _dc_code"
+            fail_msg: |
+              REGRESSION: decommission must not connect to the storage nodes.
+              Everything is API work against the Anvil, and it has to succeed
+              even when the node is powered off or already deleted in Azure.
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: confirm flag required and defaults false; all work delegated to the controller'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 4: volume_group_leave preserves everything it was not asked to remove
+    # ========================================================================
+    - name: 'TEST 4: group removal is surgical'
+      block:
+        - name: Simulate a group holding two other volumes plus two of ours
+          ansible.builtin.set_fact:
+            _locations:
+              - {storageVolume: {name: "AZ1:keep-1::/nvme/tier0"}}
+              - {storageVolume: {name: "AZ1:doomed-1::/nvme/tier0"}}
+              - {storageVolume: {name: "AZ1:keep-2::/nvme/tier0"}}
+              - {storageVolume: {name: "AZ1:doomed-2::/nvme/tier0"}}
+            _remove: ["AZ1:doomed-1::/nvme/tier0", "AZ1:doomed-2::/nvme/tier0"]
+
+        - name: Compute what the task file would keep and remove
+          ansible.builtin.set_fact:
+            _keep: "{{ _locations | rejectattr('storageVolume.name', 'in', _remove) | map(attribute='storageVolume.name') | list }}"
+            _gone: "{{ _locations | selectattr('storageVolume.name', 'in', _remove) | map(attribute='storageVolume.name') | list }}"
+
+        - name: 'TEST 4 ASSERT: only the named volumes leave the group'
+          ansible.builtin.assert:
+            that:
+              - _keep == ['AZ1:keep-1::/nvme/tier0', 'AZ1:keep-2::/nvme/tier0']
+              - _gone | sort == _remove | sort
+            fail_msg: |
+              REGRESSION: group removal is not surgical.
+              keep: {{ _keep }}   remove: {{ _gone }}
+              Other deployments' volumes must survive untouched.
+
+        - name: 'TEST 4 ASSERT: groups are never deleted, even when emptied'
+          ansible.builtin.assert:
+            that:
+              - "'-X DELETE' not in _vgl_code"
+              - "'run_once: true' in _vgl_code"
+            fail_msg: |
+              REGRESSION: volume_group_leave must never DELETE a group (an
+              emptied group may carry placement objectives for future
+              deployments), and its writes must be run_once to avoid the
+              per-host read-modify-write race.
+
+        - name: 'TEST 4 ASSERT: the destructive sibling is clearly distinguished'
+          ansible.builtin.assert:
+            that:
+              - "'reset-tier0-host.yml' in _dc"
+              - "'DATA IS NOT TOUCHED' in _dc"
+            fail_msg: |
+              The header must state that this playbook preserves data and point
+              at reset-tier0-host.yml for the destructive teardown. Confusing
+              the two costs a customer their array.
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: group removal surgical, groups never deleted, destructive sibling distinguished'] }}"
+      rescue:
+        - name: Record TEST 4 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 5: nodes resolve by registered NAME or registered management IP, so
+    # `--limit <ip>` works exactly as it does for deployment.
+    # ========================================================================
+    # Nodes are registered with mgmtIpAddress (hammerspace_integration/main.yml),
+    # so the IP is a stable second identifier. This matters beyond convenience:
+    # the inventory naming scheme can differ between the deploy run and the
+    # decommission run — VMSS instance names change on every scale-set
+    # recreation, and `hostnames:` may be switched to IPs later. Matching on
+    # both means decommission still finds the node instead of silently removing
+    # nothing.
+    - name: 'TEST 5: name-or-IP resolution against registered nodes'
+      block:
+        - name: A cluster where nodes were registered under VMSS names
+          ansible.builtin.set_fact:
+            _reg:
+              - {name: "hb120v3-abc_0", mgmtIpAddress: {address: "10.0.16.5"}}
+              - {name: "hb120v3-abc_1", mgmtIpAddress: {address: "10.0.16.7"}}
+              - {name: "unrelated", mgmtIpAddress: {address: "10.0.99.9"}}
+
+        - name: Resolve a name-based and an IP-based selection
+          ansible.builtin.set_fact:
+            _by_name: >-
+              {{ (_reg | selectattr('name', 'equalto', 'hb120v3-abc_0') | map(attribute='name') | list)
+                 + (_reg | selectattr('mgmtIpAddress.address', 'equalto', 'nope') | map(attribute='name') | list) }}
+            _by_ip: >-
+              {{ (_reg | selectattr('name', 'equalto', '10.0.16.7') | map(attribute='name') | list)
+                 + (_reg | selectattr('mgmtIpAddress.address', 'equalto', '10.0.16.7') | map(attribute='name') | list) }}
+            _ghost: >-
+              {{ (_reg | selectattr('name', 'equalto', 'ghost') | map(attribute='name') | list)
+                 + (_reg | selectattr('mgmtIpAddress.address', 'equalto', '10.0.55.55') | map(attribute='name') | list) }}
+
+        - name: 'TEST 5 ASSERT: both paths resolve to the REGISTERED name'
+          ansible.builtin.assert:
+            that:
+              - _by_name == ['hb120v3-abc_0']
+              # Targeted by IP, resolves to the name Hammerspace knows — not
+              # the IP. Everything downstream must use the registered name.
+              - _by_ip == ['hb120v3-abc_1']
+              - _ghost == []
+              - "'unrelated' not in (_by_name + _by_ip + _ghost)"
+            fail_msg: |
+              REGRESSION: node resolution no longer matches by both name and
+              management IP, or leaked an unrelated node.
+              by_name={{ _by_name }} by_ip={{ _by_ip }} ghost={{ _ghost }}
+
+        - name: 'TEST 5 ASSERT: the playbook implements both match paths'
+          ansible.builtin.assert:
+            that:
+              - "'_dc_node_name in _dc_reg_names' in _dc_code"
+              - "'_dc_node_ip in _dc_reg_ips' in _dc_code"
+              - "'mgmtIpAddress.address' in _dc_code"
+              # An unresolvable selection must abort, not quietly delete
+              # nothing — cleanup_instance_nodes.py matches NOTHING when given
+              # no filter, so a silent empty selection looks like success.
+              - "'_dc_unmatched | length > 0' in _dc_code"
+            fail_msg: |
+              REGRESSION: decommission_tier0.yml must resolve targets by
+              registered name OR registered mgmtIpAddress, and must hard-fail
+              when a selected host matches neither.
+
+        - name: 'TEST 5 ASSERT: no select(extract) — it is a filter, not a test'
+          ansible.builtin.assert:
+            that:
+              - "\"select('extract'\" not in _dc_code"
+            fail_msg: |
+              REGRESSION: select('extract', ...) raises "No test named
+              'extract'" at runtime. Use map('extract', hostvars) followed by
+              selectattr instead.
+
+        - name: Record TEST 5 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 5: targets resolve by registered name or mgmtIpAddress; unresolvable selection is fatal'] }}"
+      rescue:
+        - name: Record TEST 5 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 5: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          TIER 0 DECOMMISSION SAFETY TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

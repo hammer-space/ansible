@@ -1,0 +1,82 @@
+---
+# Default variables for the DI role
+
+# Firewall defaults
+flush_iptables: true
+enable_ufw: false
+
+di_firewall_ports:
+  - port: 9095
+    proto: tcp
+  - port: 9096
+    proto: tcp
+
+# Container defaults (host-mode podman/docker)
+di_container_systemd_flag: "{{ '--systemd=always' if di_container_runtime == 'podman' else '' }}"
+
+# ============================================================================
+# Kubernetes deployment defaults (di_deployment_type: "kubernetes")
+# ============================================================================
+
+# Where to find kubeconfig on the Ansible controller.
+di_k8s_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('~/.kube/config', true) }}"
+
+# Target namespace + PodSecurityAdmission profile. DI needs privileged
+# (hostNetwork, hostPath, SYS_ADMIN/NET_ADMIN/SYS_PTRACE).
+di_k8s_namespace: "hammerspace-di"
+di_k8s_psa_level: "privileged"
+
+# Node selector — only labeled nodes get the DaemonSet, AND the same label
+# acts as the ops-visible tag the customer asked for.
+di_k8s_node_selector_label: "hammerspace.io/di"
+di_k8s_node_selector_value: "true"
+
+# List of node names (kubectl get nodes) that should be labeled. Empty list
+# means "use the di_nodes inventory group's ansible_host or inventory_hostname".
+di_k8s_target_nodes: []
+
+# Operator-supplied tolerations to land on tainted nodes (GPU, etc.).
+# Example:
+#   di_k8s_tolerations:
+#     - {key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule"}
+di_k8s_tolerations: []
+
+# Optional priority class (recommend system-node-critical for production).
+di_k8s_priority_class: ""
+
+# Status label set by kubernetes_status_label.yml.
+di_k8s_status_label: "hammerspace.io/di-status"
+
+# Image registry — operator MUST set di_k8s_registry_namespace.
+di_k8s_registry: "{{ oci_region | default('us-ashburn-1') }}.ocir.io"
+di_k8s_registry_namespace: ""
+di_k8s_image_repository: "hammerspace-di"
+di_k8s_image_tag: "{{ pd_di_version | default('5.1.41-452') }}"
+di_k8s_image_arch_suffix: true
+di_k8s_image: >-
+  {{ di_k8s_registry }}/{{ di_k8s_registry_namespace }}/{{ di_k8s_image_repository }}:{{ di_k8s_image_tag }}
+
+# Pull-secret resource (created by the deploy if registry creds are provided).
+di_k8s_image_pull_secret: "hammerspace-di-pull"
+di_k8s_registry_username: ""
+di_k8s_registry_password: ""
+di_k8s_registry_email: "noreply@hammerspace.com"
+
+# Hammerspace API credentials Secret (consumed by the initContainer).
+di_k8s_api_credentials_secret: "hammerspace-api-credentials"
+
+# Build + push flow.
+di_k8s_build_push: true
+di_k8s_build_tool: "auto"                 # auto | podman | docker | buildah | nerdctl
+di_k8s_build_multiarch_manifest: false    # only honored when build tool is buildah
+
+# Rollout poll budget.
+di_k8s_rollout_timeout: 300
+di_k8s_rollout_poll_delay: 5
+
+# Status-label poll budget.
+di_k8s_status_retries: 30
+di_k8s_status_delay: 5
+
+# kubernetes.core collection auto-install (set false to manage it yourself).
+di_k8s_auto_install_collection: true

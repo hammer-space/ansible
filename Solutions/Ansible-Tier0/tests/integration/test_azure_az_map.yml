@@ -1,0 +1,532 @@
+---
+# Integration test for Azure AZ derivation (added with Azure support).
+#
+# Azure exposes TWO different placement values and they are NOT interchangeable:
+#
+#   zone                  Availability Zone, 1-BASED ("1", "2", "3").
+#                         EMPTY STRING — not absent — on non-zonal VMs
+#                         (availability sets, or a region without zones).
+#   platformFaultDomain   Fault domain inside an availability set / VMSS,
+#                         ZERO-BASED ("0", "1", "2"). Always present via IMDS.
+#
+# Two easy ways to get this wrong, both covered below:
+#   - testing `azure_zone is defined` instead of its length, so a non-zonal
+#     VM's "" wins the chain and every node renders "AZ" with no number;
+#   - forgetting the +1 on platformFaultDomain, so fault domain 0 renders
+#     "AZ0" — a zone label Hammerspace never assigns, silently splitting
+#     volume placement across a phantom AZ.
+#
+# The AZ expression lives ONCE in vars/main.yml as `_cloud_az_detected` and is
+# consumed by az_map.yml (node label), add_volume.yml (volume name prefix) and
+# plays/storage.yml (instance_report.csv). This test loads the REAL expression
+# from vars/main.yml so it cannot drift, then audits that all three call sites
+# still reference it.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_azure_az_map.yml \
+#       -i localhost, -c local
+
+- name: Azure AZ derivation regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _repo: "{{ playbook_dir }}/../.."
+
+    # The az_map.yml priority chain, verbatim. Mirrors
+    # roles/hammerspace_integration/tasks/az_map.yml — TEST 8 audits that the
+    # real file still delegates to _cloud_az_detected.
+    _az_map_tmpl: >-
+      {%- if hammerspace_node_az is defined -%}
+        {{ hammerspace_node_az }}
+      {%- elif (_cloud_az_detected | default('', true) | trim | length) > 0 -%}
+        {{ _cloud_az_detected | default('', true) | trim }}
+      {%- elif ':' in hs_node_name -%}
+        {{ hs_node_name.split(':')[0] }}
+      {%- elif group_names | default([]) | select('match', '^AZ[0-9]+$') | list | length > 0 -%}
+        {{ (group_names | default([]) | select('match', '^AZ[0-9]+$') | list)[0] }}
+      {%- else -%}
+        {{ hammerspace_default_az | default('default') }}
+      {%- endif -%}
+
+    # The azure_imds_az.yml parse expressions, verbatim.
+    _imds_json_tmpl: >-
+      {{ _azure_imds_raw.json if _azure_imds_raw.json is defined else {} }}
+    _imds_status_tmpl: >-
+      {{ _azure_imds_raw.status if _azure_imds_raw.status is defined else 0 }}
+
+    # The add_volume.yml "auto" prefix branch, verbatim.
+    _vol_prefix_tmpl: >-
+      {{ (_cloud_az_detected | default('', true) | trim) }}{{ ':' if (_cloud_az_detected | default('', true) | trim | length) > 0 else '' }}
+
+  tasks:
+    # ========================================================================
+    # Load the REAL _cloud_az_detected expression from vars/main.yml.
+    # Namespaced so the rest of vars/main.yml does not leak into the play.
+    # ========================================================================
+    - name: Load vars/main.yml
+      ansible.builtin.include_vars:
+        file: "{{ _repo }}/vars/main.yml"
+        name: _hsvars
+
+    # NOTE: deliberately NOT bound via set_fact. set_fact would evaluate the
+    # expression ONCE, here, with none of the per-test `vars:` in scope and
+    # freeze that result. Referencing _hsvars._cloud_az_detected at each render
+    # site re-templates it against the task's vars, which is the whole point.
+
+    # ========================================================================
+    # TEST 1: vars/main.yml actually defines the shared expression and the
+    # Azure IMDS toggle (audit — stops a silent removal).
+    # ========================================================================
+    - name: Read azure_imds_az.yml source for the TEST 9 audit
+      ansible.builtin.slurp:
+        src: "{{ _repo }}/roles/hammerspace_integration/tasks/azure_imds_az.yml"
+      register: _imds_src_raw
+
+    - name: Bind azure_imds_az.yml source text
+      ansible.builtin.set_fact:
+        _imds_src: "{{ _imds_src_raw.content | b64decode }}"
+
+    - name: 'TEST 1: vars/main.yml defines _cloud_az_detected + Azure toggles'
+      block:
+        - name: 'TEST 1 ASSERT: keys present with expected defaults'
+          ansible.builtin.assert:
+            that:
+              - "'_cloud_az_detected' in _hsvars"
+              - "'hammerspace_azure_imds_az' in _hsvars"
+              - _hsvars.hammerspace_azure_imds_az == false
+              - "'azure_imds_api_version' in _hsvars"
+              - "'azure_imds_timeout' in _hsvars"
+            fail_msg: |
+              vars/main.yml must define _cloud_az_detected plus the Azure IMDS
+              toggle (default false), api version and timeout.
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: vars/main.yml defines _cloud_az_detected + Azure IMDS vars'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 2: Azure zone is 1-BASED and used verbatim. zone "2" -> AZ2.
+    # ========================================================================
+    - name: 'TEST 2: azure_zone "2" -> AZ2'
+      block:
+        - name: Render with a zonal Azure VM
+          ansible.builtin.set_fact:
+            _r_zone: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+          vars:
+            azure_zone: "2"
+            azure_fault_domain: "0"
+
+        - name: 'TEST 2 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _r_zone == 'AZ2'
+            fail_msg: "azure_zone '2' should render AZ2 (1-based, verbatim), got: {{ _r_zone }}"
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: azure_zone is 1-based, used verbatim -> AZ2'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 3: zone WINS over fault domain when both are present. A zonal VM
+    # in zone 1 always reports platformFaultDomain 0, so getting the
+    # precedence backwards would be invisible until a multi-FD deployment.
+    # ========================================================================
+    - name: 'TEST 3: azure_zone beats azure_fault_domain'
+      block:
+        - name: Render with conflicting zone / fault domain
+          ansible.builtin.set_fact:
+            _r_prec: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+          vars:
+            azure_zone: "3"
+            azure_fault_domain: "0"      # would render AZ1 if it won
+
+        - name: 'TEST 3 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _r_prec == 'AZ3'
+            fail_msg: "zone must outrank fault domain; expected AZ3, got: {{ _r_prec }}"
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: azure_zone outranks azure_fault_domain'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 4: THE ZERO-BASED TRAP. Non-zonal VM (availability set): zone is
+    # "" and must NOT win the chain; platformFaultDomain 0 must render AZ1,
+    # not AZ0. Also checks FD 2 -> AZ3.
+    # ========================================================================
+    - name: 'TEST 4: non-zonal VM — fault domain is 0-based, +1'
+      block:
+        - name: Render fault domain 0 with an empty zone
+          ansible.builtin.set_fact:
+            _r_fd0: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+          vars:
+            azure_zone: ""               # non-zonal: empty STRING, not absent
+            azure_fault_domain: "0"
+
+        - name: Render fault domain 2 with an empty zone
+          ansible.builtin.set_fact:
+            _r_fd2: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+          vars:
+            azure_zone: ""
+            azure_fault_domain: "2"
+
+        - name: 'TEST 4 ASSERT: 0 -> AZ1 and 2 -> AZ3, never AZ0 / bare AZ'
+          ansible.builtin.assert:
+            that:
+              - _r_fd0 == 'AZ1'
+              - _r_fd2 == 'AZ3'
+              - _r_fd0 != 'AZ0'
+              - _r_fd0 != 'AZ'
+            fail_msg: |
+              platformFaultDomain is ZERO-based and must be +1'd, and an empty
+              azure_zone must not win the chain.
+              fd0 -> {{ _r_fd0 }} (want AZ1), fd2 -> {{ _r_fd2 }} (want AZ3)
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: non-zonal VM — empty zone skipped, fault domain 0-based +1'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 5: OCI is unchanged and still outranks the Azure facts. Guards the
+    # existing OCI fleet against a regression from adding Azure branches.
+    # ========================================================================
+    - name: 'TEST 5: OCI fault domain still wins and still maps correctly'
+      block:
+        - name: Render an OCI host
+          ansible.builtin.set_fact:
+            _r_oci: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+          vars:
+            oci_fault_domain: "FAULT-DOMAIN-3"
+
+        - name: Render an OCI host that also has stale Azure facts
+          ansible.builtin.set_fact:
+            _r_mixed: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+          vars:
+            oci_fault_domain: "FAULT-DOMAIN-2"
+            azure_zone: "1"
+
+        - name: 'TEST 5 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _r_oci == 'AZ3'
+              - _r_mixed == 'AZ2'
+            fail_msg: |
+              OCI mapping must be unchanged and take precedence.
+              FAULT-DOMAIN-3 -> {{ _r_oci }} (want AZ3),
+              FAULT-DOMAIN-2 + azure_zone 1 -> {{ _r_mixed }} (want AZ2)
+
+        - name: Record TEST 5 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 5: OCI fault domain unchanged and outranks Azure facts'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 5: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 6: no cloud metadata at all (on-prem, or IMDS unreachable) renders
+    # EMPTY — so az_map falls through to name prefix / group / default rather
+    # than emitting a bogus label.
+    # ========================================================================
+    - name: 'TEST 6: no cloud metadata renders empty, chain falls through'
+      block:
+        - name: Render with nothing set
+          ansible.builtin.set_fact:
+            _r_none: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+
+        - name: Render with the empty facts a non-Azure host gets from IMDS failure
+          ansible.builtin.set_fact:
+            _r_empty: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+          vars:
+            azure_zone: ""
+            azure_fault_domain: ""
+
+        - name: az_map chain with no cloud metadata falls to the name prefix
+          ansible.builtin.set_fact:
+            _r_chain_prefix: "{{ _az_map_tmpl }}"
+          vars:
+            _cloud_az_detected: "{{ _hsvars._cloud_az_detected }}"
+            hs_node_name: "AZ4:tier0-node-07"
+
+        - name: az_map chain with no cloud metadata and no prefix falls to group
+          ansible.builtin.set_fact:
+            _r_chain_group: "{{ _az_map_tmpl }}"
+          vars:
+            _cloud_az_detected: "{{ _hsvars._cloud_az_detected }}"
+            hs_node_name: "tier0-node-07"
+            group_names: ['storage_servers', 'AZ2']
+
+        - name: az_map chain with nothing at all falls to the default
+          ansible.builtin.set_fact:
+            _r_chain_default: "{{ _az_map_tmpl }}"
+          vars:
+            _cloud_az_detected: "{{ _hsvars._cloud_az_detected }}"
+            hs_node_name: "tier0-node-07"
+            group_names: ['storage_servers']
+            hammerspace_default_az: "AZ1"
+
+        - name: 'TEST 6 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _r_none == ''
+              - _r_empty == ''
+              - _r_chain_prefix == 'AZ4'
+              - _r_chain_group == 'AZ2'
+              - _r_chain_default == 'AZ1'
+            fail_msg: |
+              With no cloud metadata the expression must render empty and the
+              az_map chain must fall through.
+              none='{{ _r_none }}' empty='{{ _r_empty }}'
+              prefix={{ _r_chain_prefix }} group={{ _r_chain_group }}
+              default={{ _r_chain_default }}
+
+        - name: Record TEST 6 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 6: no cloud metadata -> empty; az_map falls through to prefix/group/default'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 6: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 7: explicit hammerspace_node_az still overrides Azure metadata, and
+    # the add_volume "auto" prefix renders "AZ2:" (with the colon) on Azure
+    # and "" when there is nothing to derive.
+    # ========================================================================
+    - name: 'TEST 7: explicit override + volume-name prefix on Azure'
+      block:
+        - name: Explicit override beats a live Azure zone
+          ansible.builtin.set_fact:
+            _r_override: "{{ _az_map_tmpl }}"
+          vars:
+            _cloud_az_detected: "{{ _hsvars._cloud_az_detected }}"
+            hammerspace_node_az: "AZ9"
+            azure_zone: "2"
+            hs_node_name: "tier0-node-07"
+
+        - name: Volume prefix on a zonal Azure VM
+          ansible.builtin.set_fact:
+            _r_vp_azure: "{{ _vol_prefix_tmpl }}"
+          vars:
+            _cloud_az_detected: "{{ _hsvars._cloud_az_detected }}"
+            azure_zone: "2"
+
+        - name: Volume prefix with no cloud metadata
+          ansible.builtin.set_fact:
+            _r_vp_none: "{{ _vol_prefix_tmpl }}"
+          vars:
+            _cloud_az_detected: "{{ _hsvars._cloud_az_detected }}"
+
+        - name: 'TEST 7 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _r_override == 'AZ9'
+              - _r_vp_azure == 'AZ2:'
+              - _r_vp_none == ''
+            fail_msg: |
+              override={{ _r_override }} (want AZ9),
+              azure volume prefix='{{ _r_vp_azure }}' (want 'AZ2:'),
+              no-metadata prefix='{{ _r_vp_none }}' (want '')
+
+        - name: Record TEST 7 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 7: hammerspace_node_az override + AZ2: volume prefix on Azure'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 7: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 8: audit — all three call sites delegate to _cloud_az_detected
+    # rather than re-deriving the AZ from oci_fault_domain locally, the role
+    # includes azure_imds_az.yml BEFORE az_map.yml, and the Azure inventory +
+    # collection requirement are present.
+    # ========================================================================
+    - name: 'TEST 8: audit call sites, include order, inventory, requirements'
+      block:
+        - name: Read the files under audit
+          ansible.builtin.slurp:
+            src: "{{ _repo }}/{{ item }}"
+          loop:
+            - roles/hammerspace_integration/tasks/az_map.yml
+            - roles/hammerspace_integration/tasks/add_volume.yml
+            - roles/hammerspace_integration/tasks/main.yml
+            - plays/storage.yml
+            - inventory.azure.yml
+            - requirements.yml
+            - roles/hammerspace_integration/tasks/azure_imds_az.yml
+          register: _audit_src
+
+        - name: Index the audited sources by path
+          ansible.builtin.set_fact:
+            _src: >-
+              {{ dict(_audit_src.results | map(attribute='item')
+                      | zip(_audit_src.results | map(attribute='content') | map('b64decode'))) }}
+
+        - name: 'TEST 8 ASSERT: call sites delegate to _cloud_az_detected'
+          ansible.builtin.assert:
+            that:
+              - "'_cloud_az_detected' in _src['roles/hammerspace_integration/tasks/az_map.yml']"
+              - "'_cloud_az_detected' in _src['roles/hammerspace_integration/tasks/add_volume.yml']"
+              - "'_cloud_az_detected' in _src['plays/storage.yml']"
+            fail_msg: |
+              An AZ call site stopped using _cloud_az_detected and is deriving
+              the AZ locally again — Azure hosts will silently fall back to
+              hammerspace_default_az there. Re-point it at vars/main.yml.
+
+        - name: 'TEST 8 ASSERT: azure_imds_az.yml is included before az_map.yml'
+          ansible.builtin.assert:
+            that:
+              - "'azure_imds_az.yml' in _src['roles/hammerspace_integration/tasks/main.yml']"
+              - >-
+                _src['roles/hammerspace_integration/tasks/main.yml'].index('azure_imds_az.yml')
+                < _src['roles/hammerspace_integration/tasks/main.yml'].index('az_map.yml')
+            fail_msg: |
+              azure_imds_az.yml must be included BEFORE az_map.yml in
+              roles/hammerspace_integration/tasks/main.yml — az_map consumes
+              the azure_zone / azure_fault_domain facts it sets.
+
+        - name: 'TEST 8 ASSERT: Azure inventory + collection requirement present'
+          ansible.builtin.assert:
+            that:
+              - "'azure.azcollection.azure_rm' in _src['inventory.azure.yml']"
+              - "'azure.azcollection' in _src['requirements.yml']"
+            fail_msg: |
+              inventory.azure.yml must use the azure.azcollection.azure_rm
+              plugin and requirements.yml must pin azure.azcollection.
+
+        - name: Record TEST 8 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 8: audit — call sites, include order, inventory, requirements'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 8: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 9: azure_imds_az.yml must survive a FAILED IMDS request.
+    #
+    # The request runs with failed_when:false, so on a non-Azure host (or with
+    # IMDS firewalled) the registered result has NO `json` key at all. Per the
+    # 2026-07-21 sunrpc incident, `result.json | default({})` does NOT rescue a
+    # missing dict key — Ansible raises "'dict object' has no attribute 'json'"
+    # at access time and `default` never runs. Same for the individual IMDS
+    # fields, which vary by api-version.
+    #
+    # This test renders the real parse expressions against three shapes:
+    # a failed request, a 200 with a full payload, and a 200 with a sparse
+    # payload — and asserts none of them raise.
+    # ========================================================================
+    - name: 'TEST 9: IMDS parse is safe on failed / sparse responses'
+      block:
+        - name: 'TEST 9a: failed request (no json key) parses to empty facts'
+          ansible.builtin.set_fact:
+            _r9_json: "{{ _imds_json_tmpl }}"
+            _r9_status: "{{ _imds_status_tmpl }}"
+          vars:
+            # What uri registers when the host is not on Azure.
+            _azure_imds_raw: {msg: "Connection refused", status: -1, url: "http://169.254.169.254/..."}
+
+        - name: 'TEST 9a ASSERT: empty dict, status passed through, no crash'
+          ansible.builtin.assert:
+            that:
+              - _r9_json == {}
+              - (_r9_status | int) == -1
+            fail_msg: "Failed IMDS request must parse to {} — got {{ _r9_json }} / {{ _r9_status }}"
+
+        - name: 'TEST 9b: sparse 200 payload (no zone key) parses to empty strings'
+          ansible.builtin.set_fact:
+            _r9_zone: "{{ (_imds.zone if 'zone' in _imds else '') | string | trim }}"
+            _r9_fd: "{{ (_imds.platformFaultDomain if 'platformFaultDomain' in _imds else '') | string | trim }}"
+          vars:
+            # Older api-versions omit keys entirely rather than returning "".
+            _imds: {location: "westus2", vmSize: "Standard_L16s_v3"}
+
+        - name: 'TEST 9b ASSERT: missing keys yield empty, not a crash'
+          ansible.builtin.assert:
+            that:
+              - _r9_zone == ''
+              - _r9_fd == ''
+            fail_msg: "Sparse IMDS payload must yield empty strings, got zone='{{ _r9_zone }}' fd='{{ _r9_fd }}'"
+
+        - name: 'TEST 9c: full 200 payload yields the real values'
+          ansible.builtin.set_fact:
+            _r9_zone_ok: "{{ (_imds.zone if 'zone' in _imds else '') | string | trim }}"
+            _r9_fd_ok: "{{ (_imds.platformFaultDomain if 'platformFaultDomain' in _imds else '') | string | trim }}"
+            _r9_az_ok: "{{ _hsvars._cloud_az_detected | default('', true) | trim }}"
+          vars:
+            _imds: {zone: "2", platformFaultDomain: "0", location: "westus2", vmSize: "Standard_L16s_v3"}
+            azure_zone: "2"
+            azure_fault_domain: "0"
+
+        - name: 'TEST 9c ASSERT: values extracted and mapped to AZ2'
+          ansible.builtin.assert:
+            that:
+              - _r9_zone_ok == '2'
+              - _r9_fd_ok == '0'
+              - _r9_az_ok == 'AZ2'
+            fail_msg: |
+              Full payload: zone='{{ _r9_zone_ok }}' fd='{{ _r9_fd_ok }}'
+              az='{{ _r9_az_ok }}' (want '2' / '0' / AZ2)
+
+        - name: 'TEST 9 AUDIT: azure_imds_az.yml has no unguarded .attr | default()'
+          ansible.builtin.assert:
+            that:
+              - "'_azure_imds_raw.json | default' not in _imds_src"
+              - "'_azure_imds_raw.status | default' not in _imds_src"
+              - "'_azure_imds.zone | default' not in _imds_src"
+              - "'_azure_imds.platformFaultDomain | default' not in _imds_src"
+            fail_msg: |
+              azure_imds_az.yml re-introduced `registered_result.attr | default(...)`.
+              A missing dict key raises before `default` runs (2026-07-21 sunrpc
+              incident) — use `is defined` / `'key' in dict` instead.
+
+        - name: Record TEST 9 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 9: IMDS parse safe on failed / sparse / full responses'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 9: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          AZURE AZ DERIVATION REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

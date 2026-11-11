@@ -1,0 +1,26 @@
+---
+# Helper for test_api_host_required.yml — not a test itself (name has no test_ prefix).
+- name: Run the gate with hammerspace_api_host='{{ item.v }}'
+  block:
+    - name: Include the gate
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: require_api_host
+      vars:
+        hammerspace_api_host: "{{ item.v }}"
+    - name: Record pass
+      ansible.builtin.set_fact:
+        _probe_failed: false
+        _probe_msg: ''
+  rescue:
+    - name: Record failure
+      ansible.builtin.set_fact:
+        _probe_failed: true
+        _probe_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: 'ASSERT: result matches expectation'
+  ansible.builtin.assert:
+    that:
+      - _probe_failed == item.expect_fail
+      - not item.expect_fail or ('hammerspace_api_host is not set' in _probe_msg)
+    quiet: true

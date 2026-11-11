@@ -1,0 +1,290 @@
+---
+# Integration test for --tags di-activate (Peter's 2026-05-21 report).
+#
+# Symptom: `ansible-playbook site.yml --tags di-activate -e deploy_di=true
+# -e di_activate=true` skipped EVERYTHING; nothing started, nothing
+# registered. Meanwhile `--tags di` (the umbrella tag) did the entire
+# install + activation.
+#
+# Root cause:
+#   1. `include_tasks` (dynamic include) does NOT propagate tags from the
+#      include task to its inner tasks. Even though the include statement
+#      itself carried `di-activate`, none of the tasks in services.yml /
+#      register.yml / container_deploy.yml did, so they were all skipped
+#      under `--tags di-activate`.
+#   2. Play-level pre_tasks (vault load, var validation, node-exists
+#      check) were untagged. `--tags X` skips every untagged task, so
+#      the activation run also lost vault and credentials.
+#
+# Fix:
+#   - Each `include_tasks` in roles/di/tasks/main.yml gets
+#     `apply: tags: [<same tags>]` so the tags propagate to every inner task.
+#   - Every pre_task/post_task in plays/di.yml gets `tags: [always]`.
+#
+# This test grep-audits the role + the play so a future maintainer can't
+# accidentally re-introduce the regression by adding a new include_tasks
+# without `apply:`.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_di_activate_tag.yml -i localhost, -c local
+
+- name: --tags di-activate regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _di_main: "{{ playbook_dir }}/../../roles/di/tasks/main.yml"
+    _play_di: "{{ playbook_dir }}/../../plays/di.yml"
+
+  tasks:
+    # ========================================================================
+    # TEST 1: every `ansible.builtin.include_tasks` in roles/di/tasks/main.yml
+    # tagged with `di-activate` MUST also carry `apply: tags: [...]` with
+    # `di-activate`. Otherwise the inner tasks get skipped.
+    # ========================================================================
+    - name: 'TEST 1: every di-activate include_tasks has apply: tags propagation'
+      block:
+        - name: Read roles/di/tasks/main.yml
+          ansible.builtin.slurp:
+            src: "{{ _di_main }}"
+          register: _di_main_raw
+
+        - name: Find include_tasks blocks tagged di-activate but missing apply.tags
+          ansible.builtin.shell:
+            executable: /bin/bash
+            cmd: |
+              set -uo pipefail
+              # Use awk to scan blocks. A block is a chunk between '- name:' lines.
+              # For each block: if it contains 'include_tasks' AND
+              # 'di-activate' appears in a top-level tags: list, then the same
+              # block MUST contain 'apply:' followed by tags with di-activate
+              # inside the include_tasks: dict.
+              awk '
+                /^- name:/ {
+                    # Process previous block
+                    if (block != "") evaluate(block)
+                    block = $0 "\n"
+                    next
+                }
+                { block = block $0 "\n" }
+                END { if (block != "") evaluate(block) }
+
+                function evaluate(b,    has_include, has_activate_tag, has_apply_activate) {
+                    has_include = (b ~ /include_tasks:/)
+                    if (!has_include) return
+                    has_activate_tag = (b ~ /tags:[^\n]*di-activate/)
+                    if (!has_activate_tag) return
+                    has_apply_activate = (b ~ /apply:[[:space:]]*\n[[:space:]]+tags:[^\n]*di-activate/)
+                    if (!has_apply_activate) {
+                        # Capture the task name on the first line
+                        match(b, /name:[[:space:]]*[^\n]+/)
+                        print substr(b, RSTART, RLENGTH)
+                    }
+                }
+              ' "{{ _di_main }}"
+          register: _bad_includes
+          changed_when: false
+
+        - name: 'TEST 1 ASSERT: zero include_tasks missing apply.tags propagation'
+          ansible.builtin.assert:
+            that:
+              - (_bad_includes.stdout | length) == 0
+            fail_msg: |
+              The following include_tasks blocks in roles/di/tasks/main.yml are
+              tagged `di-activate` but lack `apply: tags:` propagation —
+              their inner tasks WILL be skipped under `--tags di-activate`:
+
+              {{ _bad_includes.stdout }}
+
+              Fix: add `apply: tags: [di, ..., di-activate]` to each
+              include_tasks. See SK-N in SKILLS.md (TAG PROPAGATION NOTE).
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: every di-activate include_tasks propagates tags via apply:'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 2: pre_tasks AND post_tasks in plays/di.yml MUST be tagged [always]
+    # so vault load, credentials check, and node-exists check run under any
+    # --tags filter.
+    # ========================================================================
+    - name: 'TEST 2: pre_tasks/post_tasks in plays/di.yml tagged [always]'
+      block:
+        - name: Slurp plays/di.yml
+          ansible.builtin.slurp:
+            src: "{{ _play_di }}"
+          register: _play_di_raw
+
+        - name: Count tasks under pre_tasks and post_tasks vs tagged-always
+          ansible.builtin.shell:
+            executable: /bin/bash
+            cmd: |
+              set -uo pipefail
+              # Count '- name:' lines under pre_tasks/post_tasks (indented 4+ spaces)
+              # and compare against count of 'tags: [always]' under same.
+              awk '
+                /^  pre_tasks:/ || /^  post_tasks:/ { in_section=1; next }
+                /^  [a-z]/                          { in_section=0 }
+                in_section && /^    - name:/      { task_count++ }
+                # Anchored to the directive form. An unanchored match also counts
+                # comment lines that merely MENTION `tags: [always]`, which made
+                # this audit report more tags than tasks (2026-09-02).
+                in_section && /^[[:space:]]+tags:[[:space:]]*\[always\]/ { always_count++ }
+                END { printf "%d %d\n", task_count, always_count }
+              ' "{{ _play_di }}"
+          register: _tag_counts
+          changed_when: false
+
+        - name: Parse counts
+          ansible.builtin.set_fact:
+            _task_count: "{{ (_tag_counts.stdout | trim).split()[0] | int }}"
+            _always_count: "{{ (_tag_counts.stdout | trim).split()[1] | int }}"
+
+        - name: 'TEST 2 ASSERT: every pre_task / post_task has tags: [always]'
+          ansible.builtin.assert:
+            that:
+              - _task_count | int > 0
+              - _task_count | int == _always_count | int
+            fail_msg: |
+              In plays/di.yml, found {{ _task_count }} task(s) under
+              pre_tasks/post_tasks but only {{ _always_count }} carry
+              `tags: [always]`. Untagged pre/post tasks are skipped under
+              `--tags <X>` filtering, breaking activation runs.
+
+              Add `tags: [always]` to every pre_task and post_task.
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: all ' ~ _task_count ~ ' pre/post tasks in plays/di.yml carry tags: [always]'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 3: ansible-playbook --list-tasks --tags di-activate must show
+    # the activation tasks, not skip them all. This is the end-to-end
+    # check — if ansible itself agrees these tasks would run, we're good.
+    # ========================================================================
+    - name: 'TEST 3: --list-tasks --tags di-activate shows activation tasks'
+      block:
+        - name: List tasks that would run under --tags di-activate
+          ansible.builtin.shell:
+            executable: /bin/bash
+            cmd: |
+              cd "{{ playbook_dir }}/../.."
+              ansible-playbook --list-tasks --tags di-activate site.yml \
+                -i localhost, \
+                -e deploy_di=true \
+                -e di_activate=true 2>&1
+          register: _list_tasks
+          changed_when: false
+          # ansible-playbook returns nonzero when no hosts match; we only
+          # care about the list output.
+          failed_when: false
+
+        - name: 'TEST 3 ASSERT: list-tasks output mentions at least one activation task'
+          ansible.builtin.assert:
+            that:
+              - "'Start DI services' in _list_tasks.stdout or
+                 'Register DI node with Hammerspace' in _list_tasks.stdout or
+                 'Build, deploy, and register DI container' in _list_tasks.stdout"
+            fail_msg: |
+              `ansible-playbook --list-tasks --tags di-activate` did not list
+              any of the expected activation tasks. The include_tasks tag
+              propagation is broken again — re-check `apply: tags:` in
+              roles/di/tasks/main.yml.
+
+              Output:
+              {{ _list_tasks.stdout }}
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: --tags di-activate would actually run activation tasks'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 4: same propagation rule for the di-k8s tag — k8s deploy,
+    # status-label, and decommission must run as a unit under --tags di-k8s.
+    # ========================================================================
+    - name: 'TEST 4: every di-k8s include_tasks has apply: tags propagation'
+      block:
+        - name: Find include_tasks blocks tagged di-k8s but missing apply.tags di-k8s
+          ansible.builtin.shell:
+            executable: /bin/bash
+            cmd: |
+              set -uo pipefail
+              awk '
+                /^- name:/ {
+                    if (block != "") evaluate(block)
+                    block = $0 "\n"
+                    next
+                }
+                { block = block $0 "\n" }
+                END { if (block != "") evaluate(block) }
+
+                function evaluate(b,    has_include, has_k8s_tag, has_apply_k8s) {
+                    has_include = (b ~ /include_tasks:/)
+                    if (!has_include) return
+                    has_k8s_tag = (b ~ /tags:[^\n]*di-k8s/)
+                    if (!has_k8s_tag) return
+                    has_apply_k8s = (b ~ /apply:[[:space:]]*\n[[:space:]]+tags:[^\n]*di-k8s/)
+                    if (!has_apply_k8s) {
+                        match(b, /name:[[:space:]]*[^\n]+/)
+                        print substr(b, RSTART, RLENGTH)
+                    }
+                }
+              ' "{{ _di_main }}"
+          register: _bad_k8s_includes
+          changed_when: false
+
+        - name: 'TEST 4 ASSERT: zero di-k8s include_tasks missing apply.tags propagation'
+          ansible.builtin.assert:
+            that:
+              - (_bad_k8s_includes.stdout | length) == 0
+            fail_msg: |
+              These include_tasks blocks in roles/di/tasks/main.yml are
+              tagged `di-k8s` but lack `apply: tags:` propagation:
+
+              {{ _bad_k8s_includes.stdout }}
+
+              Add `apply: tags: [di, di-k8s, ...]` to each.
+
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: every di-k8s include_tasks propagates tags via apply:'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          DI-ACTIVATE TAG REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

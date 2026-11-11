@@ -1,0 +1,360 @@
+---
+# "Bring your own filesystem" mode.
+#
+# Use filesystems that are ALREADY built and mounted — an md array you created
+# yourself, a previous Tier 0 deployment, a SAN LUN, anything — instead of
+# discovering disks and building RAID. This role creates one export
+# subdirectory inside each mounted path and wires up NFS + Hammerspace around
+# it. It NEVER touches the filesystem itself.
+#
+# Explicitly NOT done in this mode:
+#   - no disk discovery, no mdadm, no mkfs, no wipefs
+#   - no /etc/fstab edits, no mount or unmount
+#   - filesystem_setup is skipped entirely (see plays/storage.yml)
+# The only write is `mkdir` of the export subdirectory.
+#
+# Enabled by setting existing_mount_paths. Two accepted entry shapes:
+#
+#   existing_mount_paths:
+#     - /mnt/raid0                  # subdir defaults to existing_mount_subdir
+#     - path: /data/array1
+#       subdir: tier0               # per-entry override
+#     - path: /data/array2
+#       subdir: ''                  # export the mountpoint itself
+#
+# WHY A SUBDIRECTORY, AND THE `mp` TRAP
+# -------------------------------------
+# The repo's default export options contain `mp`, which means "only export this
+# path if it is itself a mountpoint". A subdirectory of a mount is NOT a
+# mountpoint, so exporting one with `mp` silently produces no export at all —
+# showmount comes back empty and nfs_setup's own validation flags it.
+#
+# So for subdirectory exports the bare `mp` token is replaced with
+# `mountpoint=<the parent mount>`. That keeps the intent — refuse to export if
+# the underlying filesystem is not mounted, so a client never lands on an empty
+# directory on the root disk — while allowing the export path to be a subdir.
+# When subdir is '' the path IS the mountpoint and `mp` is left alone.
+
+- name: Use existing mounted filesystems
+  when: existing_mount_paths | default([]) | length > 0
+  block:
+    # Accept both a bare string and a {path, subdir} dict per entry.
+    - name: Normalise existing_mount_paths entries
+      ansible.builtin.set_fact:
+        _existing_mounts: >-
+          {{ _existing_mounts | default([]) + [{
+               'path': _em_path,
+               'subdir': _em_subdir,
+               'export_path': ((_em_path ~ '/' ~ _em_subdir)
+                               | regex_replace('//+', '/')
+                               | regex_replace('/+$', ''))
+                              | default(_em_path, true)
+             }] }}
+      loop: "{{ existing_mount_paths }}"
+      loop_control:
+        label: "{{ item if item is string else item.path }}"
+      vars:
+        # `| default(x, true)` guards the root case: '/' | regex_replace('/+$','')
+        # is the EMPTY string, which would otherwise render as '' in the refusal
+        # message and break the export path.
+        _em_path: >-
+          {{ ((item if item is string else item.path) | regex_replace('/+$', ''))
+             | default((item if item is string else item.path), true) }}
+        _em_subdir: >-
+          {{ (existing_mount_subdir | default('tier0')) if item is string
+             else (item.subdir | default(existing_mount_subdir | default('tier0'))) }}
+
+    - name: Announce existing-mount mode
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          EXISTING-MOUNT MODE
+          ============================================
+          Discovery, RAID and filesystem creation are all SKIPPED. Using
+          filesystems that are already mounted on this host:
+          {% for m in _existing_mounts %}
+            {{ m.path }} -> export {{ m.export_path }}
+          {% endfor %}
+          The only write to disk is mkdir of those export directories.
+          ============================================
+
+    # ------------------------------------------------------------------ #
+    # Validation
+    # ------------------------------------------------------------------ #
+    # A subdirectory of / exported with no_root_squash hands out the OS disk.
+    # This refuse-list mirrors HARD_SYSTEM_MOUNTS in files/scan_disks.sh.
+    - name: Refuse system mountpoints
+      ansible.builtin.fail:
+        msg: |
+          REFUSING to use '{{ item.path }}' as Tier 0 storage — it is a system
+          mountpoint. Exporting it over NFS (the default options include
+          no_root_squash for Hammerspace nodes) would expose the operating
+          system to every client.
+
+          Use a dedicated data filesystem instead.
+      loop: "{{ _existing_mounts }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: >-
+        item.path in ['', '/', '/boot', '/boot/efi', '/usr', '/usr/local',
+                      '/var', '/etc', '/home', '/lib', '/lib64', '/sbin',
+                      '/bin', '/root']
+
+    - name: Confirm each path is genuinely a mountpoint
+      ansible.builtin.command: "findmnt -n -o TARGET,SOURCE,FSTYPE --mountpoint {{ item.path }}"
+      register: _em_findmnt
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      loop: "{{ _existing_mounts }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Fail if a configured path is not a mountpoint
+      ansible.builtin.fail:
+        msg: |
+          existing_mount_paths entry '{{ item.item.path }}' is not a mountpoint.
+
+          This mode exports storage that is already mounted. If the path is just
+          a directory on the root filesystem, exporting it would hand clients
+          space on the OS disk instead of the array — so this is refused rather
+          than guessed at.
+
+          Mount the filesystem first (and add it to /etc/fstab so it survives a
+          reboot), then re-run. Current mounts:
+            findmnt -n -o TARGET,SOURCE,FSTYPE
+      loop: "{{ _em_findmnt.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      # `| default(1)`, NOT `is defined`. This is a safety gate: it refuses to
+      # export a path that is not a mountpoint. The probe above carries
+      # `check_mode: false`, so `rc` is always present today — but if that ever
+      # stops being true, a missing `rc` must read as "not verified" and FAIL,
+      # never as "fine". Fails closed.
+      #
+      # The writability gate further down deliberately does the opposite: its
+      # probe is skipped under --check on purpose, so a missing `rc` there means
+      # "not run", and it fails open. Same shape, opposite default — the
+      # difference is whether the probe was skipped BY DESIGN.
+      when: item.rc | default(1) != 0
+
+    - name: Identify disks that back critical system mounts
+      ansible.builtin.script:
+        cmd: scan_disks.sh --critical-disks
+      register: _em_critical
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve the disk behind each existing mount
+      ansible.builtin.script:
+        cmd: "scan_disks.sh --disk-for-mount {{ item.path | quote }}"
+      register: _em_disks
+      changed_when: false
+      check_mode: false
+      loop: "{{ _existing_mounts }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # Not fatal: a data partition on the OS disk is unusual but legitimate.
+    # Worth saying out loud, because it means Tier 0 traffic and the OS share
+    # spindles and a full export can wedge the node.
+    - name: Warn when an existing mount shares a disk with the OS
+      ansible.builtin.debug:
+        msg: |
+          WARNING: {{ item.item.path }} is on {{ item.stdout_lines | join(', ') }},
+          which also backs a critical system mount. Tier 0 traffic will contend
+          with the OS, and filling this export can wedge the node. A dedicated
+          disk is strongly preferred.
+      loop: "{{ _em_disks.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      when: >-
+        item.stdout_lines | default([]) | reject('equalto', '') | list
+        | intersect(_em_critical.stdout_lines | default([]) | reject('equalto', '') | list)
+        | length > 0
+
+    # ------------------------------------------------------------------ #
+    # The only write: create the export directories
+    # ------------------------------------------------------------------ #
+    - name: Create the export directory inside each mounted filesystem
+      ansible.builtin.file:
+        path: "{{ item.export_path }}"
+        state: directory
+        mode: "{{ existing_mount_dir_mode | default('0755') }}"
+        owner: "{{ existing_mount_dir_owner | default(omit) }}"
+        group: "{{ existing_mount_dir_group | default(omit) }}"
+      loop: "{{ _existing_mounts }}"
+      loop_control:
+        label: "{{ item.export_path }}"
+
+    # NO check_mode: false here, unlike the probes above.
+    #
+    # The distinction matters: `check_mode: false` is correct for probing
+    # PRE-EXISTING state (findmnt, --critical-disks, --disk-for-mount) — check
+    # mode does not change any of that, and skipping those probes would produce
+    # empty facts. It is WRONG for probing state that an earlier task in the
+    # same run creates. Under --check the mkdir above is only SIMULATED, so a
+    # `check_mode: false` probe here tests a directory that does not exist,
+    # `test -w` returns 1, and the dry run hard-fails on a directory the real
+    # run would have created:
+    #
+    #   TASK [Fail if an export directory is not writable]
+    #   failed: (item=/nvme) ... cmd: [test, -w, /nvme/tier0]  rc: 1
+    #
+    # So this is skipped under --check, alongside the mkdir it depends on.
+    - name: Verify each export directory is writable
+      ansible.builtin.command: >-
+        test -w {{ item.export_path | quote }}
+      register: _em_writable
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+      loop: "{{ _existing_mounts }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # Two different skip shapes have to be tolerated here, and only one of
+    # them is what the `| default([])` below handles.
+    #
+    # `| default([])` covers the probe never running at all (e.g. an empty
+    # _existing_mounts), where `_em_writable` has no `results` key.
+    #
+    # It does NOT cover the --check case, which is what actually broke. A
+    # LOOPED task whose `when` is false still registers a `results` list — one
+    # entry per item, each of the form
+    #
+    #   {"skipped": true, "skip_reason": "Conditional result was False",
+    #    "item": {...}, "changed": false}
+    #
+    # so `results` IS present, `| default([])` never fires, the loop runs over
+    # those skip dicts, and `item.rc` raises
+    #
+    #   The conditional check 'item.rc != 0' failed. The error was: error
+    #   while evaluating conditional (item.rc != 0): 'dict object' has no
+    #   attribute 'rc'
+    #
+    # This is the loop-shaped form of the 2026-07-21 registered-var rule: the
+    # per-ITEM attribute has to be guarded, not just the registered var.
+    - name: Fail if an export directory is not writable
+      ansible.builtin.fail:
+        msg: |
+          Export directory {{ item.item.export_path }} is not writable.
+
+          Either {{ item.item.path }} is mounted read-only, or the directory
+          was not created. Check both:
+
+            findmnt -n -o TARGET,SOURCE,OPTIONS {{ item.item.path }}
+            ls -ld {{ item.item.path }} {{ item.item.export_path }}
+
+          If {{ item.item.path }} itself is writable (touch a file there to
+          confirm) then the directory is missing rather than read-only.
+      loop: "{{ _em_writable.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      # `is defined` first: under --check every item is a skip dict with no
+      # `rc`, and Jinja evaluates both sides of `and` lazily in order.
+      when:
+        - item.rc is defined
+        - item.rc != 0
+
+    # ------------------------------------------------------------------ #
+    # Build the same facts discovery would have produced
+    # ------------------------------------------------------------------ #
+    - name: Build mount_points from the existing mounts
+      ansible.builtin.set_fact:
+        discovered_mount_points: >-
+          {{ discovered_mount_points | default([]) + [{
+               'path': item.item.export_path,
+               'device': _em_fields[1] | default('unmanaged', true),
+               'fstype': _em_fields[2] | default('unknown', true),
+               'label': item.item.subdir | default('tier0', true),
+               'mount_opts': 'defaults,nofail',
+               'is_raid': false,
+               'is_existing_mount': true,
+               'parent_mount': item.item.path
+             }] }}
+      loop: "{{ _em_findmnt.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      vars:
+        # findmnt -o TARGET,SOURCE,FSTYPE -> "<target> <source> <fstype>".
+        # Padded so a short line cannot raise an index error.
+        _em_fields: "{{ ((item.stdout | default('')).split() + ['', '', '']) }}"
+
+    - name: Override mount_points with the existing-mount configuration
+      ansible.builtin.set_fact:
+        mount_points: "{{ discovered_mount_points }}"
+
+    # `mp` means "only export this path if it is itself a mountpoint". An export
+    # subdirectory is not one, so leaving `mp` in place silently produces no
+    # export. mountpoint=<parent> keeps the guarantee and works for a subdir.
+    # When subdir is '' the export path IS the mountpoint, so `mp` is kept.
+    - name: Collect export clients per export path (Hammerspace nodes + movers)
+      ansible.builtin.set_fact:
+        _em_clients_by_path: >-
+          {{ _em_clients_by_path | default({}) | combine({
+               item.0.path: (_em_clients_by_path | default({})).get(item.0.path, [])
+                            + [{'host': item.1, 'options': _em_opts}]
+             }) }}
+      loop: "{{ mount_points | product((hammerspace_nodes | default([])) + (mover_nodes | default([]))) | list }}"
+      loop_control:
+        label: "{{ item.0.path }} <- {{ item.1 }}"
+      vars:
+        _em_raw: "{{ hammerspace_export_opts | default('rw,no_root_squash,sync,secure,mp,no_subtree_check') }}"
+        _em_opts: >-
+          {{ _em_raw if item.0.path == item.0.parent_mount
+             else (_em_raw.split(',') | reject('equalto', 'mp') | list
+                   + ['mountpoint=' ~ item.0.parent_mount]) | join(',') }}
+
+    - name: Collect export clients per export path (client subnets)
+      ansible.builtin.set_fact:
+        _em_clients_by_path: >-
+          {{ _em_clients_by_path | default({}) | combine({
+               item.0.path: (_em_clients_by_path | default({})).get(item.0.path, [])
+                            + [{'host': item.1, 'options': _em_opts}]
+             }) }}
+      loop: "{{ mount_points | product(client_subnets | default([])) | list }}"
+      loop_control:
+        label: "{{ item.0.path }} <- {{ item.1 }}"
+      vars:
+        _em_raw: "{{ client_export_opts | default('rw,root_squash,sync,secure,mp,no_subtree_check') }}"
+        _em_opts: >-
+          {{ _em_raw if item.0.path == item.0.parent_mount
+             else (_em_raw.split(',') | reject('equalto', 'mp') | list
+                   + ['mountpoint=' ~ item.0.parent_mount]) | join(',') }}
+
+    - name: Assemble nfs_exports
+      ansible.builtin.set_fact:
+        discovered_nfs_exports: >-
+          {{ discovered_nfs_exports | default([]) + [{
+               'path': item.path,
+               'clients': (_em_clients_by_path | default({})).get(item.path, [])
+             }] }}
+      loop: "{{ mount_points }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Override nfs_exports with the existing-mount configuration
+      ansible.builtin.set_fact:
+        nfs_exports: "{{ discovered_nfs_exports }}"
+
+    - name: Set existing-mount mode flag
+      ansible.builtin.set_fact:
+        _existing_mounts_mode: true
+
+    - name: Display existing-mount configuration
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          EXISTING-MOUNT CONFIGURATION COMPLETE
+          ============================================
+          Exports:
+          {% for e in nfs_exports %}
+            {{ e.path }}
+          {% for c in e.clients %}
+              {{ c.host }}({{ c.options }})
+          {% endfor %}
+          {% endfor %}
+
+          Hammerspace volumes: {{ mount_points | length }}
+          ============================================

@@ -1,0 +1,609 @@
+---
+# Tests for the vm dirty-page writeback limits (NFS client ingest tuning).
+#
+# Background (2026-09-25): a field question asked why Tier 0 tunes the NFSD /
+# sunrpc / TCP side heavily but sets nothing on the NFS *client* writeback
+# path, where a bulk ingest (azcopy) appears to consume very large amounts of
+# memory. The recipe circulating for it was:
+#
+#     sysctl -w vm.dirty_background_bytes=268435456   # 256 MB
+#     sysctl -w vm.dirty_bytes=1073741824             # 1 GB
+#     sysctl -w vm.dirty_background_ratio=0
+#     sysctl -w vm.dirty_ratio=0
+#
+# That recipe silently discards its own first line. vm.dirty_*_bytes and
+# vm.dirty_*_ratio are ONE limit in two units, and the kernel keeps them
+# exclusive by zeroing the other on write (mm/page-writeback.c):
+#
+#   dirty_background_bytes_handler -> dirty_background_ratio = 0   (always)
+#   dirty_background_ratio_handler -> dirty_background_bytes = 0   (always)
+#   dirty_bytes_handler            -> vm_dirty_ratio         = 0   (on change)
+#   dirty_ratio_handler            -> vm_dirty_bytes         = 0   (on change)
+#
+# So line 3 resets dirty_background_bytes to 0 and the background flush
+# threshold ends up at 0 pages instead of 256 MB. Line 4 is a no-op only
+# because line 2 already set the ratio to 0 and that handler acts on a change.
+#
+# TEST 1 simulates the four handlers and pins that outcome, so the reason the
+# role refuses to write *_ratio keys cannot be "cleaned up" away. TESTS 2-3
+# exercise the guard, TEST 4 audits the task file, TEST 5 the wiring + docs.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_vm_writeback.yml -i localhost, -c local
+
+- name: vm dirty-page writeback limit tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _repo: "{{ playbook_dir }}/../.."
+    _pagesize: 4096
+
+    # Kernel defaults before anything is written.
+    _kernel_initial:
+      dirty_background_bytes: 0
+      dirty_background_ratio: 10
+      dirty_bytes: 0
+      dirty_ratio: 20
+
+    # The shipped configuration.
+    _shipped: "{{ {'vm.dirty_background_bytes': 268435456, 'vm.dirty_bytes': 1073741824} }}"
+
+  tasks:
+    # ========================================================================
+    # TEST 1: the four-line recipe loses its own 256 MB background threshold.
+    #
+    # Each step below is one kernel sysctl handler, applied in the order the
+    # recipe writes them. Nothing here reads the host's real /proc/sys.
+    # ========================================================================
+    - name: 'TEST 1: the *_ratio lines cancel the *_bytes lines above them'
+      block:
+        - name: Start from kernel defaults
+          ansible.builtin.set_fact:
+            _k: "{{ _kernel_initial }}"
+
+        # Line 1: vm.dirty_background_bytes = 268435456
+        # dirty_background_bytes_handler sets dirty_background_ratio = 0
+        # unconditionally on any successful write.
+        - name: 'Line 1: write dirty_background_bytes=256MB'
+          ansible.builtin.set_fact:
+            _k: >-
+              {{ _k | combine({'dirty_background_bytes': 268435456,
+                               'dirty_background_ratio': 0}) }}
+
+        # Line 2: vm.dirty_bytes = 1073741824
+        # dirty_bytes_handler sets vm_dirty_ratio = 0, but only when the value
+        # changed. 0 -> 1 GB is a change, so the ratio is zeroed.
+        - name: 'Line 2: write dirty_bytes=1GB'
+          ansible.builtin.set_fact:
+            _k: >-
+              {{ _k | combine({'dirty_bytes': 1073741824,
+                               'dirty_ratio': 0}
+                              if (_k.dirty_bytes | int) != 1073741824
+                              else {'dirty_bytes': 1073741824}) }}
+
+        # Line 3: vm.dirty_background_ratio = 0
+        # dirty_background_ratio_handler sets dirty_background_bytes = 0
+        # unconditionally -- this is the line that destroys line 1.
+        - name: 'Line 3: write dirty_background_ratio=0'
+          ansible.builtin.set_fact:
+            _k: >-
+              {{ _k | combine({'dirty_background_ratio': 0,
+                               'dirty_background_bytes': 0}) }}
+
+        # Line 4: vm.dirty_ratio = 0
+        # dirty_ratio_handler zeroes vm_dirty_bytes only on a CHANGE. Line 2
+        # already set the ratio to 0, so this write changes nothing and the
+        # 1 GB cap survives -- by luck, not by design.
+        - name: 'Line 4: write dirty_ratio=0'
+          ansible.builtin.set_fact:
+            _k: >-
+              {{ _k | combine({'dirty_ratio': 0, 'dirty_bytes': 0}
+                              if (_k.dirty_ratio | int) != 0
+                              else {'dirty_ratio': 0}) }}
+
+        # global_dirty_limits(): the *_bytes value wins when non-zero,
+        # otherwise the ratio is applied to available memory.
+        - name: Derive the effective thresholds a 512 GB host would get
+          ansible.builtin.set_fact:
+            _t1_dirty_pages: >-
+              {{ ((_k.dirty_bytes | int) / _pagesize) | round(0, 'ceil') | int
+                 if (_k.dirty_bytes | int) > 0
+                 else ((_k.dirty_ratio | int) * _avail_pages / 100) | int }}
+            _t1_background_pages: >-
+              {{ ((_k.dirty_background_bytes | int) / _pagesize) | round(0, 'ceil') | int
+                 if (_k.dirty_background_bytes | int) > 0
+                 else ((_k.dirty_background_ratio | int) * _avail_pages / 100) | int }}
+          vars:
+            _avail_pages: "{{ (512 * 1024 * 1024 * 1024 / _pagesize) | int }}"
+
+        - name: 'TEST 1 ASSERT: line 3 silently zeroed the 256 MB target'
+          ansible.builtin.assert:
+            that:
+              # The 1 GB hard cap survived -- only because line 4 was a no-op.
+              - _k.dirty_bytes | int == 1073741824
+              - _t1_dirty_pages | int == 262144
+              # The 256 MB background target did NOT survive.
+              - _k.dirty_background_bytes | int == 0
+              - _k.dirty_background_ratio | int == 0
+              - _t1_background_pages | int == 0
+            fail_msg: |
+              The handler simulation no longer reproduces the recipe's outcome.
+              final kernel state: {{ _k }}
+              dirty threshold:      {{ _t1_dirty_pages }} pages
+              background threshold: {{ _t1_background_pages }} pages
+              Expected dirty_bytes=1073741824 and dirty_background_bytes=0
+              (line 3 overwrites line 1). If the kernel handlers changed,
+              update both this test and the header of
+              roles/perf_tuning/tasks/vm_writeback.yml.
+            success_msg: >-
+              Four-line recipe yields dirty=1 GB but background=0 pages -- the
+              256 MB setting is discarded by the dirty_background_ratio line.
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: *_ratio=0 lines cancel the *_bytes lines above them (256 MB background target lost)'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2: the guard rejects every config whose meaning depends on order.
+    #
+    # The conditions are the ones in vm_writeback.yml, evaluated here against
+    # each bad input. A config that the guard would accept is a regression.
+    # ========================================================================
+    - name: 'TEST 2: guard rejects mixed forms, sub-page values and ratio=0'
+      block:
+        - name: Evaluate the guard against each bad configuration
+          ansible.builtin.set_fact:
+            _t2_verdicts: >-
+              {{ _t2_verdicts | default({}) | combine({item.name: _accepted}) }}
+          vars:
+            _keys: "{{ item.cfg | dict2items | map(attribute='key') | list }}"
+            # Same int coercion the role applies, so a quoted number in
+            # vars/main.yml cannot make the `lt` comparisons compare a string
+            # to an int (a Jinja type error, not the guard's own message).
+            _cfg: >-
+              {{ dict(item.cfg | dict2items | map(attribute='key') | list
+                      | zip(item.cfg | dict2items | map(attribute='value')
+                            | map('int') | list)) }}
+            _accepted: >-
+              {{ (not ('vm.dirty_bytes' in _keys and 'vm.dirty_ratio' in _keys))
+                 and (not ('vm.dirty_background_bytes' in _keys
+                           and 'vm.dirty_background_ratio' in _keys))
+                 and (_cfg | dict2items
+                      | selectattr('key', 'match', '^vm\.dirty(_background)?_bytes$')
+                      | selectattr('value', 'lt', _pagesize * 2)
+                      | list | length == 0)
+                 and ((not ('vm.dirty_background_bytes' in _keys
+                            and 'vm.dirty_bytes' in _keys))
+                      or (_cfg['vm.dirty_background_bytes'] | int
+                          < _cfg['vm.dirty_bytes'] | int))
+                 and (_cfg | dict2items
+                      | selectattr('key', 'match', '^vm\.dirty(_background)?_ratio$')
+                      | selectattr('value', 'eq', 0)
+                      | list | length == 0) }}
+          loop:
+            # The verbatim four-line recipe.
+            - name: recipe_all_four
+              cfg:
+                vm.dirty_background_bytes: 268435456
+                vm.dirty_bytes: 1073741824
+                vm.dirty_background_ratio: 0
+                vm.dirty_ratio: 0
+            # Mixed forms, one limit at a time.
+            - name: mixed_dirty
+              cfg: {vm.dirty_bytes: 1073741824, vm.dirty_ratio: 20}
+            - name: mixed_background
+              cfg: {vm.dirty_background_bytes: 268435456, vm.dirty_background_ratio: 10}
+            # ratio=0 alone is a zero-page threshold, not "off".
+            - name: ratio_zero_only
+              cfg: {vm.dirty_ratio: 0, vm.dirty_background_ratio: 0}
+            # Below two pages: the kernel ignores the write and keeps the old value.
+            - name: sub_page_bytes
+              cfg: {vm.dirty_bytes: 4096}
+            # background >= dirty: the kernel substitutes dirty / 2.
+            - name: background_above_dirty
+              cfg: {vm.dirty_background_bytes: 2147483648, vm.dirty_bytes: 1073741824}
+            # Good configs the guard must NOT reject.
+            - name: good_shipped
+              cfg: {vm.dirty_background_bytes: 268435456, vm.dirty_bytes: 1073741824}
+            - name: good_ratio_only
+              cfg: {vm.dirty_background_ratio: 2, vm.dirty_ratio: 5}
+            # Quoted numbers: accepted, and the comparison must not raise.
+            - name: good_quoted_bytes
+              cfg: {vm.dirty_background_bytes: '268435456', vm.dirty_bytes: '1073741824'}
+            # A non-numeric value coerces to 0 and trips the two-page floor.
+            - name: non_numeric_bytes
+              cfg: {vm.dirty_bytes: '1GB'}
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: 'TEST 2 ASSERT: only the two valid configs are accepted'
+          ansible.builtin.assert:
+            that:
+              - not (_t2_verdicts.recipe_all_four | bool)
+              - not (_t2_verdicts.mixed_dirty | bool)
+              - not (_t2_verdicts.mixed_background | bool)
+              - not (_t2_verdicts.ratio_zero_only | bool)
+              - not (_t2_verdicts.sub_page_bytes | bool)
+              - not (_t2_verdicts.background_above_dirty | bool)
+              - _t2_verdicts.good_shipped | bool
+              - _t2_verdicts.good_ratio_only | bool
+              - _t2_verdicts.good_quoted_bytes | bool
+              - not (_t2_verdicts.non_numeric_bytes | bool)
+            fail_msg: |
+              The writeback guard admitted a configuration it must refuse, or
+              refused a valid one.
+              verdicts (true = accepted): {{ _t2_verdicts }}
+            success_msg: >-
+              Guard refuses the four-line recipe, both mixed forms, ratio=0,
+              sub-page values and background >= dirty; accepts *_bytes-only and
+              *_ratio-only.
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: guard refuses mixed forms / ratio=0 / sub-page / background>=dirty, accepts both single-form configs'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3: the SHIPPED defaults pass their own guard.
+    # ========================================================================
+    - name: 'TEST 3: shipped defaults use one form and are internally ordered'
+      block:
+        - name: Load role defaults and vars/main.yml
+          ansible.builtin.include_vars:
+            file: "{{ item.file }}"
+            name: "{{ item.name }}"
+          loop:
+            - {file: "{{ _repo }}/roles/perf_tuning/defaults/main.yml", name: _t3_defaults}
+            - {file: "{{ _repo }}/vars/main.yml", name: _t3_vars}
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: 'TEST 3 ASSERT: defaults and vars/main.yml agree and are valid'
+          ansible.builtin.assert:
+            that:
+              # Opt-in in both places -- a global writeback cap must not be
+              # switched on for every storage_server by a repo update.
+              - _t3_defaults.perf_vm_writeback_enabled | bool == false
+              - _t3_vars.perf_vm_writeback_enabled | bool == false
+              # Only the *_bytes form is shipped.
+              - >-
+                _t3_defaults.perf_vm_writeback | dict2items
+                  | selectattr('key', 'search', '_ratio$') | list | length == 0
+              - >-
+                _t3_vars.perf_vm_writeback | dict2items
+                  | selectattr('key', 'search', '_ratio$') | list | length == 0
+              - "'vm.dirty_bytes' in _t3_defaults.perf_vm_writeback"
+              - "'vm.dirty_background_bytes' in _t3_defaults.perf_vm_writeback"
+              # background strictly below the hard cap, both above two pages.
+              - >-
+                _t3_defaults.perf_vm_writeback['vm.dirty_background_bytes'] | int
+                < _t3_defaults.perf_vm_writeback['vm.dirty_bytes'] | int
+              - >-
+                _t3_defaults.perf_vm_writeback | dict2items
+                  | selectattr('value', 'lt', _pagesize * 2) | list | length == 0
+              # vars/main.yml must not drift from the role defaults.
+              - _t3_vars.perf_vm_writeback == _t3_defaults.perf_vm_writeback
+              # The sysctl.d filename is a plain basename, not a path.
+              - "'/' not in _t3_defaults.perf_vm_writeback_sysctl_filename"
+              - _t3_defaults.perf_vm_writeback_sysctl_filename is search('\.conf$')
+            fail_msg: |
+              Shipped writeback defaults are not a valid single-form config.
+              defaults:      {{ _t3_defaults.perf_vm_writeback | default('MISSING') }}
+              vars/main.yml: {{ _t3_vars.perf_vm_writeback | default('MISSING') }}
+              enabled:       defaults={{ _t3_defaults.perf_vm_writeback_enabled | default('MISSING') }}
+                             vars={{ _t3_vars.perf_vm_writeback_enabled | default('MISSING') }}
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: shipped defaults are *_bytes-only, background<dirty, opt-in, and identical in defaults/ and vars/main.yml'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 4: source audit of vm_writeback.yml.
+    #
+    # The two probes are read-only command/shell tasks whose output feeds a
+    # safety assert, so they must carry check_mode: false -- otherwise --check
+    # skips them, they register stdout: '' and the guard evaluates against an
+    # empty page size. The verification assert must be gated the other way:
+    # nothing was applied under --check, so it would read stale values.
+    # ========================================================================
+    - name: 'TEST 4: vm_writeback.yml check-mode handling and sysctl_file'
+      block:
+        - name: Read vm_writeback.yml
+          ansible.builtin.slurp:
+            src: "{{ _repo }}/roles/perf_tuning/tasks/vm_writeback.yml"
+          register: _t4_raw
+
+        # splitlines() and regex_findall(multiline=True), NOT .split('\n'):
+        # a YAML block scalar does not process string escapes, so inside `>-`
+        # the Jinja literal '\n' is a literal backslash-n and .split() returns
+        # a single element containing the whole file -- every count then reads
+        # 0 and the audit passes vacuously. Same trap as the note in
+        # test_existing_mounts.yml and test_protected_vs_md_split.yml.
+        - name: Decode, strip comment lines, and count check_mode occurrences
+          ansible.builtin.set_fact:
+            # Comments are stripped before the audit: the file's own header
+            # explains the /etc/sysctl.conf trap in prose, so a negative
+            # search over the raw text would always report a regression.
+            # Double-quoted, NOT `>-`: a block scalar does not process string
+            # escapes, so join('\n') there joins with a literal backslash-n and
+            # every multi-line needle below silently stops matching.
+            _t4_code: "{{ (_t4_raw.content | b64decode).splitlines() | reject('search', '^[ \\t]*#') | join('\n') }}"
+            _t4_check_mode_false: >-
+              {{ (_t4_raw.content | b64decode)
+                 | regex_findall('^[ \t]*check_mode:[ \t]*false[ \t]*$', multiline=True)
+                 | length }}
+            _t4_shell_tasks: >-
+              {{ (_t4_raw.content | b64decode)
+                 | regex_findall('^[ \t]*ansible\.builtin\.shell:', multiline=True)
+                 | length }}
+            _t4_bash: >-
+              {{ (_t4_raw.content | b64decode)
+                 | regex_findall('^[ \t]*executable: /bin/bash[ \t]*$', multiline=True)
+                 | length }}
+            _t4_locale: >-
+              {{ (_t4_raw.content | b64decode)
+                 | regex_findall('LC_ALL=C LANG=C') | length }}
+
+        - name: 'TEST 4 ASSERT: probes are check_mode-safe, sysctl_file pinned'
+          ansible.builtin.assert:
+            that:
+              # Both read-only probes exist and both are exempted from --check.
+              - _t4_shell_tasks | int == 2
+              - _t4_check_mode_false | int == 2
+              # The verification is the one thing that must NOT run in check
+              # mode -- nothing was applied, so the read-back is stale.
+              - "_t4_code is search('when: not ansible_check_mode')"
+              # Persisted to our own sysctl.d file, never /etc/sysctl.conf
+              # (procps applies /etc/sysctl.conf last and would shadow it).
+              - _t4_code is search('/etc/sysctl\.d/\{\{ perf_vm_writeback_sysctl_filename \}\}')
+              - _t4_code is not search('sysctl_file.*/etc/sysctl\.conf')
+              # The *_bytes / *_ratio mutual-exclusion guard, both limits.
+              - _t4_code is search('vm\.dirty_bytes. in _vmwb_keys and .vm\.dirty_ratio. in _vmwb_keys')
+              - _t4_code is search('vm\.dirty_background_bytes. in _vmwb_keys')
+              # The two-page minimum (a smaller value is silently ignored).
+              - _t4_code is search('selectattr\(.value., .lt., \(_vmwb_pagesize \| int\) \* 2\)')
+              # The ratio=0 rule: the two filter lines must stay adjacent, or
+              # the rule stops being about *_ratio keys specifically.
+              - _t4_code is search('_ratio\$.\)\s+\| selectattr\(.value., .eq., 0\)')
+              # background < dirty, or the kernel substitutes dirty / 2.
+              - _t4_code is search('vm\.dirty_background_bytes.\] \| int')
+              # The read-back skips an unreadable knob instead of emitting an
+              # empty value: printf "$(cat missing)" does NOT trip `set -e`, so
+              # without the -r test the task exits 0 with empty values and the
+              # verification confirms nothing. Guarded on LENGTH, not on the
+              # key being defined.
+              - _t4_code is search('\[ -r "\$f" \]')
+              - _t4_code is search('_vmwb_unread \| length == 0')
+              - _t4_code is search("rejectattr\('value', 'eq', ''\)")
+              # Values coerced to int once, so the guard's own message is what
+              # an operator sees when a number is quoted in vars/main.yml.
+              - _t4_code is search("map\('int'\)")
+              - _t4_code is not search('perf_vm_writeback \| dict2items\s+\| selectattr')
+              # The read-back must not be the task that fails the play, or the
+              # diagnostics below it never run.
+              - "_t4_code is search('register: _vmwb_effective\\s+changed_when: false\\s+failed_when: false')"
+              # Both probes pin the locale (they parse getconf and grep
+              # output) and both force bash (pipefail; Ubuntu /bin/sh is dash).
+              # Counted, not matched once -- there are two probes.
+              - _t4_locale | int == 2
+              - _t4_bash | int == 2
+            fail_msg: |
+              REGRESSION in roles/perf_tuning/tasks/vm_writeback.yml. Required:
+                - exactly 2 read-only shell probes, each with check_mode: false
+                  (a --check skip registers stdout: '' and the guard passes on
+                  an empty page size)
+                - the effective-value verification gated on
+                  `when: not ansible_check_mode`
+                - sysctl_file pinned to /etc/sysctl.d/{{ '{{' }} perf_vm_writeback_sysctl_filename {{ '}}' }},
+                  never /etc/sysctl.conf
+                - the *_bytes / *_ratio mutual-exclusion, two-page-minimum and
+                  ratio-zero conditions in the assert
+                - LC_ALL=C LANG=C and executable: /bin/bash in the probes
+              check_mode: false count = {{ _t4_check_mode_false }}
+              shell task count        = {{ _t4_shell_tasks }}
+              LC_ALL=C LANG=C count   = {{ _t4_locale }}
+              /bin/bash count         = {{ _t4_bash }}
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: both probes check_mode:false, verification gated on not ansible_check_mode, sysctl_file pinned to sysctl.d, guard conditions present'] }}"
+      rescue:
+        - name: Record TEST 4 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 5: wiring and documentation.
+    # ========================================================================
+    - name: 'TEST 5: role wiring, tag, and documentation'
+      block:
+        - name: Read role main.yml and the docs
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          register: _t5_raw
+          loop:
+            - "{{ _repo }}/roles/perf_tuning/tasks/main.yml"
+            - "{{ _repo }}/VARIABLE_REFERENCE.md"
+            - "{{ _repo }}/docs/TROUBLESHOOTING.md"
+          loop_control:
+            label: "{{ item | basename }}"
+
+        - name: Decode
+          ansible.builtin.set_fact:
+            _t5_main: "{{ _t5_raw.results[0].content | b64decode }}"
+            _t5_ref: "{{ _t5_raw.results[1].content | b64decode }}"
+            _t5_trouble: "{{ _t5_raw.results[2].content | b64decode }}"
+
+        - name: 'TEST 5 ASSERT: included, gated, tagged, documented'
+          ansible.builtin.assert:
+            that:
+              - "_t5_main is search('include_tasks. vm_writeback.yml')"
+              - _t5_main is search('perf_vm_writeback_enabled \| default\(false\) \| bool')
+              # Its own tag, so it can be applied without re-running the rest
+              # of the role (IRQ pinning bounces irqbalance).
+              - _t5_main is search('tags..\[perf, writeback\]')
+              # Reported in the role summary, so a run says whether it applied.
+              - _t5_main is search('vm writeback limits:')
+              # Documented as a variable and as a symptom.
+              - _t5_ref is search('perf_vm_writeback_enabled')
+              - _t5_ref is search('perf_vm_writeback')
+              - _t5_trouble is search('dirty_background_bytes')
+              - _t5_trouble is search('NFS_Unstable')
+            fail_msg: |
+              Writeback tuning is not wired or documented. Required:
+                - roles/perf_tuning/tasks/main.yml includes vm_writeback.yml,
+                  gated on perf_vm_writeback_enabled (default false),
+                  tagged [perf, writeback], listed in the role summary
+                - VARIABLE_REFERENCE.md documents perf_vm_writeback* variables
+                - docs/TROUBLESHOOTING.md covers the memory symptom and names
+                  the /proc/meminfo counters (Dirty / NFS_Unstable)
+
+        - name: Record TEST 5 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 5: included gated+tagged, shown in role summary, documented in VARIABLE_REFERENCE.md and docs/TROUBLESHOOTING.md'] }}"
+      rescue:
+        - name: Record TEST 5 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 5: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 6: the post-apply verification must not pass on nothing.
+    #
+    # Found by smoke-running the role on a host with no /proc/sys/vm: the
+    # read-back exited 0 with empty values (a failing `$(cat ...)` inside
+    # printf does not trip `set -e`) and the verification reported success for
+    # limits it had never seen. The consumer expressions below are the ones in
+    # vm_writeback.yml, evaluated against synthetic read-back maps.
+    # ========================================================================
+    - name: 'TEST 6: verification fails on an empty or zeroed read-back'
+      block:
+        - name: Evaluate the verification against each read-back shape
+          ansible.builtin.set_fact:
+            _t6_verdicts: >-
+              {{ _t6_verdicts | default({}) | combine({item.name: {
+                   'unread': _unread, 'zeroed': _zeroed,
+                   'passes': (_unread | length == 0) and (_zeroed | length == 0)}}) }}
+          vars:
+            _unread: >-
+              {{ _shipped | dict2items
+                 | map(attribute='key')
+                 | reject('in', (item.eff | dict2items
+                                 | rejectattr('value', 'eq', '')
+                                 | map(attribute='key') | list))
+                 | list }}
+            _zeroed: >-
+              {{ _shipped | dict2items
+                 | rejectattr('value', 'eq', 0)
+                 | map(attribute='key')
+                 | select('in', (item.eff | dict2items
+                                 | selectattr('value', 'eq', '0')
+                                 | map(attribute='key') | list))
+                 | list }}
+          loop:
+            # Nothing came back at all (no /proc/sys/vm, or wrong key names).
+            - name: empty_map
+              eff: {}
+            # The knobs were listed but produced empty values.
+            - name: empty_values
+              eff: {vm.dirty_background_bytes: '', vm.dirty_bytes: ''}
+            # Only one of the two came back.
+            - name: partial
+              eff: {vm.dirty_bytes: '1073741824'}
+            # Something zeroed the background threshold after we wrote it --
+            # the ordering footgun, observed after the fact.
+            - name: background_zeroed
+              eff:
+                vm.dirty_background_bytes: '0'
+                vm.dirty_background_ratio: '0'
+                vm.dirty_bytes: '1073741824'
+                vm.dirty_ratio: '0'
+            # The healthy shape: both *_bytes kept, both *_ratio reported as 0
+            # by the kernel because it is not using that unit.
+            - name: healthy
+              eff:
+                vm.dirty_background_bytes: '268435456'
+                vm.dirty_background_ratio: '0'
+                vm.dirty_bytes: '1073741824'
+                vm.dirty_ratio: '0'
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: 'TEST 6 ASSERT: only the healthy read-back verifies'
+          ansible.builtin.assert:
+            that:
+              # An unverifiable read-back is a failure, never a silent success.
+              - not (_t6_verdicts.empty_map.passes | bool)
+              - _t6_verdicts.empty_map.unread | length == 2
+              - not (_t6_verdicts.empty_values.passes | bool)
+              - _t6_verdicts.empty_values.unread | length == 2
+              - not (_t6_verdicts.partial.passes | bool)
+              - _t6_verdicts.partial.unread == ['vm.dirty_background_bytes']
+              # A zeroed value is reported as zeroed, not as unread.
+              - not (_t6_verdicts.background_zeroed.passes | bool)
+              - _t6_verdicts.background_zeroed.zeroed == ['vm.dirty_background_bytes']
+              - _t6_verdicts.background_zeroed.unread | length == 0
+              # A *_ratio of 0 next to a set *_bytes is expected, not a failure.
+              - _t6_verdicts.healthy.passes | bool
+              - _t6_verdicts.healthy.unread | length == 0
+              - _t6_verdicts.healthy.zeroed | length == 0
+            fail_msg: |
+              The post-apply verification does not distinguish "not verified"
+              from "verified good".
+              verdicts: {{ _t6_verdicts }}
+            success_msg: >-
+              Verification fails on an empty, partial or zeroed read-back and
+              passes only when every requested key came back non-empty and
+              non-zero.
+
+        - name: Record TEST 6 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 6: verification fails on empty/partial/zeroed read-back, passes only on a verified one'] }}"
+      rescue:
+        - name: Record TEST 6 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 6: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          VM WRITEBACK LIMIT TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

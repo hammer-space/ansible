@@ -1,0 +1,232 @@
+---
+# Regression test for the "Discovery produced 0 RAID arrays" diagnostics.
+#
+# Reported 2026-08-26 (third report, same Azure HBv3 VMSS host). Once
+# check-mode detection was fixed, discovery ran for real (ok=53,
+# "boot_device detected: sda") and then aborted with:
+#
+#   Discovery produced 0 RAID arrays. Check:
+#   - storage_type is set correctly (current: ssd)
+#   - Drives exist and are not excluded by boot device detection
+#   - boot_device detected: sda
+#
+# That message names the suspects but reports NOTHING about what the host
+# actually has, so it cannot be acted on without SSHing to the node. At least
+# four distinct causes produce it, and they need different fixes:
+#
+#   A. storage_type ssd|hdd but every /dev/sd* has the opposite rotational
+#      flag. Azure synthetic SCSI reports rotational=1 even for Premium SSD,
+#      so `ssd` silently drops real data disks.  -> storage_type: scsi
+#   B. storage_type ssd|hdd|scsi on a host whose Tier 0 disks are local NVMe
+#      (Azure HBv3/L-series, AWS i-series, most bare metal). The NVMe block is
+#      gated on storage_type in [nvme, all] and never ran.  -> nvme | all
+#   C. genuinely no candidate disks on either path.
+#   D. disks existed but every one was excluded (protected / boot / explicit
+#      *_exclude_* lists).
+#
+# Fix: snapshot scsi_all_devices before the destructive rotational filter, add
+# a failure-path topology dump, and pick the most likely cause explicitly.
+#
+# NOTE ON COVERAGE: TEST 1 mirrors the branch conditions from main.yml rather
+# than rendering the real template (the message is inline in an assert and
+# cannot be invoked in isolation). TEST 2 therefore audits the source so that
+# deleting or renaming a branch is still caught. Keep the two in step.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_discovery_diagnostics.yml \
+#       -i localhost, -c local
+
+- name: Discovery-diagnostics regression tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+
+    # Branch selection, mirrored from the fail_msg in
+    # roles/nvme_discovery/tasks/main.yml.
+    _cases:
+      - name: "A: Azure Premium SSD reports rotational=1, ssd filter drops all"
+        storage_type: ssd
+        nvme_all: 0
+        pre: 2          # sdc + sdd found by the raw scan
+        post: 0         # both dropped by selectattr('rotational', 0)
+        expect: rotational_filter
+
+      - name: "B: HBv3 local NVMe never scanned because storage_type is ssd"
+        storage_type: ssd
+        nvme_all: 0
+        pre: 0
+        post: 0
+        expect: nvme_not_scanned
+
+      - name: "B2: storage_type scsi on an NVMe-only host"
+        storage_type: scsi
+        nvme_all: 0
+        pre: 0
+        post: 0
+        expect: nvme_not_scanned
+
+      - name: "C: nothing found on either path"
+        storage_type: all
+        nvme_all: 0
+        pre: 0
+        post: 0
+        expect: nothing_found
+
+      - name: "D: disks found but all excluded"
+        storage_type: all
+        nvme_all: 4
+        pre: 0
+        post: 0
+        expect: all_excluded
+
+      - name: "D2: scsi with disks that survived the (absent) filter but got excluded"
+        storage_type: scsi
+        nvme_all: 0
+        pre: 3
+        post: 3
+        expect: all_excluded
+
+  tasks:
+    # ========================================================================
+    # TEST 1: branch selection truth table
+    # ========================================================================
+    - name: 'TEST 1: the fail_msg picks the right cause for each scenario'
+      block:
+        - name: Evaluate the branch conditions for every case
+          ansible.builtin.set_fact:
+            _results: >-
+              {{ _results | default([]) + [{
+                   'name': item.name,
+                   'expect': item.expect,
+                   'actual': (
+                     'rotational_filter'
+                       if (item.storage_type in ['ssd', 'hdd']
+                           and item.pre > 0 and item.post == 0)
+                     else 'nvme_not_scanned'
+                       if (item.storage_type not in ['nvme', 'all']
+                           and item.post == 0)
+                     else 'nothing_found'
+                       if (item.nvme_all + item.pre == 0)
+                     else 'all_excluded'
+                   )
+                 }] }}
+          loop: "{{ _cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: 'TEST 1 ASSERT: every case selects its expected branch'
+          ansible.builtin.assert:
+            that:
+              - "_results | length == _cases | length"
+              - "_results | map(attribute='expect') | list == _results | map(attribute='actual') | list"
+            fail_msg: |
+              Branch selection no longer matches main.yml. Mismatches:
+              {% for r in _results %}
+              {% if r.expect != r.actual %}
+                - {{ r.name }}: expected {{ r.expect }}, got {{ r.actual }}
+              {% endif %}
+              {% endfor %}
+            success_msg: "OK — all {{ _cases | length }} scenarios select the correct cause"
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: all ' ~ (_cases | length) ~ ' scenarios select the correct most-likely cause'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2 (audit): the source must still contain the snapshot task, the
+    # diagnostics task, and each branch's remedy.
+    # ========================================================================
+    - name: 'TEST 2: audit the discovery diagnostics in main.yml'
+      block:
+        - name: Read nvme_discovery/main.yml
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../roles/nvme_discovery/tasks/main.yml"
+          register: _main_src
+
+        - name: Decode source
+          ansible.builtin.set_fact:
+            _src: "{{ _main_src.content | b64decode }}"
+
+        - name: 'TEST 2 ASSERT: pre-filter snapshot exists and precedes the filters'
+          ansible.builtin.assert:
+            that:
+              - "'_scsi_prefilter' in _src"
+              # Quoted: these expressions contain ': ', which YAML would
+              # otherwise parse as a mapping rather than a conditional string.
+              - "_src.index('_scsi_prefilter') < _src.index('selectattr(\\'rotational\\', \\'equalto\\', 1)')"
+            fail_msg: |
+              REGRESSION: scsi_all_devices must be snapshotted into _scsi_prefilter
+              BEFORE the rotational filters overwrite it. Without that snapshot,
+              "no SCSI disks at all" and "the rotational filter dropped every disk"
+              are indistinguishable — cause A becomes undiagnosable.
+
+        - name: 'TEST 2 ASSERT: failure-path topology dump exists and is check-mode safe'
+          ansible.builtin.assert:
+            that:
+              - "'_discovery_diag' in _src"
+              - "'/sys/class/nvme' in _src"
+              - "'queue/rotational' in _src"
+              # Must run under --check, or a dry run reproduces the blank
+              # diagnostics of the 2026-08-26 (b) incident.
+              - "_src.count('check_mode: false') >= 3"
+            fail_msg: |
+              REGRESSION: the failure-path diagnostics task is missing, no longer
+              reports NVMe presence / rotational flags, or lost check_mode: false.
+
+        - name: 'TEST 2 ASSERT: each branch still offers its remedy'
+          ansible.builtin.assert:
+            that:
+              - "'storage_type: scsi' in _src"          # cause A remedy
+              - "'rotational=1 even for Premium SSD' in _src"
+              - "'scans ONLY /dev/sd*' in _src"          # cause B
+              - "'No candidate disks were detected at ALL' in _src"   # cause C
+              - "'every one was excluded' in _src"       # cause D
+            fail_msg: |
+              REGRESSION: one of the four "most likely cause" branches lost its
+              remedy text. Operators rely on these to act without SSHing to the host.
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: audit — snapshot, topology dump and all 4 remedies present in main.yml'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          DISCOVERY DIAGNOSTICS REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

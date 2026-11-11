@@ -1,0 +1,37 @@
+---
+# Install with: ansible-galaxy collection install -r requirements.yml
+
+collections:
+  - name: ansible.posix
+    version: ">=1.4.0"
+  - name: community.general
+    version: ">=6.0.0"
+  # OCI Dynamic Inventory (optional - only needed if using inventory.oci.yml)
+  - name: oracle.oci
+    version: ">=5.0.0"
+  # AWS Dynamic Inventory (optional - only needed if using inventory.aws.yml)
+  # Requires: pip3 install boto3 botocore
+  - name: amazon.aws
+    version: ">=6.0.0"
+  # GCP Dynamic Inventory (optional - only needed if using inventory.gcp.yml)
+  # Requires: pip3 install google-auth requests
+  - name: google.cloud
+    version: ">=1.0.0"
+  # Azure Dynamic Inventory (optional - only needed if using inventory.azure.yml)
+  # Requires: pip3 install -r \
+  #   ~/.ansible/collections/ansible_collections/azure/azcollection/requirements.txt
+  #
+  # Upper bound is deliberate and tied to ansible-core, NOT to features:
+  #   azcollection <= 2.5.0  requires_ansible >= 2.14.0
+  #   azcollection >= 2.6.0  requires_ansible >= 2.15.0
+  # An unpinned install pulls the newest and warns
+  #   "Collection azure.azcollection does not support Ansible version 2.14.x"
+  # on controllers still on core 2.14 (e.g. RHEL/Rocky ansible-core packages,
+  # Azure CycleCloud scheduler nodes). Raise the ceiling only after confirming
+  # every controller runs core >= 2.15.
+  - name: azure.azcollection
+    version: ">=2.3.0,<2.6.0"
+  # Kubernetes / DI k8s deployment mode (di_deployment_type: "kubernetes").
+  # Auto-installed by plays/di.yml when di_k8s_auto_install_collection: true.
+  - name: kubernetes.core
+    version: ">=3.0.0"

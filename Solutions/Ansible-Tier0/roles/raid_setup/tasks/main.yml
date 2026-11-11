@@ -1,0 +1,413 @@
+---
+# RAID setup role - main tasks
+
+# raid_arrays must be a list of dicts, each with name/device/level/drives.
+# Anything else used to surface as a raw Jinja error from a `subelements` loop
+# further down — "obj must be a list of dicts or a nested dict" — which names
+# neither the variable nor the file. Worse, that error fires while Ansible is
+# BUILDING the loop, which happens BEFORE `when` is evaluated, so it escapes
+# even a role-level gate: a host in existing-mount mode, where raid_setup is
+# skipped entirely, still died on it (2026-08-27).
+- name: Validate raid_arrays shape
+  ansible.builtin.fail:
+    msg: |
+      raid_arrays is malformed.
+
+      Expected a list of dicts:
+
+        raid_arrays:
+          - name: md0
+            device: /dev/md0
+            level: 0
+            drives: [/dev/nvme0n1, /dev/nvme1n1]
+
+      Got: {{ raid_arrays }}
+
+      {% if raid_arrays | select('mapping') | list | length == 0 %}
+      None of the entries are dicts — this looks like a list of device paths.
+      A bare device list belongs in `hw_raid_devices` (with use_raid: false),
+      or, if the filesystem is already built and mounted, in
+      `existing_mount_paths`. Comment `raid_arrays` out in vars/main.yml.
+      {% else %}
+      Entries missing a 'drives' key:
+      {{ raid_arrays | select('mapping') | rejectattr('drives', 'defined') | list }}
+      {% endif %}
+  when:
+    - raid_arrays is defined
+    - raid_arrays | length > 0
+    - (raid_arrays | select('mapping') | selectattr('drives', 'defined') | list | length)
+      != (raid_arrays | length)
+
+- name: Include OS-specific variables
+  ansible.builtin.include_vars: "{{ item }}"
+  with_first_found:
+    - "{{ ansible_distribution | lower }}-{{ ansible_distribution_major_version }}.yml"
+    - "{{ ansible_distribution | lower }}.yml"
+    - "{{ ansible_os_family | lower }}.yml"
+    - "default.yml"
+
+- name: Install mdadm package
+  ansible.builtin.package:
+    name: mdadm
+    state: present
+
+- name: Gather existing RAID array information
+  ansible.builtin.command: cat /proc/mdstat
+  register: mdstat_output
+  changed_when: false
+  failed_when: false
+
+- name: Check for existing RAID arrays
+  ansible.builtin.set_fact:
+    existing_arrays: "{{ mdstat_output.stdout | regex_findall('md[0-9]+') | unique }}"
+
+- name: Display existing RAID arrays
+  ansible.builtin.debug:
+    msg: "Existing RAID arrays: {{ existing_arrays }}"
+  when: existing_arrays | length > 0
+
+# ============================================================================
+# Idempotency: detect when planned drives are already in an md array under a
+# DIFFERENT name (e.g. kernel auto-assembled /dev/md127 after a reboot
+# because mdadm.conf wasn't in the initramfs). Without this, the create
+# step below fails with "Device or resource busy".
+# Outputs:
+#   _existing_md_for_array  — dict {planned_name -> actual /dev/mdN device}
+#   _arrays_already_present — list of planned names that already exist
+# ============================================================================
+
+- name: For each planned array, look up any md device its drives belong to
+  ansible.builtin.shell:
+    # Force bash: dash (Ubuntu /bin/sh) does not support `set -o pipefail`.
+    executable: /bin/bash
+    cmd: |
+      set -uo pipefail
+      export LC_ALL=C LANG=C
+      found=""
+      for d in {{ item.drives | join(' ') }}; do
+          [ -b "$d" ] || continue
+          # lsblk shows child raid* device when a drive is an md member
+          child=$(lsblk -nro NAME,TYPE "$d" 2>/dev/null \
+                   | awk '$2 ~ /^raid/ {print $1; exit}')
+          if [ -n "$child" ]; then
+              found="/dev/${child}"
+              break
+          fi
+      done
+      echo "${found}"
+  # Filtered, not bare: loop AND loop_control.label are templated even when
+  # the task is skipped, so a malformed entry (a bare device string) breaks
+  # `item.name` / `item.drives` through a role-level gate.
+  loop: "{{ raid_arrays | default([]) | select('mapping')
+            | selectattr('drives', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: _array_md_lookup
+  changed_when: false
+
+- name: Build planned-name → existing-md-device mapping
+  ansible.builtin.set_fact:
+    _existing_md_for_array: >-
+      {{ dict(_array_md_lookup.results
+              | map(attribute='item')
+              | map(attribute='name')
+              | zip(_array_md_lookup.results
+                    | map(attribute='stdout')
+                    | map('trim')
+                    | list)) }}
+
+- name: List arrays whose drives are already assembled (under any name)
+  ansible.builtin.set_fact:
+    _arrays_already_present: >-
+      {{ _existing_md_for_array
+         | dict2items | selectattr('value', 'ne', '') | map(attribute='key') | list }}
+
+- name: Inform when planned array is already assembled under a different name
+  ansible.builtin.debug:
+    msg: |
+      Planned array '{{ item.key }}' is already assembled as {{ item.value }} —
+      skipping mdadm --create. Downstream mount_points will be remapped to use
+      the actual device.
+  loop: "{{ _existing_md_for_array | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - item.value | length > 0
+    - item.value | basename != item.key       # name differs from planned
+
+# Remap raid_arrays[*].device and mount_points[*].device to the real /dev/mdN
+# so filesystem_setup / fstab / mount logic targets the array that ACTUALLY
+# exists, not the planned-but-unused /dev/md0.
+
+- name: Build planned-device → actual-device remap (e.g. /dev/md0 → /dev/md127)
+  ansible.builtin.set_fact:
+    _device_remap: >-
+      {{ dict(_array_md_lookup.results
+              | map(attribute='item')
+              | map(attribute='device')
+              | zip(_array_md_lookup.results
+                    | map(attribute='stdout')
+                    | map('trim')
+                    | list))
+         | dict2items
+         | selectattr('value', 'ne', '')
+         | items2dict }}
+
+# Rebuild each list one element at a time so per-element `item` is correctly
+# scoped. The naive `map('combine', {'device': item.device})` form re-uses
+# the OUTER loop's item for every map element, which collapses all rows to
+# whatever the last iteration matched.
+- name: Remap raid_arrays.device entries individually
+  ansible.builtin.set_fact:
+    raid_arrays: >-
+      {{ (raid_arrays | rejectattr('name', 'equalto', item.name) | list)
+         + [ item | combine({'device': _device_remap[item.device]
+                              | default(item.device)}) ] }}
+  # Filtered, not bare: loop AND loop_control.label are templated even when
+  # the task is skipped, so a malformed entry (a bare device string) breaks
+  # `item.name` / `item.drives` through a role-level gate.
+  loop: "{{ raid_arrays | default([]) | select('mapping')
+            | selectattr('drives', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - _device_remap | default({}) | length > 0
+    - item.device in (_device_remap | default({}))
+
+- name: Remap mount_points[*].device entries individually
+  ansible.builtin.set_fact:
+    mount_points: >-
+      {{ (mount_points | rejectattr('path', 'equalto', item.path) | list)
+         + [ item | combine({'device': _device_remap[item.device]
+                              | default(item.device)}) ] }}
+  loop: "{{ mount_points }}"
+  loop_control:
+    label: "{{ item.path }} ({{ item.device }})"
+  when:
+    - _device_remap | default({}) | length > 0
+    - mount_points is defined
+    - item.device in (_device_remap | default({}))
+
+- name: Verify drives exist before creating RAID
+  ansible.builtin.stat:
+    path: "{{ item.1 }}"
+  # Total expression — see the validation task above for why this must never
+  # raise. A malformed raid_arrays makes `subelements` throw while Ansible is
+  # BUILDING the loop, which happens BEFORE `when` is applied — so a role-level
+  # gate does NOT protect this task. select('mapping') drops non-dict entries
+  # and selectattr drops dicts with no 'drives' key.
+  loop: "{{ raid_arrays | default([]) | select('mapping')
+            | selectattr('drives', 'defined') | list | subelements('drives') }}"
+  loop_control:
+    label: "{{ item.1 }}"
+  register: drive_checks
+
+- name: Fail if any drives are missing
+  ansible.builtin.fail:
+    msg: "Drive {{ item.item.1 }} does not exist!"
+  loop: "{{ drive_checks.results }}"
+  loop_control:
+    label: "{{ item.item.1 }}"
+  when: not item.stat.exists
+
+- name: Check if drives are already in use
+  ansible.builtin.command: "lsblk -no TYPE {{ item.1 }}"
+  # Total expression — see the validation task above for why this must never
+  # raise. A malformed raid_arrays makes `subelements` throw while Ansible is
+  # BUILDING the loop, which happens BEFORE `when` is applied — so a role-level
+  # gate does NOT protect this task. select('mapping') drops non-dict entries
+  # and selectattr drops dicts with no 'drives' key.
+  loop: "{{ raid_arrays | default([]) | select('mapping')
+            | selectattr('drives', 'defined') | list | subelements('drives') }}"
+  loop_control:
+    label: "{{ item.1 }}"
+  register: drive_usage
+  changed_when: false
+  failed_when: false
+
+- name: Warn about drives already in RAID
+  ansible.builtin.debug:
+    msg: "WARNING: {{ item.item.1 }} appears to be part of a RAID array"
+  loop: "{{ drive_usage.results }}"
+  loop_control:
+    label: "{{ item.item.1 }}"
+  when: "'raid' in item.stdout"
+
+- name: Create RAID arrays individually with per-array error tracking
+  ansible.builtin.command: >
+    mdadm --create --verbose {{ item.device }}
+    --level={{ item.level }}
+    --raid-devices={{ item.drives | length }}
+    {% if raid_chunk_size is defined and item.level in [0, 5, 6, 10] %}--chunk={{ raid_chunk_size }}{% endif %}
+    {{ item.drives | join(' ') }}
+    --run
+  # Filtered, not bare: loop AND loop_control.label are templated even when
+  # the task is skipped, so a malformed entry (a bare device string) breaks
+  # `item.name` / `item.drives` through a role-level gate.
+  loop: "{{ raid_arrays | default([]) | select('mapping')
+            | selectattr('drives', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    # Skip if an array with this planned name already exists.
+    - item.name not in existing_arrays
+    # Skip if the drives are already in SOME md array (under any name).
+    # Prevents the "Device or resource busy" failure when the kernel
+    # auto-assembled the array as /dev/md127 after a reboot.
+    - item.name not in (_arrays_already_present | default([]))
+    - force_raid_recreate | default(false) or item.name not in existing_arrays
+  register: raid_creation
+  failed_when: false
+
+- name: Track RAID creation results
+  ansible.builtin.set_fact:
+    _raid_failed_arrays: >-
+      {{ raid_creation.results | default([])
+         | selectattr('rc', 'defined')
+         | selectattr('rc', 'ne', 0)
+         | map(attribute='item')
+         | list }}
+    _raid_succeeded_arrays: >-
+      {{ raid_creation.results | default([])
+         | selectattr('rc', 'defined')
+         | selectattr('rc', 'eq', 0)
+         | map(attribute='item')
+         | list }}
+    _raid_skipped_arrays: >-
+      {{ raid_creation.results | default([])
+         | selectattr('skipped', 'defined')
+         | selectattr('skipped')
+         | map(attribute='item')
+         | list }}
+
+- name: Display RAID creation results per array
+  ansible.builtin.debug:
+    msg: |
+      RAID Creation Results:
+        Succeeded: {{ _raid_succeeded_arrays | map(attribute='name') | list | join(', ') | default('none') }}
+        Skipped:   {{ _raid_skipped_arrays | map(attribute='name') | list | join(', ') | default('none') }}
+        Failed:    {{ _raid_failed_arrays | map(attribute='name') | list | join(', ') | default('none') }}
+
+- name: Display per-array failure diagnostics
+  ansible.builtin.debug:
+    msg: |
+      RAID ARRAY FAILED: {{ item.item.name }} ({{ item.item.device }})
+        Drives: {{ item.item.drives | join(', ') }}
+        Return code: {{ item.rc }}
+        Error: {{ item.stderr | default('') }}
+  loop: "{{ raid_creation.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: _raid_failed_arrays | length > 0
+
+- name: Capture RAID state after partial failure
+  ansible.builtin.command: cat /proc/mdstat
+  register: partial_failure_mdstat
+  changed_when: false
+  failed_when: false
+  when: _raid_failed_arrays | length > 0
+
+- name: Display RAID state after partial failure
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+      PARTIAL RAID FAILURE - {{ _raid_failed_arrays | length }}/{{ raid_arrays | length }} arrays failed
+      ============================================
+      /proc/mdstat:
+      {{ partial_failure_mdstat.stdout | default('unable to read') }}
+
+      TROUBLESHOOTING:
+      1. Check if drives are in use: lsblk
+      2. Check for existing signatures: wipefs -a /dev/nvmeXnY
+      3. Check boot device exclusion: findmnt -n -o SOURCE /
+      4. Check dmesg for hardware errors: dmesg | tail -50
+      ============================================
+  when: _raid_failed_arrays | length > 0
+
+- name: Fail if ALL RAID arrays failed
+  ansible.builtin.fail:
+    msg: >-
+      All {{ _raid_failed_arrays | length }} RAID array(s) failed to create.
+      See diagnostics above. Fix the issue and re-run.
+  when:
+    - _raid_failed_arrays | length > 0
+    - _raid_succeeded_arrays | length == 0
+
+- name: Warn about partial RAID failure (continuing with successful arrays)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _raid_failed_arrays | length }} of {{ raid_arrays | length }} RAID arrays failed.
+      Continuing with {{ _raid_succeeded_arrays | length }} successful arrays.
+      Failed: {{ _raid_failed_arrays | map(attribute='name') | list | join(', ') }}.
+      Re-run playbook to retry failed arrays.
+  when:
+    - _raid_failed_arrays | length > 0
+    - _raid_succeeded_arrays | length > 0
+
+- name: Wait for RAID arrays to sync (for mirrored/parity arrays)
+  ansible.builtin.command: cat /proc/mdstat
+  register: sync_status
+  until: "'resync' not in sync_status.stdout and 'recovery' not in sync_status.stdout"
+  retries: "{{ raid_sync_retries | default(60) }}"
+  delay: "{{ raid_sync_delay | default(30) }}"
+  changed_when: false
+  when:
+    - _raid_succeeded_arrays | length > 0
+    - _raid_succeeded_arrays | selectattr('level', 'in', [1, 5, 6, 10]) | list | length > 0
+
+- name: Ensure /etc/mdadm directory exists
+  ansible.builtin.file:
+    path: /etc/mdadm
+    state: directory
+    mode: '0755'
+
+- name: Get current mdadm array details
+  ansible.builtin.command: mdadm --detail --scan
+  register: mdadm_scan
+  changed_when: false
+
+- name: Generate mdadm.conf with proper settings
+  ansible.builtin.copy:
+    content: |
+      # mdadm.conf - Generated by Ansible
+      # Auto-generated on {{ ansible_date_time.iso8601 }}
+
+      # Email for RAID monitoring alerts (optional)
+      MAILADDR root
+
+      # Automatically assemble arrays at boot
+      AUTO +all
+
+      # RAID array definitions
+      {{ mdadm_scan.stdout }}
+    dest: "{{ mdadm_conf_path | default('/etc/mdadm/mdadm.conf') }}"
+    mode: '0644'
+    backup: true
+  notify: update initramfs
+
+- name: Symlink mdadm.conf to /etc for RedHat compatibility
+  ansible.builtin.file:
+    src: /etc/mdadm/mdadm.conf
+    dest: /etc/mdadm.conf
+    state: link
+    force: true
+  when: ansible_os_family == 'RedHat'
+
+- name: Ensure mdadm service is enabled for monitoring
+  ansible.builtin.systemd:
+    name: "{{ mdadm_monitor_service | default('mdmonitor') }}"
+    enabled: true
+    state: started
+  failed_when: false
+
+- name: Flush handlers to update initramfs now
+  ansible.builtin.meta: flush_handlers
+
+- name: Display RAID array status
+  ansible.builtin.command: cat /proc/mdstat
+  register: final_mdstat
+  changed_when: false
+
+- name: Display RAID status
+  ansible.builtin.debug:
+    var: final_mdstat.stdout_lines

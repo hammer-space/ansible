@@ -1,0 +1,210 @@
+---
+# Release cloud-provisioned scratch mounts so their disks become available to
+# Tier 0. OPT-IN: does nothing unless release_ephemeral_mountpoints is set.
+#
+# WHY THIS EXISTS
+# ---------------
+# Azure (and CycleCloud in particular) auto-mounts local NVMe as scratch. On an
+# HB120rs_v3 the 894 GB local NVMe comes up mounted at /tmp and /nvme:
+#
+#   nvme0n1  259:0  0  894.3G  0 disk  /tmp
+#                                      /nvme
+#
+# /tmp is in scan_disks.sh's SYSTEM_MOUNTS allow-list, so detection correctly
+# classifies nvme0n1 as PROTECTED and discovery yields 0 RAID arrays. The disk
+# genuinely holds a live filesystem — mkfs on it would fail EBUSY anyway. To use
+# it for Tier 0 the mounts must be released first, which is what this does.
+#
+# SAFETY MODEL
+# ------------
+# 1. Opt-in by name. release_ephemeral_mountpoints defaults to [] — the feature
+#    is inert until an operator names exact mountpoints.
+# 2. Hard refuse-list. Any mountpoint whose physical disk also backs /, /boot,
+#    /boot/efi, /usr, /var, /etc, /home or ACTIVE SWAP is refused outright, even
+#    if explicitly named. Enforced by `scan_disks.sh --critical-disks`.
+# 3. No lazy unmount. `umount -l` returns success while the filesystem is still
+#    referenced, so a later mkfs can hit a still-live device. If a mount is
+#    busy this FAILS with the holding processes listed. The fstab entry is
+#    removed first, so a reboot brings the disk up free.
+# 4. Nothing is reformatted here. This only unmounts and de-registers. The
+#    normal protected-disk gate still runs afterwards against the new state.
+#
+# ORDER MATTERS: this runs BEFORE detect_boot_device.yml, so a released disk is
+# no longer mounted when classification happens and drops out of
+# _protected_disks naturally.
+
+- name: Release ephemeral cloud mounts
+  when: release_ephemeral_mountpoints | default([]) | length > 0
+  block:
+    - name: Announce ephemeral mount release
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          RELEASING EPHEMERAL CLOUD MOUNTS (opt-in)
+          ============================================
+          Requested: {{ release_ephemeral_mountpoints | join(', ') }}
+
+          These mountpoints will be unmounted and removed from /etc/fstab so
+          their disks can be used for Tier 0. Nothing is reformatted here.
+          ============================================
+
+    - name: Determine which disks may never be released
+      ansible.builtin.script:
+        cmd: scan_disks.sh --critical-disks
+      register: _critical_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve the disk behind each requested mountpoint
+      ansible.builtin.script:
+        cmd: "scan_disks.sh --disk-for-mount {{ item | quote }}"
+      register: _release_probe
+      changed_when: false
+      check_mode: false
+      loop: "{{ release_ephemeral_mountpoints }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Build the release plan
+      ansible.builtin.set_fact:
+        _critical_disks: "{{ _critical_raw.stdout_lines | default([]) | reject('equalto', '') | list }}"
+        # [[mountpoint, [disks...]], ...] — pairs each requested mountpoint with
+        # the physical disks --disk-for-mount resolved for it. An empty disk
+        # list means the path is not a mountpoint here.
+        _release_plan: >-
+          {{ (_release_probe.results | map(attribute='item') | list)
+             | zip(_release_probe.results
+                   | map(attribute='stdout_lines')
+                   | map('reject', 'equalto', '') | map('list') | list)
+             | map('list') | list }}
+
+    - name: Refuse any mountpoint whose disk also backs a critical system mount
+      ansible.builtin.fail:
+        msg: |
+          REFUSING to release {{ item[0] }} — its disk ({{ item[1] | join(', ') }})
+          also backs a critical system mount (/, /boot, /usr, /var, /etc, /home)
+          or active swap.
+
+          Critical disks on this host: {{ _critical_disks | join(', ') }}
+
+          This refuse-list cannot be overridden. Releasing that mountpoint would
+          make the OS disk a RAID candidate.
+      loop: "{{ _release_plan }}"
+      loop_control:
+        label: "{{ item[0] }}"
+      when: item[1] | intersect(_critical_disks) | length > 0
+
+    - name: Report mountpoints that are not actually mounted (nothing to do)
+      ansible.builtin.debug:
+        msg: "{{ item[0] }} is not a mountpoint on this host — skipping."
+      loop: "{{ _release_plan }}"
+      loop_control:
+        label: "{{ item[0] }}"
+      when: item[1] | length == 0
+
+    # ansible.posix.mount state:absent unmounts AND removes the fstab entry, so
+    # the disk does not come back on reboot. fstab is cleaned even if the umount
+    # later fails, which is what makes "reboot then re-run" a working recovery.
+    - name: Unmount and de-register the ephemeral mounts
+      ansible.posix.mount:
+        path: "{{ item[0] }}"
+        state: absent
+      loop: "{{ _release_plan }}"
+      loop_control:
+        label: "{{ item[0] }}"
+      when: item[1] | length > 0
+      register: _release_result
+      ignore_errors: true
+
+    - name: Identify what is still holding a mount that would not release
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uo pipefail
+          export LC_ALL=C LANG=C
+          mp={{ item.item[0] | quote }}
+          echo "--- still mounted? ---"
+          findmnt -n -o TARGET,SOURCE,FSTYPE "$mp" 2>&1 || echo "(not mounted)"
+          echo "--- processes holding $mp ---"
+          if command -v fuser >/dev/null 2>&1; then
+              fuser -vm "$mp" 2>&1 | head -20
+          elif command -v lsof >/dev/null 2>&1; then
+              lsof +f -- "$mp" 2>&1 | head -20
+          else
+              echo "(neither fuser nor lsof available)"
+          fi
+          echo "--- systemd units referencing it ---"
+          systemctl list-units --type=mount --all --no-legend 2>/dev/null \
+              | grep -F -- "$mp" || echo "(none)"
+      register: _release_busy_diag
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      loop: "{{ _release_result.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item[0] | default('?') }}"
+      when:
+        - item.failed | default(false)
+
+    - name: Fail with the reason a mount could not be released
+      ansible.builtin.fail:
+        msg: |
+          Could not release {{ item.item.item[0] }}.
+
+          {{ item.stdout | default('<no diagnostics collected>') }}
+
+          The /etc/fstab entry has already been removed, so the usual fix is:
+
+            reboot the node, then re-run this playbook
+
+          /tmp in particular is almost always busy on a running system
+          (systemd, logind, user sessions), so a reboot is expected there.
+          A lazy unmount is deliberately NOT used — it reports success while
+          the filesystem is still referenced, and a later mkfs can then hit a
+          live device.
+      loop: "{{ _release_busy_diag.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item[0] | default('?') }}"
+      when:
+        - item.skipped is not defined or not item.skipped
+
+    - name: Warn about cloud agents that may remount on reboot
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -uo pipefail
+          export LC_ALL=C LANG=C
+          # Azure's waagent re-formats and re-mounts the resource disk unless
+          # told not to. cloud-init can also re-add a mount via its config.
+          if [ -f /etc/waagent.conf ]; then
+              echo "waagent ResourceDisk settings:"
+              grep -E '^ResourceDisk\.(Format|EnableSwap|MountPoint)' \
+                  /etc/waagent.conf 2>/dev/null || echo "  (defaults)"
+          fi
+          if [ -d /etc/cloud ]; then
+              echo "cloud-init mounts directives:"
+              grep -rEl '^\s*mounts:' /etc/cloud 2>/dev/null | head -5 \
+                  || echo "  (none)"
+          fi
+      register: _release_cloud_agents
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Display release summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          EPHEMERAL MOUNT RELEASE COMPLETE
+          ============================================
+          {% for mp, disks in _release_plan %}
+          {{ mp }}: {{ 'released (was on ' ~ disks | join(', ') ~ ')' if disks | length > 0 else 'was not mounted' }}
+          {% endfor %}
+
+          These disks are now unmounted and out of /etc/fstab, so the
+          protected-disk scan that follows will no longer classify them as
+          system disks.
+
+          Cloud agent configuration that could remount them on reboot:
+          {{ _release_cloud_agents.stdout | default('(not checked)') }}
+          ============================================

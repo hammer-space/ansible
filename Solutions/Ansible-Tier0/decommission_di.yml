@@ -1,0 +1,89 @@
+---
+# Decommission Data Instantiator (DI) nodes from Hammerspace
+# Removes volumes, unregisters node from cluster, stops services
+#
+# CAUTION: This is a destructive operation. Use --check first.
+#
+# Usage:
+#   ansible-playbook decommission_di.yml -i inventory.yml --check
+#   ansible-playbook decommission_di.yml -i inventory.yml --limit "mover101"
+#   ansible-playbook decommission_di.yml -i inventory.yml
+#
+# If vars/vault.yml is encrypted:
+#   ansible-playbook decommission_di.yml -i inventory.yml --ask-vault-pass
+#
+# Or pass the password directly:
+#   ansible-playbook decommission_di.yml -i inventory.yml -e hammerspace_api_password=YourPass
+
+- name: Decommission Hammerspace Data Instantiator (DI)
+  hosts: di_nodes
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars_files:
+    - vars/main.yml
+
+  pre_tasks:
+    # Load vault.yml if it exists and is readable (optional — password can
+    # also be passed via -e hammerspace_api_password=xxx)
+    - name: Check if vars/vault.yml exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/vars/vault.yml"
+      register: _vault_file
+      delegate_to: localhost
+      become: false
+
+    - name: Load vault variables (if available)
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/vars/vault.yml"
+      when: _vault_file.stat.exists | default(false)
+      failed_when: false
+
+    - name: Require hammerspace_api_host (set with -e hammerspace_api_host=<anvil-ip>)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: require_api_host
+      tags: [always]
+
+    # Azure Key Vault (opt-in) — overrides vars/vault.yml when set. Must
+    # resolve BEFORE anything authenticates against the Anvil.
+    - name: Retrieve Hammerspace password from Azure Key Vault (optional)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: keyvault_password
+      when: (hammerspace_keyvault_uri | default('')) | length > 0
+
+    - name: Verify required variables are defined
+      ansible.builtin.assert:
+        that:
+          - hammerspace_cluster_mgmt_ip is defined or hammerspace_api_host is defined
+          - hammerspace_api_user is defined
+        fail_msg: >-
+          Required Hammerspace cluster variables are not defined.
+          Check vars/main.yml and ensure vars/vault.yml is accessible
+          (run with --ask-vault-pass if encrypted).
+
+    - name: Display decommission warning
+      ansible.builtin.debug:
+        msg: |
+          === DECOMMISSION WARNING ===
+          About to decommission DI node: {{ di_node_name | default(inventory_hostname) }}
+          Evacuate data: {{ di_decommission_evacuate_data | default(true) }}
+          Stop services: {{ di_decommission_stop_services | default(true) }}
+          Cleanup local: {{ di_decommission_cleanup | default(true) }}
+          ============================
+
+  tasks:
+    - name: Run DI decommission
+      ansible.builtin.include_role:
+        name: di
+        tasks_from: decommission.yml
+      tags: [decommission]
+
+  post_tasks:
+    - name: Decommission complete
+      ansible.builtin.debug:
+        msg: |
+          DI decommission complete for {{ di_node_name | default(inventory_hostname) }}
+          Node has been removed from Hammerspace and services stopped.

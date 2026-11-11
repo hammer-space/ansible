@@ -1,0 +1,37 @@
+---
+# Storage Discovery Role - Default Configuration
+# Supports NVMe, HDD, SSD, and mixed environments
+
+# Storage device type to discover
+# Options:
+#   nvme  - NVMe drives only (default, backward compatible)
+#   hdd   - SCSI/SATA HDD only (/dev/sd*, rotational=1)
+#   ssd   - SCSI/SATA SSD only (/dev/sd*, rotational=0)
+#   scsi  - All SCSI/SATA devices (HDD + SSD)
+#   all   - NVMe + SCSI/SATA (mixed environment)
+storage_type: "nvme"
+
+# Enable dynamic discovery mode
+# When true, raid_arrays and mount_points will be auto-generated
+# When false, uses manually defined raid_arrays from vars/main.yml
+use_dynamic_discovery: true
+
+# RAID level for dynamically created arrays
+# 0 = striping (best performance, no redundancy)
+# 1 = mirroring
+# 5 = striping with parity
+# 10 = striping + mirroring
+raid_level: 0
+
+# Base path for mount points
+# Arrays will be mounted as: {{ mount_base_path }}/hsvol0, hsvol1, etc.
+mount_base_path: /hammerspace
+
+# Additional devices to exclude (besides boot device)
+# For NVMe: controller names like nvme8, nvme9
+# For SCSI: device names like sda, sdb
+additional_exclude_devices: []
+
+# Minimum drives per NUMA node to create a RAID array
+# NUMA nodes with fewer drives will be skipped
+min_drives_per_array: 1

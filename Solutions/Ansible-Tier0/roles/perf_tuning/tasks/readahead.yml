@@ -1,0 +1,34 @@
+---
+# Block device read-ahead tuning for the storage devices behind Hammerspace
+# mount points (NVMe drives + MD RAID arrays).
+#
+# nfs_setup deploys a udev rule for NFS *clients*; this targets the local block
+# devices on the storage_servers themselves. Both can coexist.
+
+- name: Collect block devices for Hammerspace mounts
+  ansible.builtin.set_fact:
+    _perf_readahead_devices: >-
+      {{ (mount_points | default([]) | map(attribute='device') | list)
+         + (raid_arrays | default([]) | map(attribute='device') | list) }}
+
+- name: Deduplicate block device list
+  ansible.builtin.set_fact:
+    _perf_readahead_devices: "{{ _perf_readahead_devices | unique | list }}"
+
+- name: Apply read-ahead to block devices (runtime)
+  ansible.builtin.shell: >-
+    blockdev --setra {{ (perf_readahead_kb | int) * 2 }} {{ item }}
+  loop: "{{ _perf_readahead_devices }}"
+  when: _perf_readahead_devices | length > 0
+  changed_when: true
+  failed_when: false
+  # blockdev --setra takes 512-byte sectors, so multiply KB by 2.
+
+- name: Deploy persistent read-ahead udev rule
+  ansible.builtin.template:
+    src: 99-hammerspace-readahead.rules.j2
+    dest: /etc/udev/rules.d/99-hammerspace-readahead.rules
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload udev

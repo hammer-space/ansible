@@ -1,0 +1,38 @@
+---
+# Default variables for firewall_setup role
+
+# Whether to flush iptables before configuring
+# Set to true to clear existing rules and start fresh
+# This ensures NFS rules are not blocked by existing REJECT rules
+flush_iptables: true
+
+# Whether to enable UFW (only affects Debian/Ubuntu)
+# Set to true with caution - ensure SSH is allowed first!
+enable_ufw: false
+
+# Firewalld services for NFS
+firewalld_services:
+  - nfs
+  - rpc-bind
+  - mountd
+
+# Default NFS ports for UFW
+nfs_ports:
+  - port: 111
+    proto: tcp
+    service: portmapper
+  - port: 111
+    proto: udp
+    service: portmapper
+  - port: 2049
+    proto: tcp
+    service: nfs
+  - port: 2049
+    proto: udp
+    service: nfs
+  - port: 20048
+    proto: tcp
+    service: mountd
+  - port: 20048
+    proto: udp
+    service: mountd

@@ -1,0 +1,149 @@
+---
+# Add this run's Tier 0 volumes to ALREADY-EXISTING volume groups.
+#
+# Enabled by setting hammerspace_volume_group to the name of a group that
+# already exists in Hammerspace (typically carrying placement objectives).
+# The value may be set per host or per inventory group (group_vars/AZ1,
+# group_vars/AZ2, host_vars, -e on the command line) — each host's volumes go
+# to the group THAT host names. See "PER-HOST GROUPS" below.
+#
+# CONTRACT — this task file will NOT:
+#   - create a volume group, unless hammerspace_create_volume_groups is true
+#     (then a MISSING group is created with this run's volumes as members;
+#     an existing one is never modified beyond the append). With the flag
+#     off a 404 is a hard failure, not a silent skip, or the volumes would
+#     never pick up its objectives.
+#   - remove, reorder or rewrite any volume already in a group
+#   - re-add a volume that is already a member
+# It appends only, and only the volumes this run created.
+#
+# WHY ONE run_once WRITE PER GROUP INSTEAD OF ONE PER VOLUME
+# ----------------------------------------------------------
+# Updating a volume group is a read-modify-write: GET the group, append to
+# expressions[0].locations, PUT the whole thing back. hammerspace_integration
+# runs on every storage_server in PARALLEL, so a per-host update races —
+#
+#   host A: GET (sees V1)          host B: GET (sees V1)
+#   host A: PUT (V1 + A)           host B: PUT (V1 + B)   <- drops A
+#
+# The last writer wins and silently discards the other host's volume. Existing
+# members survive (both reads saw them), but newly added ones vanish, which is
+# exactly the kind of loss that is not noticed until objectives fail to apply.
+#
+# So this runs ONCE for the whole play, unions the volume names recorded by
+# every host, and performs a single read-modify-write PER DISTINCT GROUP.
+#
+# This does NOT protect against a concurrent run of a different playbook, or
+# someone editing a group in the UI at the same moment. Those remain
+# last-writer-wins; the post-write verification detects it.
+#
+# PER-HOST GROUPS — why the plan is built from hostvars
+# ----------------------------------------------------
+# `run_once` executes the task on ONE host and evaluates its variables in THAT
+# host's context. So reading a bare `hammerspace_volume_group` here resolves to
+# whichever host Ansible happened to pick, and a per-AZ configuration —
+#
+#   group_vars/AZ1: hammerspace_volume_group: tier0-az1
+#   group_vars/AZ2: hammerspace_volume_group: tier0-az2
+#
+# — silently sent EVERY volume in the play to one of the two groups, with no
+# warning. Worse, when the picked host named no group at all the whole step
+# was skipped and nothing was joined anywhere.
+#
+# The plan is therefore built by reading each host's own value out of hostvars,
+# then grouping. One PUT per distinct group keeps the race protection; the
+# grouping keeps the per-host intent.
+
+# Reset first: `set_fact` persists for the life of the play, and
+# hammerspace_serial runs this role in SEVERAL plays (one per batch), so an
+# accumulating `| default([]) + [...]` would carry the previous batch's hosts
+# into this one and re-add volumes that are no longer part of the run.
+- name: Reset the volume group join plan
+  ansible.builtin.set_fact:
+    _vg_pairs: []
+    _vg_plan: []
+    _hs_vg_created_groups: []
+  run_once: true
+
+# add_volume.yml records the exact name it used on each host; hostvars is how
+# we reach both that and the host's own hammerspace_volume_group from run_once.
+# `default(..., true)` on the group means an empty per-host value falls back to
+# the play-level setting rather than reading as "no group".
+- name: Collect each host's volume group and this run's volume names
+  ansible.builtin.set_fact:
+    _vg_pairs: >-
+      {{ _vg_pairs + [{
+           'host': item,
+           'group': (hostvars[item]['hammerspace_volume_group']
+                     | default(hammerspace_volume_group | default(''), true) | trim),
+           'volumes': (hostvars[item]['_hs_run_volume_names'] | default([]))
+         }] }}
+  loop: "{{ ansible_play_hosts }}"
+  loop_control:
+    label: "{{ item }}"
+  run_once: true
+
+- name: Resolve the distinct volume groups named by this run
+  ansible.builtin.set_fact:
+    _vg_group_names: >-
+      {{ _vg_pairs | rejectattr('group', 'equalto', '')
+         | map(attribute='group') | unique | sort | list }}
+  run_once: true
+
+- name: Build the per-group join plan
+  ansible.builtin.set_fact:
+    _vg_plan: >-
+      {{ _vg_plan + [{
+           'group': item,
+           'volumes': (_vg_pairs | selectattr('group', 'equalto', item)
+                       | map(attribute='volumes') | map('list')
+                       | sum(start=[]) | unique | sort | list),
+           'hosts': (_vg_pairs | selectattr('group', 'equalto', item)
+                     | map(attribute='host') | sort | list)
+         }] }}
+  loop: "{{ _vg_group_names }}"
+  loop_control:
+    label: "{{ item }}"
+  run_once: true
+
+- name: Report when no host named a volume group
+  ansible.builtin.debug:
+    msg: >-
+      No host in this run sets hammerspace_volume_group, so no volume group
+      membership was changed.
+  run_once: true
+  when: _vg_plan | length == 0
+
+- name: Report when this run created no volumes to add
+  ansible.builtin.debug:
+    msg: >-
+      This run created no volumes, so volume group(s)
+      {{ _vg_plan | map(attribute='group') | join(', ') }} are left untouched.
+  run_once: true
+  when:
+    - _vg_plan | length > 0
+    - (_vg_plan | map(attribute='volumes') | map('length') | sum) == 0
+
+# Printed before any write. A multi-group plan is legitimate, but it is also
+# what an accidental per-host override looks like, so the mapping is always
+# shown rather than inferred from the task labels.
+- name: Show the volume group join plan
+  ansible.builtin.debug:
+    msg: |
+      Volume group join plan ({{ _vg_plan | length }} group(s)):
+      {% for p in _vg_plan %}
+        {{ p.group }} <- {{ p.volumes | length }} volume(s) from {{ p.hosts | join(', ') }}
+      {% for v in p.volumes %}      + {{ v }}
+      {% endfor %}
+      {% endfor %}
+  run_once: true
+  when: (_vg_plan | map(attribute='volumes') | map('length') | sum) > 0
+
+- name: Join each named volume group
+  ansible.builtin.include_tasks: volume_group_join_one.yml
+  loop: "{{ _vg_plan }}"
+  loop_control:
+    loop_var: _vgj
+    label: "{{ _vgj.group }} <- {{ _vgj.volumes | length }} volume(s)"
+  run_once: true
+  when: _vgj.volumes | length > 0

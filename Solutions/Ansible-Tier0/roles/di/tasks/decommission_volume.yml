@@ -1,0 +1,198 @@
+---
+# Decommission a single volume: decommission -> poll -> remove -> poll -> verify
+#
+# Included from decommission.yml in a loop over the volumes listed for a DI
+# node. `_volume` is one object from GET /storage-volumes, so it carries
+# uoid.uuid.
+#
+# ADDRESSING — by UUID, never by `name | urlencode`
+# ------------------------------------------------
+# A storage volume name is [AZ:]node::/path and always contains '/'. Jinja's
+# `urlencode` encodes ':' but NOT '/', so the old URL
+#
+#   /storage-volumes/<name | urlencode>/decommission
+#
+# put the path into the URL as extra segments and 404'd for every volume. The
+# volume is now addressed by its uoid.uuid (the same rule as every other
+# write in this repo), falling back to the name with '/' encoded as %2F —
+# what the Python scripts do with quote(name, safe='') — only if the listed
+# object has no uuid.
+#
+# THE 404s WERE SILENT
+# --------------------
+# Neither request's status was ever read. A 404 has no Location header, so
+# both polls were SKIPPED, the "task failed" checks never fired, and the last
+# task printed "removed successfully" for a volume that was never touched.
+# The node DELETE in decommission.yml then ran anyway. Both requests are now
+# gated on their HTTP status, and the removal is VERIFIED by re-listing.
+#
+# The decommission request must also return a task Location: evacuation
+# (evacuateData) is asynchronous, and without a task to wait on there is no
+# way to know the data has left the volume before it is deleted.
+#
+# DRY RUN
+# -------
+# _api_request.yml runs its curl with check_mode: false (its GETs must run
+# under --check). So without the gate below, `--check` would POST the
+# decommission and DELETE the volume for real. Writes are skipped under
+# --check and reported instead.
+
+# Looped include: reset what this file reads, or a value from the PREVIOUS
+# volume (or the previous request in this file) is read as this one's.
+- name: "Reset per-volume facts for '{{ _volume.name }}'"
+  ansible.builtin.set_fact:
+    _api_response:
+      status: 0
+      json: {}
+      location: ""
+    _api_poll_result:
+      status: 0
+      task_status: ""
+    _dv_id: >-
+      {{ (_volume.uoid.uuid | default('', true))
+         or (_volume.name | urlencode | replace('/', '%2F')) }}
+    _dv_by: "{{ 'uuid' if (_volume.uoid.uuid | default('', true)) else 'encoded name' }}"
+
+- name: "Would decommission and remove '{{ _volume.name }}' (check mode)"
+  ansible.builtin.debug:
+    msg: >-
+      --check: would POST storage-volumes/{{ _dv_id }}/decommission
+      (evacuateData={{ di_decommission_evacuate_data | default(true) }}),
+      wait for it, then DELETE storage-volumes/{{ _dv_id }}. Nothing was sent.
+  when: ansible_check_mode
+
+- name: "Decommission and remove '{{ _volume.name }}'"
+  when: not ansible_check_mode
+  block:
+    - name: "Decommission volume '{{ _volume.name }}' (by {{ _dv_by }})"
+      ansible.builtin.include_tasks: _api_request.yml
+      vars:
+        _api_request_url: "{{ _hs_api_base }}/storage-volumes/{{ _dv_id }}/decommission"
+        _api_request_method: POST
+        _api_request_body:
+          evacuateData: "{{ di_decommission_evacuate_data | default(true) }}"
+        _api_request_save_headers: true
+        _api_request_timeout: 180
+
+    - name: "Fail if the decommission of '{{ _volume.name }}' was rejected"
+      ansible.builtin.fail:
+        msg: |
+          Decommissioning storage volume '{{ _volume.name }}' failed
+          with HTTP {{ _api_response.status | int }}.
+
+          POST {{ _hs_api_base }}/storage-volumes/{{ _dv_id }}/decommission
+
+          The API said:
+            {{ _api_response.json | default({}) | to_json | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+
+          Nothing was deleted. The volume and the node are left in place, so
+          data that has not been evacuated is not lost.
+      when: (_api_response.status | int) not in [200, 201, 202, 204]
+
+    - name: "Fail if the decommission of '{{ _volume.name }}' returned no task"
+      ansible.builtin.fail:
+        msg: |
+          Decommissioning storage volume '{{ _volume.name }}' returned
+          HTTP {{ _api_response.status | int }} but no task Location, so there
+          is no way to wait for the data evacuation to finish.
+
+          Deleting the volume now could remove data that has not left it yet,
+          so the run stops here. Check the volume's state in the Anvil UI.
+      when: (_api_response.location | default('') | length) == 0
+
+    - name: "Poll decommission task for '{{ _volume.name }}'"
+      ansible.builtin.include_tasks: _api_poll_task.yml
+      vars:
+        _api_poll_url: "{{ _api_response.location }}"
+        _api_poll_retries: "{{ di_decommission_poll_retries | default(180) }}"
+        _api_poll_delay: "{{ di_decommission_poll_delay | default(10) }}"
+
+    - name: "Fail unless the decommission of '{{ _volume.name }}' completed"
+      ansible.builtin.fail:
+        msg: >-
+          Volume decommission task for '{{ _volume.name }}' ended as
+          {{ _api_poll_result.task_status | default('UNKNOWN', true) }}, not
+          COMPLETED. The volume was NOT deleted.
+      when: (_api_poll_result.task_status | default('')) != 'COMPLETED'
+
+    - name: "Reset the poll result before removing '{{ _volume.name }}'"
+      ansible.builtin.set_fact:
+        _api_poll_result:
+          status: 0
+          task_status: ""
+
+    - name: "Remove volume '{{ _volume.name }}' (by {{ _dv_by }})"
+      ansible.builtin.include_tasks: _api_request.yml
+      vars:
+        _api_request_url: "{{ _hs_api_base }}/storage-volumes/{{ _dv_id }}"
+        _api_request_method: DELETE
+        _api_request_save_headers: true
+
+    - name: "Fail if removing '{{ _volume.name }}' was rejected"
+      ansible.builtin.fail:
+        msg: |
+          Removing storage volume '{{ _volume.name }}' failed
+          with HTTP {{ _api_response.status | int }}. Its data was already
+          evacuated (the decommission completed).
+
+          DELETE {{ _hs_api_base }}/storage-volumes/{{ _dv_id }}
+
+          The API said:
+            {{ _api_response.json | default({}) | to_json | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+      when: (_api_response.status | int) not in [200, 202, 204]
+
+    - name: "Poll removal task for '{{ _volume.name }}'"
+      ansible.builtin.include_tasks: _api_poll_task.yml
+      vars:
+        _api_poll_url: "{{ _api_response.location }}"
+        _api_poll_retries: "{{ di_decommission_poll_retries | default(180) }}"
+        _api_poll_delay: "{{ di_decommission_poll_delay | default(10) }}"
+      when: _api_response.location | default('') | length > 0
+
+    - name: "Fail unless the removal of '{{ _volume.name }}' completed"
+      ansible.builtin.fail:
+        msg: >-
+          Volume removal task for '{{ _volume.name }}' ended as
+          {{ _api_poll_result.task_status | default('UNKNOWN', true) }}, not
+          COMPLETED.
+      when:
+        - (_api_poll_result.task_status | default('') | length) > 0
+        - (_api_poll_result.task_status | default('')) != 'COMPLETED'
+
+    # The verification is what makes "removed" true. The node DELETE that
+    # follows in decommission.yml must not run while the volume still exists,
+    # so this FAILS rather than warns.
+    - name: "List volumes to verify '{{ _volume.name }}' is gone"
+      ansible.builtin.include_tasks: _api_request.yml
+      vars:
+        _api_request_url: "{{ _hs_api_base }}/storage-volumes"
+        _api_request_method: GET
+
+    - name: "Fail if '{{ _volume.name }}' is still listed after removal"
+      ansible.builtin.fail:
+        msg: |
+          {% if not _dv_verifiable %}
+          Could not verify that '{{ _volume.name }}' was removed: listing
+          /storage-volumes returned HTTP {{ _api_response.status | int }}
+          {{- '' if (_api_response.status | int) != 200 else ' with a body that is not a volume list' }}.
+          {% else %}
+          Storage volume '{{ _volume.name }}' is still listed after a
+          completed DELETE.
+          {% endif %}
+          The node is NOT removed while this is unresolved. Re-run once the
+          volume is gone from the Anvil UI.
+      # Fails CLOSED: a list we cannot read is "not verified", never "gone".
+      when: >-
+        (not _dv_verifiable)
+        or ((_api_response.json | selectattr('name', 'defined')
+             | selectattr('name', 'equalto', _volume.name) | list | length) > 0)
+      vars:
+        _dv_verifiable: >-
+          {{ ((_api_response.status | int) == 200)
+             and (_api_response.json is sequence)
+             and (_api_response.json is not string)
+             and (_api_response.json is not mapping) }}
+
+    - name: "Volume '{{ _volume.name }}' removed"
+      ansible.builtin.debug:
+        msg: "Volume '{{ _volume.name }}' decommissioned, removed, and verified gone"

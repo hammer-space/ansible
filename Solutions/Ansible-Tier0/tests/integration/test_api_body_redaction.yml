@@ -1,0 +1,157 @@
+---
+# Regression test: API response bodies printed in failure messages must not
+# carry the Authorization header.
+#
+# The Hammerspace API echoes the request headers back inside some error bodies
+# (ENTITY_NOT_FOUND, errorCode 4002). The curl tasks are no_log because the
+# command line holds the password, so the failure messages print the response
+# body instead — and that body can hold the very same credential.
+# scripts/run.sh writes every run to ~/logs, so an un-redacted body wrote the
+# cluster admin credential to disk. The old comment claimed "the response
+# cannot contain the credential"; the Anvil does echo it.
+#
+# TWO BODY SHAPES, AND WHY THE FIRST FIX DID NOT WORK
+# ---------------------------------------------------
+# The redaction originally shipped was anchored:
+#
+#   regex_replace('(?i)authorization:\s*Basic\s+[A-Za-z0-9+/=]+', ...)
+#
+# and this test fed it a fixture where "headers" was a STRING of header lines
+# ("authorization: Basic <b64>\n"). It passed, and it was wrong. A real Anvil
+# emits "headers" as a JSON OBJECT —
+#
+#   "headers":{"host":"...","authorization":"Basic <b64>","content-type":...}
+#
+# — where `authorization` is followed by `":"`, not `:`. The anchored pattern
+# never matched, so the credential printed in full. It reached a screen-share
+# before anyone noticed.
+#
+# The redaction is therefore UNANCHORED: it matches `Basic <base64>` wherever
+# it appears, whatever precedes it. TEST 1 now asserts both shapes, with the
+# JSON-object shape taken verbatim from the field report.
+#
+# Rule: a redaction test must use a body captured from the real API, not one
+# written from the same assumption as the redaction it is checking.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_api_body_redaction.yml -i localhost, -c local
+
+- name: API body redaction regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    # Dummy credential: base64("admin:not-a-real-password"). Never a real one.
+    _secret_b64: "YWRtaW46bm90LWEtcmVhbC1wYXNzd29yZA=="
+    # Shape A — headers as a JSON object. This is what a real Anvil returns;
+    # copied from the 2026-11-02 field report. The anchored regex missed it.
+    _body_obj: >-
+      [{"errorCode":4002,"args":["storage volume","10.1.16.5::/nvme/tier0"],"message":"ENTITY_NOT_FOUND","stack":null,"headers":{"host":"10.1.96.37:8443","user-agent":"curl/7.76.1","accept":"*/*","authorization":"Basic {{ _secret_b64 }}","content-type":"application/json","content-length":664}}]
+    # Shape B — headers as a single string of header lines. Kept so the
+    # unanchored pattern is proven against both.
+    _body_str: >-
+      [{"errorCode":4002,"args":["storage volume","10.1.16.5::/nvme/tier0"],"message":"ENTITY_NOT_FOUND","stack":null,"headers":"host: 10.1.96.37:8443\nuser-agent: curl/7.76.1\naccept: */*\nauthorization: Basic {{ _secret_b64 }}\ncontent-type: application/json\ncontent-length: 664\n"}]
+    # The pattern every body-print site must use, kept in one place.
+    _redaction_find: '(?i)Basic\s+[A-Za-z0-9+/=]{8,}'
+    _redaction_repl: 'Basic <redacted>'
+    _tasks_dir: "{{ playbook_dir }}/../../roles/hammerspace_integration/tasks"
+
+  tasks:
+    - name: 'TEST 1: the redaction removes the credential from BOTH body shapes'
+      vars:
+        _out: >-
+          {{ item | trim | regex_replace(_redaction_find, _redaction_repl) }}
+      ansible.builtin.assert:
+        that:
+          - _secret_b64 not in _out
+          - "'Basic <redacted>' in _out"
+          - "'ENTITY_NOT_FOUND' in _out"
+          - "'10.1.16.5::/nvme/tier0' in _out"
+        fail_msg: "Credential survived redaction in this body shape: {{ _out }}"
+        quiet: true
+      loop:
+        - "{{ _body_obj }}"
+        - "{{ _body_str }}"
+      loop_control:
+        index_var: _i
+        label: "shape {{ 'A (JSON object headers)' if _i == 0 else 'B (header-line string)' }}"
+
+    # The bug this file exists to prevent a SECOND time. If anyone re-anchors
+    # the pattern on `authorization:`, this fails on the real-world shape.
+    - name: 'TEST 2: the OLD anchored pattern is proven to leak shape A'
+      vars:
+        _old: >-
+          {{ _body_obj | trim | regex_replace('(?i)authorization:\s*Basic\s+[A-Za-z0-9+/=]+', 'authorization: Basic <redacted>') }}
+      ansible.builtin.assert:
+        that:
+          - _secret_b64 in _old
+        fail_msg: >-
+          The anchored pattern no longer leaks shape A. If the Anvil's body
+          format changed, update the fixture; do not relax the redaction.
+        quiet: true
+
+    # recurse: the role has task files under cluster/ and s3/ too, and a new
+    # body-print site added there must not escape the audit. roles/di prints
+    # API bodies from its decommission failures, so it is audited as well.
+    - name: Find the role's task files
+      ansible.builtin.find:
+        paths:
+          - "{{ _tasks_dir }}"
+          - "{{ playbook_dir }}/../../roles/di/tasks"
+        patterns: "*.yml"
+        recurse: true
+      register: _files
+
+    - name: 'TEST 3: audit — every line that prints an API body is redacted'
+      ansible.builtin.set_fact:
+        _site_counts: >-
+          {%- set ns = namespace(total=0, bad=[]) -%}
+          {%- for f in _files.files -%}
+          {%- for line in lookup('file', f.path).split('\n') -%}
+          {%- if "default('(empty response body)'" in line and not line.strip().startswith('#') -%}
+          {%- set ns.total = ns.total + 1 -%}
+          {%- if 'Basic <redacted>' not in line -%}
+          {%- set ns.bad = ns.bad + [f.path | basename ~ ': ' ~ line.strip()] -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ {'total': ns.total, 'bad': ns.bad} | to_json }}
+
+    - name: 'TEST 3 ASSERT: no unredacted site, and the audit saw real sites'
+      ansible.builtin.assert:
+        that:
+          - (_site_counts | from_json).bad | length == 0
+          - (_site_counts | from_json).total >= 4
+        fail_msg: "Unredacted body print sites: {{ (_site_counts | from_json).bad }}"
+        quiet: true
+
+    - name: 'TEST 4: no comment claims the response cannot contain the credential'
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', item.path) | regex_findall('(?i)cannot\s+contain\s+the\s+credential') | length) == 0
+        quiet: true
+      loop: "{{ _files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    # The anchored form is the bug. Banning the string is stronger than
+    # asserting the unanchored one is present, because a site could carry both.
+    - name: 'TEST 5: the anchored redaction pattern appears nowhere in the role'
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', item.path) | regex_findall(_anchored) | length) == 0
+        fail_msg: >-
+          {{ item.path | basename }} still uses the anchored redaction, which
+          does not match the Anvil's "authorization":"Basic ..." body shape.
+        quiet: true
+      vars:
+        _anchored: 'authorization:\\s\*Basic'
+      loop: "{{ _files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: PASSED
+      ansible.builtin.debug:
+        msg: "test_api_body_redaction PASSED (5 tests)"

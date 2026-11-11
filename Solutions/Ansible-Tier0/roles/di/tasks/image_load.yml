@@ -1,0 +1,86 @@
+---
+# Provide the pd-di container image without building it on the target.
+# Dispatched from container_deploy.yml / container_build.yml when
+# di_image_source != 'build'. Modes: url | local | registry.
+# After this file runs, an image tagged {{ di_container_image }} must exist.
+
+- name: Validate di_image_source
+  ansible.builtin.fail:
+    msg: >-
+      di_image_source='{{ di_image_source }}' is not supported.
+      Use 'build', 'url', 'local', or 'registry'.
+  when: di_image_source not in ['build', 'url', 'local', 'registry']
+
+- name: Validate required var for di_image_source
+  ansible.builtin.assert:
+    that:
+      - (di_image_source == 'url'      and (di_image_url          | default('') | length > 0)) or
+        (di_image_source == 'local'    and (di_image_local_path   | default('') | length > 0)) or
+        (di_image_source == 'registry' and (di_image_registry_ref | default('') | length > 0))
+    fail_msg: >-
+      di_image_source={{ di_image_source }} requires the matching variable to be set:
+      url -> di_image_url, local -> di_image_local_path, registry -> di_image_registry_ref.
+
+- name: Ensure staging directory for image tarball
+  ansible.builtin.file:
+    path: "{{ di_container_build_dir }}"
+    state: directory
+    mode: "0755"
+  when: di_image_source in ['url', 'local']
+
+- name: Download image tarball
+  ansible.builtin.get_url:
+    url: "{{ di_image_url }}"
+    dest: "{{ di_container_build_dir }}/di-image.tar"
+    mode: "0644"
+  when: di_image_source == 'url'
+
+- name: Copy image tarball from controller
+  ansible.builtin.copy:
+    src: "{{ di_image_local_path }}"
+    dest: "{{ di_container_build_dir }}/di-image.tar"
+    mode: "0644"
+  when: di_image_source == 'local'
+
+- name: "Load image tarball with {{ di_container_runtime }}"
+  ansible.builtin.command:
+    cmd: "{{ di_container_runtime }} load -i {{ di_container_build_dir }}/di-image.tar"
+  register: _di_image_load
+  changed_when: true
+  when: di_image_source in ['url', 'local']
+
+- name: "Pull image from registry with {{ di_container_runtime }}"
+  ansible.builtin.command:
+    cmd: "{{ di_container_runtime }} pull {{ di_image_registry_ref }}"
+  register: _di_image_pull
+  changed_when: true
+  when: di_image_source == 'registry'
+
+# Determine the loaded/pulled image reference so we can re-tag it to
+# di_container_image. podman/docker load prints e.g.
+#   "Loaded image: localhost/hammerspace-di:aarch64"
+# (some versions print "Loaded image(s):"). The pull case is just the ref.
+- name: Compute source image reference
+  ansible.builtin.set_fact:
+    _di_image_loaded_ref: >-
+      {%- if di_image_source == 'registry' -%}
+        {{ di_image_registry_ref }}
+      {%- else -%}
+        {{ (_di_image_load.stdout | default('')
+            | regex_search('Loaded image[^:]*:\s*(\S+)', '\1') | first | default('')) }}
+      {%- endif -%}
+
+- name: Fail if loaded image reference could not be determined
+  ansible.builtin.fail:
+    msg: >-
+      Could not determine the image reference produced by '{{ di_container_runtime }} load'.
+      stdout was: {{ _di_image_load.stdout | default('(empty)') }}
+  when:
+    - di_image_source in ['url', 'local']
+    - (_di_image_loaded_ref | trim) | length == 0
+
+- name: "Tag image as {{ di_container_image }} (if different)"
+  ansible.builtin.command:
+    cmd: "{{ di_container_runtime }} tag {{ _di_image_loaded_ref }} {{ di_container_image }}"
+  changed_when: true
+  when: (_di_image_loaded_ref | trim) != di_container_image

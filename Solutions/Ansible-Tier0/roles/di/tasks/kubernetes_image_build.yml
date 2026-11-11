@@ -1,0 +1,215 @@
+---
+# Build the DI container image on a build host and push to the registry.
+# Runs once per build host (typically one per architecture). Reuses the
+# existing payload-staging logic from image_build.yml.
+
+- name: Validate registry namespace is set
+  ansible.builtin.assert:
+    that:
+      - di_k8s_registry | length > 0
+      - di_k8s_registry_namespace | length > 0
+    fail_msg: >-
+      di_k8s_registry and di_k8s_registry_namespace must be set for k8s mode.
+      Set them in vars/main.yml (e.g. di_k8s_registry_namespace=<oci-tenancy>).
+
+# ---------------------------------------------------------------------------
+# Detect build tool. Order: explicit override > podman > docker > buildah > nerdctl.
+# ---------------------------------------------------------------------------
+
+- name: Probe candidate build tools
+  ansible.builtin.command:
+    cmd: "command -v {{ item }}"
+  register: _di_k8s_tool_probe
+  loop: [podman, docker, buildah, nerdctl]
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Pick build tool (auto)
+  ansible.builtin.set_fact:
+    _di_k8s_build_tool: >-
+      {{ (_di_k8s_tool_probe.results
+          | selectattr('rc', 'equalto', 0)
+          | map(attribute='item') | list | first | default('')) }}
+  when: di_k8s_build_tool == 'auto'
+
+- name: Honor explicit build tool override
+  ansible.builtin.set_fact:
+    _di_k8s_build_tool: "{{ di_k8s_build_tool }}"
+  when: di_k8s_build_tool != 'auto'
+
+- name: Fail if no build tool is available
+  ansible.builtin.fail:
+    msg: >-
+      No container build tool found on {{ inventory_hostname }}. Install one
+      of: podman, docker, buildah, nerdctl. Or set di_k8s_build_tool explicitly.
+  when: _di_k8s_build_tool | length == 0
+
+- name: "Selected build tool: {{ _di_k8s_build_tool }}"
+  ansible.builtin.debug:
+    msg: "Building DI image on {{ inventory_hostname }} ({{ ansible_architecture }}) with {{ _di_k8s_build_tool }}"
+
+# ---------------------------------------------------------------------------
+# Ensure pd-di RPMs are present on the controller (git lfs pull).
+# Runs once on the controller; the existing image_build.yml stages the
+# payload from the controller's payload dir.
+# ---------------------------------------------------------------------------
+
+- name: Ensure git-lfs payload pulled (controller side)
+  ansible.builtin.command:
+    cmd: git lfs pull --include payload/
+    chdir: "{{ repo_root }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: _di_k8s_lfs
+  changed_when: "'Downloading' in (_di_k8s_lfs.stdout | default(''))"
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# Stage payload + Containerfile on the build host (reuse image_build.yml
+# logic, but with our own build/push at the end).
+# ---------------------------------------------------------------------------
+
+- name: Set target architecture
+  ansible.builtin.set_fact:
+    _di_arch: "{{ ansible_architecture }}"
+    _di_container_platform: "{{ 'linux/arm64' if ansible_architecture == 'aarch64' else 'linux/amd64' }}"
+    _di_k8s_local_tag: "hammerspace-di:k8s-{{ ansible_architecture }}"
+
+- name: Compute remote image reference (per-arch suffix or single tag)
+  ansible.builtin.set_fact:
+    _di_k8s_remote_ref: >-
+      {{ di_k8s_registry }}/{{ di_k8s_registry_namespace }}/{{ di_k8s_image_repository }}:{{ di_k8s_image_tag }}{{
+         ('-' ~ ('amd64' if ansible_architecture == 'x86_64' else 'arm64'))
+         if (di_k8s_image_arch_suffix | bool) else '' }}
+
+- name: Ensure build directory
+  ansible.builtin.file:
+    path: "{{ di_container_build_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure payload directory
+  ansible.builtin.file:
+    path: "{{ di_container_build_dir }}/payload"
+    state: directory
+    mode: "0755"
+
+- name: Copy Containerfile into build dir
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/container/Containerfile"
+    dest: "{{ di_container_build_dir }}/Containerfile"
+    mode: "0644"
+
+- name: Enumerate local payload files (arch-filtered)
+  ansible.builtin.find:
+    paths: "{{ di_payload_local_dir | default(repo_root + '/payload') }}"
+    patterns:
+      - "*.{{ _di_arch }}.rpm"
+      - "*.noarch.rpm"
+      - "add_node.py"
+  register: _di_k8s_payload
+  delegate_to: localhost
+  become: false
+
+- name: Fail if payload dir empty on controller
+  ansible.builtin.fail:
+    msg: >-
+      di_payload_local_dir ({{ di_payload_local_dir | default(repo_root + '/payload') }})
+      is empty for arch={{ _di_arch }}. Did `git lfs pull` run successfully?
+  when: (_di_k8s_payload.matched | default(0)) == 0
+
+- name: Copy payload files to build dir
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "{{ di_container_build_dir }}/payload/{{ item.path | basename }}"
+    mode: "0644"
+  loop: "{{ _di_k8s_payload.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+# ---------------------------------------------------------------------------
+# Registry login (if creds supplied).
+# ---------------------------------------------------------------------------
+
+- name: Registry login
+  ansible.builtin.command:
+    cmd: >-
+      {{ _di_k8s_build_tool }} login
+      -u {{ di_k8s_registry_username }}
+      --password-stdin
+      {{ di_k8s_registry }}
+    stdin: "{{ di_k8s_registry_password }}"
+  when:
+    - di_k8s_registry_username | length > 0
+    - di_k8s_registry_password | length > 0
+  no_log: true
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# Build + push.
+# ---------------------------------------------------------------------------
+
+- name: "Build image with {{ _di_k8s_build_tool }} ({{ _di_container_platform }})"
+  ansible.builtin.command:
+    cmd: >-
+      {{ _di_k8s_build_tool }} build
+      --platform {{ _di_container_platform }}
+      --build-arg BASE_IMAGE={{ di_container_base_image | default('rockylinux:9') }}
+      -t {{ _di_k8s_local_tag }}
+      -t {{ _di_k8s_remote_ref }}
+      -f {{ di_container_build_dir }}/Containerfile
+      {{ di_container_build_dir }}
+  register: _di_k8s_build
+  changed_when: true
+
+- name: "Push image to {{ _di_k8s_remote_ref }}"
+  ansible.builtin.command:
+    cmd: "{{ _di_k8s_build_tool }} push {{ _di_k8s_remote_ref }}"
+  register: _di_k8s_push
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# Optional multi-arch manifest (buildah only).
+# ---------------------------------------------------------------------------
+
+- name: Assemble multi-arch manifest (buildah)
+  when:
+    - di_k8s_build_multiarch_manifest | bool
+    - _di_k8s_build_tool == 'buildah'
+  run_once: true
+  delegate_to: "{{ groups['di_k8s_build_hosts'][0] | default(inventory_hostname) }}"
+  block:
+    - name: Create manifest list
+      ansible.builtin.command:
+        cmd: >-
+          buildah manifest create
+          {{ di_k8s_registry }}/{{ di_k8s_registry_namespace }}/{{ di_k8s_image_repository }}:{{ di_k8s_image_tag }}
+      register: _di_k8s_manifest_create
+      changed_when: _di_k8s_manifest_create.rc == 0
+      failed_when:
+        - _di_k8s_manifest_create.rc != 0
+        - "'already exists' not in (_di_k8s_manifest_create.stderr | default(''))"
+
+    - name: Add per-arch image refs to manifest
+      ansible.builtin.command:
+        cmd: >-
+          buildah manifest add
+          {{ di_k8s_registry }}/{{ di_k8s_registry_namespace }}/{{ di_k8s_image_repository }}:{{ di_k8s_image_tag }}
+          {{ di_k8s_registry }}/{{ di_k8s_registry_namespace }}/{{ di_k8s_image_repository }}:{{ di_k8s_image_tag }}-{{ item }}
+      loop: [amd64, arm64]
+      changed_when: true
+      failed_when: false
+
+    - name: Push manifest list
+      ansible.builtin.command:
+        cmd: >-
+          buildah manifest push --all
+          {{ di_k8s_registry }}/{{ di_k8s_registry_namespace }}/{{ di_k8s_image_repository }}:{{ di_k8s_image_tag }}
+          docker://{{ di_k8s_registry }}/{{ di_k8s_registry_namespace }}/{{ di_k8s_image_repository }}:{{ di_k8s_image_tag }}
+      changed_when: true
+
+- name: "Image push complete ({{ _di_k8s_remote_ref }})"
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} ({{ _di_arch }}): pushed {{ _di_k8s_remote_ref }} using {{ _di_k8s_build_tool }}"

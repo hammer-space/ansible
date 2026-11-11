@@ -1,0 +1,286 @@
+---
+# Integration test for boot-drive safety in nvme_discovery + precheck.
+#
+# Regression test for the bug Keith hit on 2026-05-14: empty boot-device
+# detection caused the playbook to plan mkfs.xfs on the boot NVMe (only
+# saved by the kernel reporting EBUSY).
+#
+# This test runs against localhost (no remote hosts needed). It exercises:
+#   1. Real detection against the control host — must produce non-empty list
+#   2. Empty _protected_disks → hard-fail with the expected message
+#   3. nvme_devices overlapping _protected_disks → safety gate fires
+#   4. Detection script's locale resilience (forces LC_ALL=ko_KR.UTF-8)
+#
+# Usage:
+#   ./scripts/run.sh playbook tests/integration/test_boot_device_safety.yml
+#   # or:
+#   ansible-playbook tests/integration/test_boot_device_safety.yml \
+#       -i localhost, -c local
+
+- name: Boot-drive safety regression tests
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  # Override ansible.cfg's default become=true — the read-only detection
+  # paths (/proc/mounts, lsblk, findmnt) work without root, and the test
+  # is meant to be runnable on a developer laptop without a sudo prompt.
+  become: false
+
+  vars:
+    _test_failures: []
+    _test_passes: []
+
+  tasks:
+    - name: Skip tests on non-Linux (no /proc/mounts, no lsblk)
+      ansible.builtin.meta: end_play
+      when: ansible_system != 'Linux'
+
+    # ========================================================================
+    # TEST 1: real detection against the control host
+    # Confirms detect_boot_device.yml returns a non-empty list on a normal
+    # machine. If this fails on a normal dev box, the detection itself
+    # is broken.
+    # ========================================================================
+    - name: 'TEST 1: run detect_boot_device.yml against this host'
+      block:
+        # include_role (not include_tasks with a raw path): detect_boot_device.yml
+        # now runs roles/nvme_discovery/files/scan_disks.sh via the script module,
+        # and the script module only resolves files/ when the task has role context.
+        - name: Include the actual detection task file
+          ansible.builtin.include_role:
+            name: nvme_discovery
+            tasks_from: detect_boot_device
+
+        - name: 'TEST 1 ASSERT: _protected_disks is a non-empty list'
+          ansible.builtin.assert:
+            that:
+              - _protected_disks is defined
+              - _protected_disks is iterable
+              - _protected_disks | length > 0
+            fail_msg: |
+              REGRESSION: detection returned empty _protected_disks on a normal host.
+              This is the exact failure mode that caused the boot-drive mkfs incident.
+              scan_disks.sh stdout was: {{ _disk_scan.stdout | default('<unset>') }}
+            success_msg: "OK — detected {{ _protected_disks | length }} protected disk(s): {{ _protected_disks | join(', ') }}"
+
+        - name: 'TEST 1 ASSERT: _detected_boot_device matches the disk hosting /'
+          ansible.builtin.assert:
+            that:
+              - _detected_boot_device is defined
+              - _detected_boot_device | length > 0
+              - _detected_boot_device in _protected_disks
+            fail_msg: "_detected_boot_device='{{ _detected_boot_device }}' should be in _protected_disks={{ _protected_disks }}"
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: real detection produces non-empty list'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace(\"\\n\", \" \"))] }}"
+
+    # ========================================================================
+    # TEST 2: empty _protected_disks must HARD FAIL
+    # This is the canonical bug. Before the fix, an empty list was silently
+    # tolerated and downstream rejectattr('equalto', '') matched nothing.
+    # Now it must abort the play with a clear message.
+    # ========================================================================
+    - name: 'TEST 2: empty _protected_disks should hard-fail'
+      block:
+        - name: Simulate empty detection result
+          ansible.builtin.set_fact:
+            _protected_disks: []
+            _root_disk_raw:
+              stdout: ''
+            allow_empty_protected_disks: false
+
+        - name: Run the fail-on-empty task in isolation
+          ansible.builtin.fail:
+            msg: |
+              Boot / protected-disk detection returned an EMPTY list.
+              Refusing to proceed — running RAID / mkfs without an exclusion list
+              could wipe the OS disk.
+          when:
+            - _protected_disks | length == 0
+            - not (allow_empty_protected_disks | default(false) | bool)
+
+        - name: 'TEST 2 FAIL: empty detection did NOT trigger the safety stop'
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: empty _protected_disks did NOT trigger the fail task (REGRESSION — boot drive would be at risk)'] }}"
+      rescue:
+        - name: 'TEST 2 PASS: empty detection correctly hard-failed'
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: empty _protected_disks → hard-fail (expected behavior, caught by rescue)'] }}"
+
+    # ========================================================================
+    # TEST 3: allow_empty_protected_disks: true must bypass the gate
+    # Escape hatch for diskless / netboot — must work, but loudly.
+    # ========================================================================
+    - name: 'TEST 3: allow_empty_protected_disks=true bypasses the gate'
+      block:
+        - name: Simulate diskless system with override
+          ansible.builtin.set_fact:
+            _protected_disks: []
+            allow_empty_protected_disks: true
+
+        - name: Run the fail-on-empty task with override
+          ansible.builtin.fail:
+            msg: "Should not run."
+          when:
+            - _protected_disks | length == 0
+            - not (allow_empty_protected_disks | default(false) | bool)
+
+        - name: 'TEST 3 PASS: override correctly skipped the gate'
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: allow_empty_protected_disks=true bypasses gate'] }}"
+      rescue:
+        - name: 'TEST 3 FAIL: override did NOT bypass the gate'
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: allow_empty_protected_disks=true did NOT bypass — override is broken'] }}"
+
+    # ========================================================================
+    # TEST 4: safety gate in build_raid_arrays.yml must catch overlap
+    # If somehow boot device slips into nvme_devices, the final assertion
+    # must catch it before mkfs runs.
+    # ========================================================================
+    - name: 'TEST 4: overlap between nvme_devices and _protected_disks should fail'
+      block:
+        - name: Simulate the exact bug Keith hit
+          ansible.builtin.set_fact:
+            _protected_disks:
+              - nvme0n1
+            allow_empty_protected_disks: false
+            nvme_devices:
+              - name: nvme0n1     # <- boot drive sneaking in
+                device: /dev/nvme0n1
+                numa: 0
+                serial: BOOTDEV01
+                model: BOOT-NVME
+                pcie_address: "0000:01:00.0"
+              - name: nvme2n1
+                device: /dev/nvme2n1
+                numa: 0
+                serial: DATA02
+                model: DATA-NVME
+                pcie_address: "0000:03:00.0"
+
+        - name: Run the safety gate from build_raid_arrays.yml
+          ansible.builtin.fail:
+            msg: |
+              REFUSING TO PROCEED — candidate storage devices overlap with protected disks.
+              Overlap: {{ (nvme_devices | map(attribute='name') | list)
+                          | intersect(_protected_disks | default([])) | join(', ') }}
+          when:
+            - (nvme_devices | default([]) | map(attribute='name') | list)
+              | intersect(_protected_disks | default([])) | length > 0
+            - not (allow_empty_protected_disks | default(false) | bool)
+
+        - name: 'TEST 4 FAIL: safety gate did NOT trigger on boot-drive overlap'
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: nvme_devices∩_protected_disks did NOT trigger safety gate (REGRESSION — boot drive would be RAIDed)'] }}"
+      rescue:
+        - name: 'TEST 4 PASS: safety gate caught the overlap'
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: nvme_devices∩_protected_disks → safety gate fires (boot drive protected)'] }}"
+
+    # ========================================================================
+    # TEST 5: no overlap → safety gate does NOT trigger (negative test)
+    # ========================================================================
+    - name: 'TEST 5: clean nvme_devices should pass the safety gate'
+      block:
+        - name: Simulate a clean discovery (boot drive properly excluded)
+          ansible.builtin.set_fact:
+            _protected_disks:
+              - nvme0n1
+            allow_empty_protected_disks: false
+            nvme_devices:
+              - name: nvme1n1
+                device: /dev/nvme1n1
+                numa: 0
+                serial: DATA01
+                model: DATA-NVME
+                pcie_address: "0000:02:00.0"
+              - name: nvme2n1
+                device: /dev/nvme2n1
+                numa: 0
+                serial: DATA02
+                model: DATA-NVME
+                pcie_address: "0000:03:00.0"
+
+        - name: Run the safety gate (should NOT fire)
+          ansible.builtin.fail:
+            msg: "Should not fire — no overlap."
+          when:
+            - (nvme_devices | default([]) | map(attribute='name') | list)
+              | intersect(_protected_disks | default([])) | length > 0
+            - not (allow_empty_protected_disks | default(false) | bool)
+
+        - name: 'TEST 5 PASS: clean discovery passes the gate'
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 5: clean nvme_devices passes safety gate (no false positives)'] }}"
+      rescue:
+        - name: 'TEST 5 FAIL: safety gate fired on clean input'
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 5: safety gate fired with NO overlap (false positive — would block valid deployments)'] }}"
+
+    # ========================================================================
+    # TEST 6: locale resilience — re-run detection with non-UTF-8 LANG.
+    # The Korean-locale incident demonstrated the detection script must
+    # behave identically regardless of the controller's LANG/LC_ALL.
+    # ========================================================================
+    - name: 'TEST 6: detection works under ko_KR.UTF-8 locale'
+      block:
+        - name: Re-run the real scan_disks.sh with ko_KR.UTF-8 forced
+          ansible.builtin.script:
+            cmd: "{{ playbook_dir }}/../../roles/nvme_discovery/files/scan_disks.sh"
+          environment:
+            LC_ALL: ko_KR.UTF-8
+            LANG: ko_KR.UTF-8
+          register: _ko_detect
+          changed_when: false
+
+        - name: 'TEST 6 ASSERT: detection under ko_KR locale produces same output'
+          ansible.builtin.assert:
+            that:
+              - _ko_detect.stdout_lines | select('match', '^PROTECTED ') | list | length > 0
+            fail_msg: |
+              Detection under ko_KR.UTF-8 returned no PROTECTED lines.
+              Probable cause: the script is not forcing LC_ALL=C internally,
+              so a non-UTF-8 system locale breaks parsing of findmnt/pvs/awk.
+
+        - name: 'TEST 6 PASS: detection is locale-resilient'
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 6: detection works under ko_KR.UTF-8 locale'] }}"
+      rescue:
+        - name: 'TEST 6 SKIP or FAIL'
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 6: ' ~ (ansible_failed_result.msg | default('locale test failed — check the host has the ko_KR locale or the lsblk/awk fallback path'))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          BOOT-DRIVE SAFETY REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed — see report above."
+      when: _test_failures | length > 0

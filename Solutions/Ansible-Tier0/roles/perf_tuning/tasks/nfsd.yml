@@ -1,0 +1,53 @@
+---
+# NFSD server-side tuning (Hammerspace BKM).
+# Tunes max negotiated block size and (optionally) direct I/O mode.
+
+- name: Set NFSD max_block_size (runtime)
+  ansible.builtin.copy:
+    dest: /proc/fs/nfsd/max_block_size
+    content: "{{ perf_nfsd_max_block_size }}"
+    unsafe_writes: true
+  failed_when: false
+  changed_when: true
+
+- name: Persist NFSD max_block_size via systemd tmpfiles
+  ansible.builtin.copy:
+    dest: /etc/tmpfiles.d/hammerspace-nfsd.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Hammerspace Tier 0 BKM: NFSD max block size on boot
+      w /proc/fs/nfsd/max_block_size - - - - {{ perf_nfsd_max_block_size }}
+      {% if perf_nfsd_direct_io | bool %}
+      w /proc/fs/nfsd/nfsv4leasetime - - - - 90
+      {% endif %}
+
+- name: Check kernel support for nfsd direct I/O parameter
+  ansible.builtin.stat:
+    path: /sys/module/nfsd/parameters/nfsd_direct_io
+  register: _nfsd_direct_io_stat
+  when: perf_nfsd_direct_io | bool
+
+- name: Configure nfsd direct I/O via modprobe (when supported)
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/nfsd-direct.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Hammerspace Tier 0 BKM: bypass page cache for NFSD reads
+      options nfsd nfsd_direct_io=1
+  when:
+    - perf_nfsd_direct_io | bool
+    - _nfsd_direct_io_stat.stat.exists | default(false)
+
+- name: Warn when nfsd direct I/O is unsupported on this kernel
+  ansible.builtin.debug:
+    msg: >-
+      nfsd_direct_io parameter not present on this kernel
+      ({{ ansible_kernel }}); skipping direct I/O knob.
+      max_block_size tuning still applied.
+  when:
+    - perf_nfsd_direct_io | bool
+    - not (_nfsd_direct_io_stat.stat.exists | default(false))

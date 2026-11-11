@@ -1,0 +1,74 @@
+---
+# Defaults for perf_tuning role. Override in vars/main.yml.
+
+# Master toggle. Set to false to skip all perf tuning.
+perf_tuning_enabled: true
+
+# ---- sunrpc / NFS client RPC slot tables (Hammerspace BKM) ----
+# Increases the per-mount RPC slot count to keep many in-flight NFS ops.
+# Defaults: kernel ships with 2/65536 — Hammerspace recommends 128/65536.
+perf_sunrpc_tunables_enabled: true
+perf_sunrpc_tcp_slot_table_entries: 128
+perf_sunrpc_tcp_max_slot_table_entries: 65536
+
+# ---- NFSD threading + direct I/O (server-side BKM) ----
+# nfs_threads is already defined in vars/main.yml (default 128).
+# This section tunes additional NFSD parameters that aren't covered there.
+perf_nfsd_tunables_enabled: true
+# Max block size negotiated on the wire (kernel max is 1048576 = 1MB).
+perf_nfsd_max_block_size: 1048576
+# Enable nfsd direct I/O (bypasses page cache for large sequential reads).
+# Reduces double-buffering at the cost of higher latency for small reads.
+perf_nfsd_direct_io: true
+
+# ---- Read-ahead (Hammerspace BKM: 1024-16384 KB for sequential workloads) ----
+# nfs_setup already deploys a 1024 KB udev rule for NFS mounts. This section
+# is for the *block devices* backing /hammerspace/hsvol* (NVMe / MD arrays).
+perf_readahead_enabled: true
+perf_readahead_kb: 4096
+
+# ---- NIC IRQ pinning (NUMA-local interrupt steering) ----
+# Pins NIC RX/TX queue IRQs to CPUs on the same NUMA node as the NIC.
+# Big win for high-throughput RDMA/TCP workloads on multi-socket nodes.
+perf_irq_pinning_enabled: true
+# Network interfaces to pin. Empty list = auto-detect 25Gbps+ NICs.
+perf_irq_pin_interfaces: []
+#   - ens1f0
+#   - ens1f1
+# Disable irqbalance service (it fights manual pinning)
+perf_irq_pinning_stop_irqbalance: true
+
+# ---- TCP / network sysctl BKMs ----
+perf_tcp_sysctl_enabled: true
+perf_tcp_sysctl:
+  net.core.rmem_max: 268435456
+  net.core.wmem_max: 268435456
+  net.ipv4.tcp_rmem: "4096 87380 268435456"
+  net.ipv4.tcp_wmem: "4096 65536 268435456"
+  net.core.netdev_max_backlog: 250000
+  net.ipv4.tcp_mtu_probing: 1
+
+# ---- vm dirty-page writeback limits (NFS *client* ingest BKM) ----
+# Caps how much dirty page cache a bulk NFS writer (azcopy, rsync, cp, dd)
+# may accumulate before the kernel throttles it. With no explicit cap the
+# limit is vm.dirty_ratio = 20% of available memory; on a large-memory node
+# that is hundreds of GB of dirty NFS pages, which looks from the outside
+# like the ingest tool "using crazy amounts of memory".
+#
+# OFF by default. The knob is GLOBAL, not per-mount: it also throttles
+# writeback to the local NVMe / MD array backing /hammerspace/hsvol*, so a cap
+# sized for an ingest client can slow a Tier 0 storage node's own writes.
+# Enable it on hosts whose job is NFS ingest.
+perf_vm_writeback_enabled: false
+
+# Only ONE form per limit — *_bytes or *_ratio, never both. vm_writeback.yml
+# refuses a mix, because writing either form zeroes the other and the result
+# then depends on line order. Prefer *_bytes: it does not scale with RAM.
+perf_vm_writeback:
+  # Start background flushing at 256 MB of dirty pages.
+  vm.dirty_background_bytes: 268435456
+  # Throttle the writing process at 1 GB of dirty pages.
+  vm.dirty_bytes: 1073741824
+
+# Filename under /etc/sysctl.d/. Applied in lexical order by `sysctl --system`.
+perf_vm_writeback_sysctl_filename: 99-hammerspace-vm-writeback.conf

@@ -1,0 +1,90 @@
+---
+# Dependencies role - Install required OS packages
+
+
+- name: Enable EPEL and CRB (RedHat)
+  when: ansible_os_family == 'RedHat'
+  block:
+    - name: Install epel-release from Fedora project (works on RHEL and Rocky/Alma)
+      ansible.builtin.dnf:
+        name: "https://dl.fedoraproject.org/pub/epel/epel-release-latest-{{ ansible_distribution_major_version }}.noarch.rpm"
+        state: present
+        disable_gpg_check: true
+
+    - name: Enable CRB repo (el9 - required for some EPEL deps)
+      ansible.builtin.command:
+        cmd: dnf config-manager --set-enabled crb
+      register: crb_enable
+      changed_when: "'Enabling' in crb_enable.stdout"
+      failed_when: false
+      when: ansible_distribution_major_version == '9'
+
+- name: Wait for apt lock to be released (Ubuntu/Debian)
+  ansible.builtin.shell: |
+    systemctl stop unattended-upgrades 2>/dev/null || true
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+      echo "apt lock held, waiting..."
+      sleep 10
+    done
+  when: ansible_os_family == 'Debian'
+  changed_when: false
+  failed_when: false
+
+- name: Install OS packages
+  ansible.builtin.package:
+    name: "{{ di_os_packages }}"
+    state: present
+
+- name: Install babeltrace (RedHat - separate RPM)
+  when: ansible_os_family == 'RedHat'
+  block:
+    - name: Check if babeltrace is already installed
+      ansible.builtin.command:
+        cmd: rpm -q babeltrace
+      register: babeltrace_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download babeltrace RPM
+      ansible.builtin.get_url:
+        url: "{{ babeltrace_rpm_url }}"
+        dest: "/tmp/babeltrace.rpm"
+        mode: "0644"
+      when: babeltrace_check.rc != 0
+
+    - name: Install babeltrace RPM
+      ansible.builtin.dnf:
+        name: "/tmp/babeltrace.rpm"
+        state: present
+        disable_gpg_check: true
+      when: babeltrace_check.rc != 0
+
+- name: Install pip packages for add_node.py
+  ansible.builtin.pip:
+    name:
+      - urllib3
+      - requests
+      - jmespath
+    executable: pip3
+    extra_args: "{{ '--break-system-packages' if ansible_os_family == 'Debian' else '' }}"
+  failed_when: false
+
+- name: Install pip packages fallback (apt for Debian if pip fails)
+  ansible.builtin.package:
+    name:
+      - python3-urllib3
+      - python3-requests
+      - python3-jmespath
+    state: present
+  when: ansible_os_family == 'Debian'
+  failed_when: false
+
+- name: Install jmespath on Ansible controller (required by json_query filter)
+  ansible.builtin.pip:
+    name: jmespath
+    executable: pip3
+    extra_args: "{{ '--break-system-packages' if ansible_os_family == 'Debian' else '' }}"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  failed_when: false

@@ -1,0 +1,301 @@
+---
+# Create ONE volume group if it does not exist, and wait until the cluster
+# lists it.
+#
+# Callers:
+#   main.yml               - hammerspace_volume_groups (explicit list), with
+#                            hammerspace_create_volume_groups: true
+#   volume_group_join_one  - hammerspace_volume_group names a group that does
+#                            not exist, with hammerspace_create_volume_groups:
+#                            true. Created with this run's volumes as members.
+#
+# Input:  volume_group_config  {name, volumes: [names]} or {name, location_pattern}
+# Output: _vgc_status   HTTP status of the final lookup (200 when it exists)
+#         _vgc_json     the group object as the cluster returns it
+#         _vgc_created  true only when THIS run created it
+#
+# WHY IT IS GATED THE WAY IT IS
+# -----------------------------
+# The old version of this file never read the POST status. A rejected create
+# has no Location header, so the poll was skipped, the only gate (task
+# FAILED/CANCELLED) never fired, and "created successfully" was printed for a
+# group the cluster did not have. The run then died minutes later at the join
+# with "does not exist (HTTP 404)" — which looked like the create had never
+# been attempted. Same shape as the objective-set and storage-volume adds.
+#
+# So: the POST status is gated, the task is polled when there is one, and the
+# group is then looked up by name until it is listed. That lookup is what
+# makes "created" true; a POST the Anvil acknowledges but does not finish is
+# caught there rather than at the join.
+#
+# Every curl here carries no_log: its command line holds the API password,
+# and a curl error (connection refused, timeout) would otherwise print it.
+# Failures are reported from separate, un-censored tasks with the response
+# body redacted.
+
+- name: "Reset the volume group create facts for {{ volume_group_config.name }}"
+  ansible.builtin.set_fact:
+    _vgc_status: 0
+    _vgc_json: {}
+    _vgc_created: false
+    _vgc_do_create: false
+    _vgc_post: {status: 0, location: ""}
+    _vgc_poll_status: ""
+
+- name: "Wait for task queue before creating volume group {{ volume_group_config.name }}"
+  ansible.builtin.include_tasks: task_queue_wait.yml
+  when: hammerspace_task_queue_throttle | default(true)
+
+# Two shapes. `volumes` is the one the join reads and writes
+# (expressions[0].locations, operator IN). `location_pattern` is kept for the
+# hammerspace_volume_groups list.
+- name: "Build volume group payload for {{ volume_group_config.name }}"
+  ansible.builtin.set_fact:
+    _vgc_payload: >-
+      {{ {'_type': 'VOLUME_GROUP',
+          'name': volume_group_config.name,
+          'expressions': [
+            {'_type': 'EXPRESSION', 'operator': 'IN',
+             'locations': volume_group_config.volumes | map('regex_replace', '^(.*)$',
+               '{"_type": "VOLUME_LOCATION", "extendedInfo": {}, "storageVolume": {"_type": "STORAGE_VOLUME", "extendedInfo": {}, "name": "\1"}}')
+               | map('from_json') | list}
+          ]}
+         if volume_group_config.volumes is defined else
+         {'_type': 'VOLUME_GROUP',
+          'name': volume_group_config.name,
+          'expressions': [
+            {'_type': 'EXPRESSION',
+             'expressionType': 'VOLUME_LOCATION',
+             'namePattern': volume_group_config.location_pattern | default('*')}
+          ]} }}
+
+- name: "Check if volume group {{ volume_group_config.name }} already exists"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      "{{ hs_api_url }}/volume-groups/{{ volume_group_config.name | urlencode }}"
+  register: _vgc_check_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+- name: "Parse volume group check result for {{ volume_group_config.name }}"
+  ansible.builtin.set_fact:
+    _vgc_status: "{{ (_vgc_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+    _vgc_json: >-
+      {{ (((_vgc_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json)
+         if ((_vgc_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int) == 200 else {} }}
+
+# Anything other than "exists" or "does not exist" — auth, 5xx, curl never
+# ran — must not be read as "missing, create it".
+- name: "Fail if the lookup of volume group {{ volume_group_config.name }} failed"
+  ansible.builtin.fail:
+    msg: |
+      Looking up volume group '{{ volume_group_config.name }}' returned
+      HTTP {{ _vgc_status | int }} (curl exit {{ _vgc_check_raw.rc | default('?') }}),
+      so it is unknown whether it exists. Nothing was created.
+
+      GET {{ hs_api_url }}/volume-groups/{{ volume_group_config.name | urlencode }}
+
+      The API said:
+        {{ (_vgc_check_raw.stdout_lines | default([]))[:-1] | join('\n  ') | trim | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+      {% if (_vgc_status | int) == 0 %}
+
+      HTTP 0 means curl produced no output, so it did not run or could not
+      connect. stderr:
+        {{ (_vgc_check_raw.stderr | default('') | regex_replace('Basic [A-Za-z0-9+/=]+', 'Basic <redacted>')) | trim | default('(none)', true) }}
+      {% endif %}
+  when: (_vgc_status | int) not in [200, 404]
+
+- name: "Volume group {{ volume_group_config.name }} already exists"
+  ansible.builtin.debug:
+    msg: "Volume group '{{ volume_group_config.name }}' already exists — left unchanged."
+  when: (_vgc_status | int) == 200
+
+- name: "Would create volume group {{ volume_group_config.name }} (check mode)"
+  ansible.builtin.debug:
+    msg: >-
+      --check: would POST volume group '{{ volume_group_config.name }}'
+      {% if volume_group_config.volumes is defined %}with
+      {{ volume_group_config.volumes | length }} member(s):
+      {{ volume_group_config.volumes | join(', ') }}{% else %}with location
+      pattern '{{ volume_group_config.location_pattern | default('*') }}'{% endif %}.
+      Nothing was sent.
+  when:
+    - (_vgc_status | int) == 404
+    - ansible_check_mode
+
+# Decided ONCE, into a fact. A block's `when` is re-evaluated for EVERY task
+# inside it, and the lookup below sets _vgc_status to 200 — gating the block
+# on `_vgc_status == 404` skipped the rest of it, including the check that
+# the group is actually listed.
+- name: "Decide whether to create volume group {{ volume_group_config.name }}"
+  ansible.builtin.set_fact:
+    _vgc_do_create: "{{ ((_vgc_status | int) == 404) and not ansible_check_mode }}"
+
+- name: "Create volume group {{ volume_group_config.name }}"
+  when: _vgc_do_create | bool
+  block:
+    # Payload and response headers go to per-run temp files: the payload so
+    # no volume name is ever inside shell quoting, the headers so concurrent
+    # runs (several Slurm prologs at once) cannot read each other's Location.
+    - name: "Create temp files for the {{ volume_group_config.name }} request"
+      ansible.builtin.tempfile:
+        state: file
+        suffix: "{{ item }}"
+      loop: [".json", ".headers"]
+      register: _vgc_tmp
+
+    - name: "Write the {{ volume_group_config.name }} payload"
+      ansible.builtin.copy:
+        content: "{{ _vgc_payload | to_json }}"
+        dest: "{{ _vgc_tmp.results[0].path }}"
+        mode: "0600"
+
+    - name: "POST volume group {{ volume_group_config.name }}"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          -X POST -H "Content-Type: application/json"
+          -D {{ _vgc_tmp.results[1].path | quote }}
+          -d @{{ _vgc_tmp.results[0].path | quote }}
+          "{{ hs_api_url }}/volume-groups"
+      register: _vgc_post_raw
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: "Read the Location header for {{ volume_group_config.name }}"
+      ansible.builtin.shell:
+        cmd: >-
+          grep -i '^Location:' {{ _vgc_tmp.results[1].path | quote }} 2>/dev/null
+          | awk '{print $2}' | tr -d '\r\n'
+      register: _vgc_loc_raw
+      changed_when: false
+      failed_when: false
+
+    # Before the rejection check below, which is a hard failure.
+    - name: "Remove the {{ volume_group_config.name }} temp files"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ _vgc_tmp.results | map(attribute='path') | list }}"
+
+    - name: "Parse the {{ volume_group_config.name }} create response"
+      ansible.builtin.set_fact:
+        _vgc_post:
+          status: "{{ (_vgc_post_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+          location: "{{ _vgc_loc_raw.stdout | default('') | trim }}"
+
+    - name: "Fail if creating volume group {{ volume_group_config.name }} was rejected"
+      ansible.builtin.fail:
+        msg: |
+          Creating volume group '{{ volume_group_config.name }}' failed
+          with HTTP {{ _vgc_post.status | int }} (curl exit {{ _vgc_post_raw.rc | default('?') }}).
+
+          POST {{ hs_api_url }}/volume-groups
+
+          The API said:
+            {{ (_vgc_post_raw.stdout_lines | default([]))[:-1] | join('\n  ') | trim | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+
+          Body sent:
+            {{ _vgc_payload | to_json }}
+          {% if (_vgc_post.status | int) == 0 %}
+
+          HTTP 0 means curl produced no output, so it did not run or could
+          not connect. stderr:
+            {{ (_vgc_post_raw.stderr | default('') | regex_replace('Basic [A-Za-z0-9+/=]+', 'Basic <redacted>')) | trim | default('(none)', true) }}
+          {% endif %}
+      when: (_vgc_post.status | int) not in [200, 201, 202]
+
+    - name: "Wait for the {{ volume_group_config.name }} create task"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          {{ _vgc_post.location | quote }}
+      register: _vgc_poll_raw
+      changed_when: false
+      failed_when: false
+      no_log: true
+      until: >-
+        (_vgc_poll_raw.stdout | default('') is match('\s*\{'))
+        and ((_vgc_poll_raw.stdout | from_json).status | default('') in ['COMPLETED', 'FAILED', 'CANCELLED'])
+      retries: "{{ hammerspace_volume_group_create_poll_retries | default(60) }}"
+      delay: 5
+      when: _vgc_post.location | length > 0
+
+    - name: "Record the {{ volume_group_config.name }} task status"
+      ansible.builtin.set_fact:
+        _vgc_poll_status: >-
+          {{ ((_vgc_poll_raw.stdout | from_json).status | default('UNKNOWN', true))
+             if (_vgc_poll_raw.stdout | default('') is match('\s*\{')) else 'UNKNOWN' }}
+      when: _vgc_post.location | length > 0
+
+    - name: "Fail unless the {{ volume_group_config.name }} create task completed"
+      ansible.builtin.fail:
+        msg: >-
+          The create task for volume group '{{ volume_group_config.name }}'
+          ended as {{ _vgc_poll_status }}, not COMPLETED. Check the task in
+          the Anvil UI ({{ _vgc_post.location }}).
+      when:
+        - _vgc_post.location | length > 0
+        - _vgc_poll_status != 'COMPLETED'
+
+    # The check that makes "created" true. Also covers an Anvil that answers
+    # the POST before the group is listed (no Location, or a task that
+    # completes ahead of the listing).
+    - name: "Wait until volume group {{ volume_group_config.name }} is listed"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "{{ hs_api_url }}/volume-groups/{{ volume_group_config.name | urlencode }}"
+      register: _vgc_wait_raw
+      changed_when: false
+      failed_when: false
+      no_log: true
+      until: ((_vgc_wait_raw.stdout_lines | default(['0']))[-1] | default('0') | int) == 200
+      retries: "{{ hammerspace_volume_group_create_wait_retries | default(12) }}"
+      delay: "{{ hammerspace_volume_group_create_wait_delay | default(5) }}"
+
+    - name: "Parse the {{ volume_group_config.name }} lookup"
+      ansible.builtin.set_fact:
+        _vgc_status: "{{ (_vgc_wait_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+        _vgc_json: >-
+          {{ (((_vgc_wait_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json)
+             if ((_vgc_wait_raw.stdout_lines | default(['0']))[-1] | default('0') | int) == 200 else {} }}
+
+    - name: "Fail if volume group {{ volume_group_config.name }} is not listed after the create"
+      ansible.builtin.fail:
+        msg: |
+          Volume group '{{ volume_group_config.name }}' was accepted
+          (HTTP {{ _vgc_post.status | int }}{{ ', task ' ~ _vgc_poll_status if _vgc_poll_status else ', no task' }})
+          but is still not listed after
+          {{ hammerspace_volume_group_create_wait_retries | default(12) }} lookups
+          {{ hammerspace_volume_group_create_wait_delay | default(5) }}s apart
+          (last: HTTP {{ _vgc_status | int }}, uuid
+          '{{ _vgc_json.uoid.uuid | default('', true) }}').
+
+          Check the Anvil UI. If it appears later, re-run: an existing group
+          is used as-is.
+      when: >-
+        (_vgc_status | int) != 200
+        or (_vgc_json.uoid.uuid | default('', true) | length) == 0
+
+    - name: "Volume group {{ volume_group_config.name }} created"
+      ansible.builtin.set_fact:
+        _vgc_created: true
+
+    - name: "Report volume group {{ volume_group_config.name }}"
+      ansible.builtin.debug:
+        msg: >-
+          Volume group '{{ volume_group_config.name }}' created and verified
+          (uuid {{ _vgc_json.uoid.uuid }}).

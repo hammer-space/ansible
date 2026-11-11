@@ -1,0 +1,211 @@
+---
+# Build DI container images and export as tar files for offline deployment.
+# Produces architecture-specific tars that can be loaded on target nodes
+# without rebuilding.
+#
+# Usage:
+#   # Build on a local x86_64 host (or VM)
+#   ansible-playbook build_di_image.yml -i inventory.yml --limit build-host-x86
+#
+#   # Build on an aarch64 host
+#   ansible-playbook build_di_image.yml -i inventory.yml --limit build-host-arm
+#
+#   # Build on multiple hosts (one per arch) in parallel
+#   ansible-playbook build_di_image.yml -i inventory.yml --limit "build-x86,build-arm"
+#
+# Output:
+#   payload/hammerspace-di-<arch>.tar  (e.g., hammerspace-di-x86_64.tar)
+#
+# Then deploy with:
+#   di_image_source: "local"   in vars/main.yml
+
+- name: Build DI container image and export as tar
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    # Override these if needed
+    _di_image_tag: "{{ di_container_image | default('hammerspace-di:local') }}"
+    _di_tar_name: "hammerspace-di-{{ ansible_architecture }}.tar"
+    _di_tar_dest: "{{ playbook_dir }}/payload/{{ _di_tar_name }}"
+
+  tasks:
+    - name: Display build configuration
+      ansible.builtin.debug:
+        msg: |
+          Building DI container image:
+            Host: {{ inventory_hostname }} ({{ ansible_architecture }})
+            Runtime: {{ di_container_runtime | default('podman') }}
+            Base image: {{ di_container_base_image | default('rockylinux:9') }}
+            Output tag: {{ _di_image_tag }}
+            Output tar: {{ _di_tar_name }}
+
+    # --- Install container runtime if needed ---
+    - name: Include OS-specific variables
+      ansible.builtin.include_vars: "{{ ansible_os_family | lower }}.yml"
+      vars:
+        ansible_search_path:
+          - "{{ playbook_dir }}/roles/di/vars"
+
+    - name: Install container runtime
+      ansible.builtin.include_tasks: roles/di/tasks/container_runtime.yml
+
+    # --- Stage payload and build ---
+    - name: Ensure build directory
+      ansible.builtin.file:
+        path: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure payload directory
+      ansible.builtin.file:
+        path: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/payload"
+        state: directory
+        mode: "0755"
+
+    - name: Copy Containerfile into build dir
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/container/Containerfile"
+        dest: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/Containerfile"
+        mode: "0644"
+
+    # --- Stage RPMs (architecture-filtered) ---
+    - name: Set target architecture
+      ansible.builtin.set_fact:
+        _di_arch: "{{ ansible_architecture }}"
+
+    - name: Download DI tarball from URL
+      ansible.builtin.get_url:
+        url: "{{ di_tarball_url }}"
+        dest: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/di-components.tar.gz"
+        mode: "0644"
+      when: di_rpm_source | default('directory') == "url"
+
+    - name: Copy DI tarball from local path
+      ansible.builtin.copy:
+        src: "{{ di_tarball_local_path }}"
+        dest: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/di-components.tar.gz"
+        mode: "0644"
+      when: di_rpm_source | default('directory') == "local"
+
+    - name: Extract tarball into payload/
+      ansible.builtin.unarchive:
+        src: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/di-components.tar.gz"
+        dest: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/payload"
+        remote_src: true
+      when: di_rpm_source | default('directory') in ['url', 'local']
+
+    - name: Flatten payload layout
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          cd "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/payload"
+          find . -mindepth 2 \( -name '*.rpm' -o -name 'add_node.py' \) \
+              -exec mv -f -t . {} +
+          find . -mindepth 1 -type d -empty -delete
+        executable: /bin/bash
+      changed_when: false
+      when: di_rpm_source | default('directory') in ['url', 'local']
+
+    - name: Enumerate local payload files (directory mode)
+      ansible.builtin.find:
+        paths: "{{ di_payload_local_dir | default(playbook_dir + '/payload') }}"
+        patterns:
+          - "*.{{ _di_arch }}.rpm"
+          - "*.noarch.rpm"
+          - "add_node.py"
+      register: _local_payload
+      delegate_to: localhost
+      become: false
+      when: di_rpm_source | default('directory') == "directory"
+
+    - name: Fail if no payload files found
+      ansible.builtin.fail:
+        msg: "No {{ _di_arch }} RPMs found in {{ di_payload_local_dir | default(playbook_dir + '/payload') }}"
+      when:
+        - di_rpm_source | default('directory') == "directory"
+        - (_local_payload.matched | default(0)) == 0
+
+    - name: Copy payload files to build dir
+      ansible.builtin.copy:
+        src: "{{ item.path }}"
+        dest: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/payload/{{ item.path | basename }}"
+        mode: "0644"
+      loop: "{{ _local_payload.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: di_rpm_source | default('directory') == "directory"
+
+    - name: Check for add_node.py in payload
+      ansible.builtin.stat:
+        path: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/payload/add_node.py"
+      register: _addnode_stat
+
+    - name: Download add_node.py fallback
+      ansible.builtin.get_url:
+        url: "{{ di_add_node_script_url }}"
+        dest: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/payload/add_node.py"
+        mode: "0755"
+      when:
+        - not _addnode_stat.stat.exists
+        - di_add_node_script_url | default('') | length > 0
+
+    # --- Build ---
+    - name: Set container platform for build
+      ansible.builtin.set_fact:
+        _di_container_platform: "{{ 'linux/arm64' if ansible_architecture == 'aarch64' else 'linux/amd64' }}"
+
+    - name: "Build container image ({{ _di_arch }}, {{ _di_container_platform }})"
+      ansible.builtin.command:
+        cmd: >-
+          {{ di_container_runtime | default('podman') }} build
+          --platform {{ _di_container_platform }}
+          --build-arg BASE_IMAGE={{ di_container_base_image | default('rockylinux:9') }}
+          -t {{ _di_image_tag }}
+          -f {{ di_container_build_dir | default('/opt/hammerspace/di-container') }}/Containerfile
+          {{ di_container_build_dir | default('/opt/hammerspace/di-container') }}
+      register: build_result
+      changed_when: true
+
+    - name: Display build result
+      ansible.builtin.debug:
+        msg: "Image {{ _di_image_tag }} built successfully on {{ inventory_hostname }} ({{ _di_arch }})"
+
+    # --- Export as tar ---
+    - name: "Export image to tar ({{ _di_tar_name }})"
+      ansible.builtin.command:
+        cmd: >-
+          {{ di_container_runtime | default('podman') }} save
+          -o /tmp/{{ _di_tar_name }}
+          {{ _di_image_tag }}
+      changed_when: true
+
+    - name: Fetch tar to controller
+      ansible.builtin.fetch:
+        src: "/tmp/{{ _di_tar_name }}"
+        dest: "{{ _di_tar_dest }}"
+        flat: true
+
+    - name: Clean up remote tar
+      ansible.builtin.file:
+        path: "/tmp/{{ _di_tar_name }}"
+        state: absent
+
+    - name: Build complete
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          DI CONTAINER IMAGE EXPORTED
+          ============================================
+          Architecture: {{ _di_arch }}
+          Image: {{ _di_image_tag }}
+          Tar file: {{ _di_tar_dest }}
+
+          To deploy using this tar:
+            1. Set di_image_source: "local" in vars/main.yml
+            2. Run: ansible-playbook site.yml --tags di -e deploy_di=true
+          ============================================

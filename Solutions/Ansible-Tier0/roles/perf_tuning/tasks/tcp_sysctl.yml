@@ -1,0 +1,28 @@
+---
+# TCP / network sysctl tuning (Hammerspace BKM).
+
+- name: Apply TCP sysctl tunables (runtime)
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: false
+    sysctl_set: true
+    ignoreerrors: true
+  loop: "{{ perf_tcp_sysctl | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  failed_when: false
+
+- name: Persist TCP sysctl in /etc/sysctl.d/99-hammerspace-tcp.conf
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-hammerspace-tcp.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Hammerspace Tier 0 BKM: high-throughput TCP tuning
+      {% for k, v in perf_tcp_sysctl.items() %}
+      {{ k }} = {{ v }}
+      {% endfor %}
+  notify: reload sysctl

@@ -1,0 +1,68 @@
+# Hammerspace DI container image.
+# Base OS stays el9 because the pd-di RPMs are el9-only.
+# Built by roles/container_deploy — do not invoke directly.
+
+ARG BASE_IMAGE=rockylinux:9
+FROM ${BASE_IMAGE}
+
+ENV container=docker
+
+# Core system + network utilities + python bindings used by add_node.py
+RUN dnf -y install epel-release && \
+    dnf -y install \
+        bash bash-completion \
+        procps-ng util-linux findutils \
+        less vim-minimal which \
+        iproute net-tools iputils bind-utils \
+        ca-certificates \
+        python3-pip python3-urllib3 python3-requests \
+        systemd && \
+    dnf clean all && \
+    find /etc/systemd/system /lib/systemd/system -path '*.wants/*' \
+        \( -name '*getty*' -o -name '*udev*' -o -name '*remount-fs*' \
+           -o -name 'systemd-logind*' -o -name 'systemd-tmpfiles*' \) -delete
+
+# Enable CRB for el9 dependencies (jemalloc, babeltrace family can need it).
+RUN dnf -y install dnf-plugins-core && \
+    dnf config-manager --set-enabled crb || true
+
+# Install DI runtime dependencies from repos (so payload only needs pd-di + libtirpc).
+# babeltrace is in the 'devel' repo on Rocky 9.
+RUN dnf -y install lttng-tools lttng-ust jemalloc && \
+    dnf --enablerepo=devel -y install babeltrace || true && \
+    dnf clean all
+
+# Payload: pd-di + optional runtime-dep RPMs + add_node.py, staged by the role.
+COPY payload/ /opt/payload/
+
+# Install RPMs from payload matching the container architecture (+ noarch).
+# Dependencies already installed from repos above; payload provides pd-di
+# and any Hammerspace-patched packages (e.g., libtirpc).
+RUN ARCH=$(uname -m) && \
+    RPM_FILES=$(ls /opt/payload/*.${ARCH}.rpm /opt/payload/*.noarch.rpm 2>/dev/null) && \
+    if [ -n "$RPM_FILES" ]; then dnf -y install $RPM_FILES && dnf clean all; \
+    else echo "WARNING: No RPMs found for arch ${ARCH}"; fi
+
+# add_node.py may or may not be in the tarball; role ensures it ends up in payload.
+# Bake the ignoreIpConflicts patch in at build time so co-located Tier 0 + DI
+# registration doesn't need a runtime sed (previously done by the role).
+ARG DI_IGNORE_IP_CONFLICTS=true
+RUN if [ -f /opt/payload/add_node.py ]; then \
+        install -m 0755 /opt/payload/add_node.py /usr/local/bin/add_node.py ; \
+        if [ "${DI_IGNORE_IP_CONFLICTS}" = "true" ]; then \
+            sed -i "/def post/,/def [a-z]/s|endpoint='nodes'|endpoint='nodes?ignoreIpConflicts=true'|" \
+                /usr/local/bin/add_node.py ; \
+        fi ; \
+    fi
+
+# Enable the lttng side-services so they're up when pd-di starts.
+# pd-di itself is NOT enabled here: it needs /opt/pd/di (the DATA_MOVER UUID)
+# to exist before it can start, and that file is created by add_node.py at
+# registration time. The role enables+starts pd-di after registration.
+RUN systemctl enable lttng-sessiond pd-di-lttng-recorder || true
+
+STOPSIGNAL SIGRTMIN+3
+EXPOSE 9095/tcp 9096/tcp
+
+WORKDIR /root
+CMD ["/usr/sbin/init"]

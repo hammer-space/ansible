@@ -1,0 +1,32 @@
+---
+# Ansible Vault - Encrypted Credentials
+# Encrypt this file: ansible-vault encrypt vars/vault.yml
+# Edit encrypted:    ansible-vault edit vars/vault.yml
+# View encrypted:    ansible-vault view vars/vault.yml
+#
+# To run playbooks with vault:
+#   ansible-playbook site.yml --ask-vault-pass
+#   ansible-playbook site.yml --vault-password-file ~/.vault_pass
+
+# ============================================================================
+# Hammerspace API Credentials
+# ============================================================================
+# vault_hammerspace_api_password: "PASSWORD"
+
+# ============================================================================
+# Active Directory Credentials (uncomment if using AD join)
+# ============================================================================
+# vault_ad_username: "admin@corp.example.com"
+# vault_ad_password: "changeme"
+
+# ============================================================================
+# S3 Storage Credentials (uncomment if using S3 integration)
+# ============================================================================
+# vault_s3_access_key: "AKIAIOSFODNN7EXAMPLE"
+# vault_s3_secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+# ============================================================================
+# S3 User Credentials (uncomment if creating S3 users)
+# ============================================================================
+# vault_s3_user_access_key: "AKIAIOSFODNN7EXAMPLE"
+# vault_s3_user_secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"

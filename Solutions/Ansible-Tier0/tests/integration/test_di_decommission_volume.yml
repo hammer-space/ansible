@@ -1,0 +1,189 @@
+---
+# Regression test: DI volume decommission must address the volume correctly,
+# must not report success for a request the API rejected, must verify the
+# removal before the node is deleted, and must not write under --check.
+#
+# THREE DEFECTS, ONE FILE (2026-11-03)
+# ------------------------------------
+# 1. ADDRESSING. roles/di/tasks/decommission_volume.yml called
+#      POST   /storage-volumes/{{ _volume.name | urlencode }}/decommission
+#      DELETE /storage-volumes/{{ _volume.name | urlencode }}
+#    A volume name always contains '/', and Jinja's `urlencode` encodes ':'
+#    but NOT '/', so the path landed in the URL as extra segments: a 404 for
+#    every volume. Found in the field on add_volume.yml (same URL, same 404);
+#    see test_volume_add_status.yml TEST 8.
+#
+# 2. SILENT FAILURE. Neither request's status was read. A 404 has no
+#    Location, so both polls were skipped, the "task failed" checks never
+#    fired, and the file ended by printing "removed successfully" for a
+#    volume nothing had touched. decommission.yml then DELETEd the node —
+#    with evacuateData never having run.
+#
+# 3. DRY RUN WAS NOT DRY. _api_request.yml runs curl with check_mode: false
+#    (its GETs must run under --check), and nothing in the decommission path
+#    gated its writes. `--check` deleted the DI node for real; it did not
+#    also decommission the volumes only because defect 1 made those 404.
+#    Fixing defect 1 alone would have made --check MORE destructive.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_di_decommission_volume.yml -i localhost, -c local
+
+- name: DI volume decommission regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _di: "{{ playbook_dir }}/../../roles/di/tasks"
+    _dv_src: "{{ lookup('file', _di ~ '/decommission_volume.yml') }}"
+    _dc_src: "{{ lookup('file', _di ~ '/decommission.yml') }}"
+    # Comment lines stripped: both files explain the bugs in prose.
+    _dv_code: "{{ _dv_src.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+    _dc_code: "{{ _dc_src.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+
+  tasks:
+    # ---------------------------------------------------------------- TEST 1
+    # The addressing expression, verbatim from the task file.
+    - name: 'TEST 1: a volume is addressed by uuid, else by its fully-encoded name'
+      vars:
+        _volume: "{{ item.volume }}"
+        _dv_id: >-
+          {{ (_volume.uoid.uuid | default('', true))
+             or (_volume.name | urlencode | replace('/', '%2F')) }}
+      ansible.builtin.assert:
+        that:
+          - _dv_id == item.expect
+          - "'/' not in _dv_id"
+        fail_msg: "{{ item.name }}: got '{{ _dv_id }}', expected '{{ item.expect }}'"
+        quiet: true
+      loop:
+        - name: "listed object with a uuid"
+          volume: {name: "10.1.16.4::/nvme/tier0", uoid: {uuid: "c2ff96dd-74aa"}}
+          expect: "c2ff96dd-74aa"
+        - name: "no uoid at all — name fallback, '/' encoded"
+          volume: {name: "10.1.16.4::/nvme/tier0"}
+          expect: "10.1.16.4%3A%3A%2Fnvme%2Ftier0"
+        - name: "empty uuid — name fallback"
+          volume: {name: "AZ1:di-01::/hammerspace/hsvol0", uoid: {uuid: ""}}
+          expect: "AZ1%3Adi-01%3A%3A%2Fhammerspace%2Fhsvol0"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ---------------------------------------------------------------- TEST 2
+    - name: 'TEST 2: no volume URL is built from `name | urlencode` alone'
+      ansible.builtin.assert:
+        that:
+          # \{\{ so the needle is never itself templated.
+          - (_dv_code | regex_findall('storage-volumes/\{\{ *_volume') | length) == 0
+          # Count the REQUEST urls only — the same path also appears in the
+          # check-mode and failure messages.
+          - (_dv_code | regex_findall('_api_request_url. "\{\{ _hs_api_base \}\}/storage-volumes/\{\{ _dv_id \}\}') | length) == 2
+        fail_msg: >-
+          decommission_volume.yml must address the volume via _dv_id (uuid,
+          else name with '/' encoded) in both the decommission and the DELETE.
+        quiet: true
+
+    # ---------------------------------------------------------------- TEST 3
+    - name: 'TEST 3: both requests are status-gated and the removal is verified'
+      vars:
+        # Pin the CONDITIONS, not just the task names — a gate whose `when`
+        # is weakened keeps its name. Needles live here as plain YAML strings
+        # so neither YAML nor Jinja escaping can quietly change them.
+        _needle_noloc: "when: (_api_response.location | default('') | length) == 0"
+        _needle_closed: '\(not _dv_verifiable\)\s+or'
+      ansible.builtin.assert:
+        that:
+          - _needle_noloc in _dv_code
+          - _dv_code is search(_needle_closed)
+          - "'not in [200, 201, 202, 204]' in _dv_code"
+          - "'not in [200, 202, 204]' in _dv_code"
+          - "_dv_code is search('returned no task')"
+          - (_dv_code | regex_findall("!= 'COMPLETED'") | length) >= 2
+          - "_dv_code is search('is still listed after removal')"
+          - "'_dv_verifiable' in _dv_code"
+          - "_dv_code is not search('removed successfully')"
+        fail_msg: >-
+          decommission_volume.yml is missing a status gate, the completion
+          checks, or the post-removal verification — or still prints an
+          unconditional "removed successfully".
+        quiet: true
+
+    # ---------------------------------------------------------------- TEST 4
+    # The verification predicate, verbatim. It must FAIL CLOSED: anything it
+    # cannot read counts as "not verified", never as "gone".
+    - name: 'TEST 4: the removal verification fails closed'
+      vars:
+        _volume: {name: "10.1.16.4::/nvme/tier0"}
+        _api_response: "{{ item.response }}"
+        _dv_verifiable: >-
+          {{ ((_api_response.status | int) == 200)
+             and (_api_response.json is sequence)
+             and (_api_response.json is not string)
+             and (_api_response.json is not mapping) }}
+        _blocks: >-
+          {{ (not _dv_verifiable)
+             or ((_api_response.json | selectattr('name', 'defined')
+                  | selectattr('name', 'equalto', _volume.name) | list | length) > 0) }}
+      ansible.builtin.assert:
+        that:
+          - (_blocks | bool) == (item.expect_block | bool)
+        fail_msg: "{{ item.name }}: blocks={{ _blocks }}, expected {{ item.expect_block }}"
+        quiet: true
+      loop:
+        - name: "gone from the list — proceed"
+          response: {status: 200, json: [{name: "10.1.16.5::/nvme/tier0"}]}
+          expect_block: false
+        - name: "still listed — block the node delete"
+          response: {status: 200, json: [{name: "10.1.16.4::/nvme/tier0"}]}
+          expect_block: true
+        - name: "list call failed — cannot verify, block"
+          response: {status: 503, json: {}}
+          expect_block: true
+        - name: "200 with an error object, not a list — cannot verify, block"
+          response: {status: 200, json: {errorCode: 4001}}
+          expect_block: true
+        - name: "empty list — proceed"
+          response: {status: 200, json: []}
+          expect_block: false
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ---------------------------------------------------------------- TEST 5
+    # Every write through the DI request helper must be skipped under
+    # --check. The count guard is deliberate: a NEW write anywhere in
+    # roles/di fails this test until it is gated and added here.
+    - name: Find the DI task files
+      ansible.builtin.find:
+        paths: "{{ _di }}"
+        patterns: "*.yml"
+      register: _di_files
+
+    - name: 'TEST 5: every DI write is gated on check mode'
+      vars:
+        _all_code: >-
+          {% for f in _di_files.files %}{{ lookup('file', f.path) }}
+          {% endfor %}
+        _dv_gate: "{{ _dv_code.find('when: not ansible_check_mode') }}"
+        _dc_gate: "{{ _dc_code.find('when: not ansible_check_mode') }}"
+      ansible.builtin.assert:
+        that:
+          - (_all_code | regex_findall('_api_request_method:\s*(?:POST|PUT|PATCH|DELETE)') | length) == 3
+          - (_dv_gate | int) >= 0
+          - "(_dv_gate | int) < (_dv_code.find('_api_request_method: POST') | int)"
+          - "(_dv_gate | int) < (_dv_code.find('_api_request_method: DELETE') | int)"
+          - (_dc_gate | int) >= 0
+          - "(_dc_gate | int) < (_dc_code.find('_api_request_method: DELETE') | int)"
+          - "_dv_code is search('when: ansible_check_mode')"
+          - "_dc_code is search('when: ansible_check_mode')"
+        fail_msg: >-
+          A write through roles/di/tasks/_api_request.yml is not gated on
+          check mode, or the number of writes changed. _api_request.yml runs
+          curl with check_mode: false, so an ungated POST/PUT/DELETE executes
+          for real under --check. Gate it with `when: not ansible_check_mode`
+          (plus a check-mode debug saying what would happen), then update the
+          expected count here.
+        quiet: true
+
+    - name: PASSED
+      ansible.builtin.debug:
+        msg: "test_di_decommission_volume PASSED (5 tests)"

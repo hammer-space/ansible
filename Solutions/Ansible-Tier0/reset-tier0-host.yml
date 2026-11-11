@@ -1,0 +1,694 @@
+---
+# =============================================================================
+# reset-tier0-host.yml
+# Hammerspace Tier 0 — Demo Host Reset Playbook
+# =============================================================================
+# Reverses everything site-onprem-nvme.yml deploys on a host:
+#   1. Remove node + volumes from Hammerspace (cleanup_instance_nodes.py)
+#   2. Disable and remove mount protection (guard services, remount watchdog)
+#   3. Stop NFS services
+#   4. Unmount Tier0 filesystems (safe now that guards are gone)
+#   5. Remove fstab and exports entries (via ansible.posix.mount state:absent)
+#   6. Stop and destroy md RAID arrays
+#   7. Zero superblocks and wipe signatures on member drives
+#   8. Optional: blkdiscard drives (fast NVMe reset)
+#   9. Remove mount point subdirectories + root /hammerspace dir
+#  10. Reload systemd
+#
+# Usage (single node — standard):
+#   ansible-playbook reset-tier0-host.yml -i inventory.yml \
+#     --limit tier0-node-01 \
+#     -e reset_confirm=true
+#
+# Speed-run demo reset (also discards NVMe blocks for fastest re-provision):
+#   ansible-playbook reset-tier0-host.yml -i inventory.yml \
+#     --limit tier0-node-01 \
+#     -e reset_confirm=true \
+#     -e reset_run_blkdiscard=true
+#
+# Full reset including removal of /hammerspace directory tree:
+#   ansible-playbook reset-tier0-host.yml -i inventory.yml \
+#     --limit tier0-node-01 \
+#     -e reset_confirm=true \
+#     -e reset_remove_mount_dirs=true
+#
+# Directory-only cleanup (run after storage is already reset):
+#   ansible-playbook reset-tier0-host.yml -i inventory.yml \
+#     --limit tier0-node-01 \
+#     -e reset_confirm=true \
+#     -e reset_remove_mount_dirs=true \
+#     -e reset_hammerspace_cleanup=false
+#
+# Skip Hammerspace API removal (e.g. Anvil is unreachable):
+#   ... -e reset_hammerspace_cleanup=false
+#
+# Works for any host in inventory — always scope with --limit <host>
+# =============================================================================
+
+- name: Reset Tier0 host to pre-configured state
+  hosts: storage_servers
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    # -------------------------------------------------------------------------
+    # Safety gate — must be explicitly set to true on the command line
+    # -------------------------------------------------------------------------
+    reset_confirm: false
+
+    # -------------------------------------------------------------------------
+    # Feature toggles
+    # -------------------------------------------------------------------------
+    # Remove node and volumes from Hammerspace via cleanup_instance_nodes.py
+    reset_hammerspace_cleanup: true
+
+    # Root path under which all Tier0 mounts live
+    reset_mount_root: "/hammerspace"
+
+    # Remove the mount point subdirectories AND the root /hammerspace directory
+    reset_remove_mount_dirs: false
+
+    # Run blkdiscard on NVMe member drives after superblock wipe
+    # Fastest way to fully blank NVMe for re-provision; safe to skip on HDD
+    reset_run_blkdiscard: false
+
+    # -------------------------------------------------------------------------
+    # Override lists — use when vars/main.yml does not cover target devices,
+    # or when running a directory-only cleanup after storage is already reset
+    # -------------------------------------------------------------------------
+    reset_extra_mount_paths: []
+    reset_extra_md_devices: []
+    reset_extra_member_drives: []
+
+    # -------------------------------------------------------------------------
+    # Internal derived values (do not override)
+    # -------------------------------------------------------------------------
+    _nfs_service: >-
+      {{ 'nfs-server'
+         if ansible_os_family == 'RedHat'
+         else 'nfs-kernel-server' }}
+    _systemd_unit_dir: /etc/systemd/system
+    _remount_script: /usr/local/bin/hammerspace-remount-check.sh
+
+  # ===========================================================================
+  # PRE-TASKS — validate, discover targets, build teardown lists
+  # ===========================================================================
+  pre_tasks:
+
+    # ---- Load vault (optional) -----------------------------------------------
+    - name: Load vault variables (if available)
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/vars/vault.yml"
+      when: lookup('file', playbook_dir ~ '/vars/vault.yml', errors='ignore') | default('', true) | length > 0
+      failed_when: false
+      no_log: true
+
+    - name: Require hammerspace_api_host (set with -e hammerspace_api_host=<anvil-ip>)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: require_api_host
+      tags: [always]
+
+    # Azure Key Vault (opt-in) — overrides vars/vault.yml when set. Must
+    # resolve BEFORE anything authenticates against the Anvil.
+    - name: Retrieve Hammerspace password from Azure Key Vault (optional)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: keyvault_password
+      when: (hammerspace_keyvault_uri | default('')) | length > 0
+
+    # ---- Safety gate --------------------------------------------------------
+    - name: Safety gate — require explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - reset_confirm | bool
+        fail_msg: >-
+          This playbook is DESTRUCTIVE and irreversible.
+          Re-run with:  -e reset_confirm=true
+          Always scope with:  --limit <hostname>
+
+    # ---- Discover live mounts -----------------------------------------------
+    - name: Discover active Tier0 mounts on host
+      ansible.builtin.shell: |
+        findmnt -rn -o TARGET,SOURCE | \
+          awk -v root="{{ reset_mount_root }}" \
+            '$1 ~ "^" root "(/|$)" {print $1 "|" $2}'
+      register: _findmnt_raw
+      changed_when: false
+
+    # ---- Build mount path list ----------------------------------------------
+    - name: Build consolidated mount path list
+      ansible.builtin.set_fact:
+        reset_mount_paths: >-
+          {{
+            (
+              (mount_points | default([]) | map(attribute='path') | list)
+              + (_findmnt_raw.stdout_lines | default([])
+                 | map('regex_replace', '\|.*$', '') | list)
+              + (reset_extra_mount_paths | default([]))
+            ) | reject('equalto', '') | unique | list
+          }}
+
+    # ---- Fallback: scan reset_mount_root subdirs if nothing found -----------
+    # Handles re-runs where mounts are already gone but directories still exist
+    - name: "Fallback — scan {{ reset_mount_root }} subdirectories"
+      ansible.builtin.find:
+        paths: "{{ reset_mount_root }}"
+        file_type: directory
+        recurse: false
+      register: _hs_subdirs
+      when: reset_mount_paths | length == 0
+      failed_when: false
+
+    - name: Merge fallback subdirectories into mount path list
+      ansible.builtin.set_fact:
+        reset_mount_paths: >-
+          {{
+            (_hs_subdirs.files | default([]) | map(attribute='path') | list)
+          }}
+      when:
+        - reset_mount_paths | length == 0
+        - _hs_subdirs.files is defined
+        - _hs_subdirs.files | length > 0
+
+    # ---- Build md device list -----------------------------------------------
+    - name: Build consolidated md device list
+      ansible.builtin.set_fact:
+        reset_md_devices: >-
+          {{
+            (
+              (raid_arrays | default([]) | map(attribute='device') | list)
+              + (mount_points | default([]) | map(attribute='device') | default([])
+                 | select('match', '^/dev/md') | list)
+              + (_findmnt_raw.stdout_lines | default([])
+                 | map('regex_replace', '^[^|]+\|', '')
+                 | select('match', '^/dev/md') | list)
+              + (reset_extra_md_devices | default([]))
+            ) | reject('equalto', '') | unique | list
+          }}
+
+    # ---- Discover member drives from live md arrays -------------------------
+    - name: Discover member drives from active md arrays
+      ansible.builtin.shell: |
+        for md in {{ reset_md_devices | join(' ') }}; do
+          mdadm --detail "$md" 2>/dev/null \
+            | awk '/\/dev\// && !/\/dev\/md/ {print $NF}'
+        done | sort -u
+      register: _md_members_raw
+      changed_when: false
+      when: reset_md_devices | length > 0
+
+    # ---- Build member drive list --------------------------------------------
+    - name: Build consolidated member drive list
+      ansible.builtin.set_fact:
+        reset_member_drives: >-
+          {{
+            (
+              (raid_arrays | default([])
+               | map(attribute='drives') | flatten)
+              + (_md_members_raw.stdout_lines | default([]))
+              + (reset_extra_member_drives | default([]))
+            ) | reject('equalto', '') | unique | list
+          }}
+
+    # ---- Discover deployed protection units on host -------------------------
+    - name: Find deployed guard service unit files
+      ansible.builtin.find:
+        paths: "{{ _systemd_unit_dir }}"
+        patterns: "hammerspace-*-guard.service"
+        file_type: file
+      register: _guard_service_files
+
+    - name: Build guard service name list
+      ansible.builtin.set_fact:
+        reset_guard_services: >-
+          {{
+            _guard_service_files.files
+            | map(attribute='path')
+            | map('basename')
+            | map('regex_replace', '\.service$', '')
+            | list
+          }}
+
+    - name: Check for hammerspace-guards.target
+      ansible.builtin.stat:
+        path: "{{ _systemd_unit_dir }}/hammerspace-guards.target"
+      register: _guards_target_stat
+
+    - name: Check for remount watchdog timer
+      ansible.builtin.stat:
+        path: "{{ _systemd_unit_dir }}/hammerspace-remount.timer"
+      register: _remount_timer_stat
+
+    - name: Check for remount watchdog service
+      ansible.builtin.stat:
+        path: "{{ _systemd_unit_dir }}/hammerspace-remount.service"
+      register: _remount_service_stat
+
+    - name: Check for remount script
+      ansible.builtin.stat:
+        path: "{{ _remount_script }}"
+      register: _remount_script_stat
+
+    # ---- Sanity check -------------------------------------------------------
+    # Relaxed: allows directory-only cleanup re-runs via reset_remove_mount_dirs
+    - name: Sanity check — must have something to reset
+      ansible.builtin.assert:
+        that:
+          - >-
+            (reset_mount_paths | length > 0)
+            or (reset_md_devices | length > 0)
+            or (reset_guard_services | length > 0)
+            or (reset_remove_mount_dirs | bool)
+        fail_msg: >-
+          Nothing found to reset on {{ inventory_hostname }}.
+          Verify reset_mount_root="{{ reset_mount_root }}" is correct,
+          or pass reset_extra_mount_paths / reset_extra_md_devices explicitly.
+          For a directory-only cleanup on an already-reset host:
+            -e reset_confirm=true -e reset_remove_mount_dirs=true -e reset_hammerspace_cleanup=false
+
+    # ---- Print reset plan ---------------------------------------------------
+    - name: Display reset plan
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          hammerspace_node: "{{ hammerspace_node_name | default(inventory_hostname) }}"
+          remove_from_hammerspace: "{{ reset_hammerspace_cleanup }}"
+          mount_paths: "{{ reset_mount_paths }}"
+          md_arrays: "{{ reset_md_devices }}"
+          member_drives: "{{ reset_member_drives }}"
+          guard_services: "{{ reset_guard_services }}"
+          guards_target_present: "{{ _guards_target_stat.stat.exists | default(false) }}"
+          remount_timer_present: "{{ _remount_timer_stat.stat.exists | default(false) }}"
+          remount_service_present: "{{ _remount_service_stat.stat.exists | default(false) }}"
+          remount_script_present: "{{ _remount_script_stat.stat.exists | default(false) }}"
+          run_blkdiscard: "{{ reset_run_blkdiscard }}"
+          remove_mount_dirs: "{{ reset_remove_mount_dirs }}"
+
+  # ===========================================================================
+  # TASKS — execute teardown in safe dependency order
+  # ===========================================================================
+  tasks:
+
+    # ==========================================================================
+    # PHASE 1 — Remove node and volumes from Hammerspace
+    # Must happen before local storage teardown so Hammerspace can cleanly
+    # deregister the volumes while NFS is still serving them.
+    # ==========================================================================
+
+    - name: "PHASE 1 | Remove node from Hammerspace (cleanup_instance_nodes.py)"
+      ansible.builtin.command: >
+        python3 {{ playbook_dir }}/cleanup_instance_nodes.py
+        --host {{ hammerspace_api_host }}
+        --user {{ hammerspace_api_user }}
+        --node {{ hammerspace_node_name | default(inventory_hostname) }}
+        --yes
+      environment:
+        HAMMERSPACE_PASSWORD: "{{ hammerspace_api_password }}"
+      delegate_to: localhost
+      register: _hs_cleanup
+      changed_when: true
+      failed_when:
+        - _hs_cleanup.rc is defined
+        - _hs_cleanup.rc != 0
+        - "'not found' not in (_hs_cleanup.stderr | default(''))"
+        - "'no nodes' not in (_hs_cleanup.stdout | default(''))"
+      when:
+        - reset_hammerspace_cleanup | bool
+        - hammerspace_api_host is defined
+        - hammerspace_api_user is defined
+        - hammerspace_api_password is defined
+
+    - name: "PHASE 1 | Show Hammerspace cleanup result"
+      ansible.builtin.debug:
+        msg: "{{ _hs_cleanup.stdout_lines | default(['Skipped or already removed']) }}"
+      when: reset_hammerspace_cleanup | bool
+
+    # ==========================================================================
+    # PHASE 2 — Tear down mount protection (MUST happen before any umount)
+    #
+    # Guard services run:
+    #   ExecStart=/bin/bash -lc 'cd /hammerspace/hsvolX && exec sleep infinity'
+    # with RefuseManualStop=yes — holds an open fd on each mount point.
+    # umount returns "target is busy" until guards are killed.
+    #
+    # Key: use 'systemctl kill' NOT 'systemctl stop' — RefuseManualStop=yes
+    # blocks stop. kill() sends SIGTERM directly to the sleep process,
+    # bypassing that restriction. Escalate to SIGKILL if needed.
+    #
+    # The remount watchdog timer must also be stopped first or it will
+    # attempt to remount the filesystem while we are trying to destroy it.
+    # ==========================================================================
+
+    - name: "PHASE 2 | Stop remount watchdog timer (prevents auto-remount during teardown)"
+      ansible.builtin.systemd:
+        name: hammerspace-remount.timer
+        state: stopped
+        enabled: false
+      when: _remount_timer_stat.stat.exists | default(false)
+      failed_when: false
+
+    - name: "PHASE 2 | Stop remount watchdog service"
+      ansible.builtin.systemd:
+        name: hammerspace-remount.service
+        state: stopped
+        enabled: false
+      when: _remount_service_stat.stat.exists | default(false)
+      failed_when: false
+
+    - name: "PHASE 2 | Kill guard services — releases busy-lock on each mount point"
+      ansible.builtin.shell: |
+        # SIGTERM to sleep infinity — bypasses RefuseManualStop=yes
+        systemctl kill "{{ item }}.service" 2>/dev/null || true
+        sleep 2
+        # Escalate to SIGKILL if still running
+        systemctl kill -s SIGKILL "{{ item }}.service" 2>/dev/null || true
+        sleep 1
+        systemctl stop "{{ item }}.service" 2>/dev/null || true
+        systemctl disable "{{ item }}.service" 2>/dev/null || true
+      loop: "{{ reset_guard_services }}"
+      changed_when: true
+      failed_when: false
+
+    - name: "PHASE 2 | Stop hammerspace-guards.target"
+      ansible.builtin.systemd:
+        name: hammerspace-guards.target
+        state: stopped
+        enabled: false
+      when: _guards_target_stat.stat.exists | default(false)
+      failed_when: false
+
+    - name: "PHASE 2 | Reload systemd daemon — deactivates unit tracking"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: "PHASE 2 | Verify no guard processes remain on mount points"
+      ansible.builtin.shell: |
+        lsof +D "{{ item }}" 2>/dev/null | grep -v "^COMMAND" | wc -l
+      loop: "{{ reset_mount_paths }}"
+      register: _lsof_check
+      changed_when: false
+      failed_when: false
+
+    - name: "PHASE 2 | Warn if open file handles remain (fuser will force-close in Phase 4)"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ item.item }} still has {{ item.stdout | trim }} open
+          file handle(s). fuser -km will be used during unmount.
+      loop: "{{ _lsof_check.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: (item.stdout | default('0') | trim | int) > 0
+
+    # ==========================================================================
+    # PHASE 3 — Stop NFS services
+    # ==========================================================================
+
+    - name: "PHASE 3 | Unexport all NFS shares"
+      ansible.builtin.command: exportfs -ua
+      changed_when: true
+      failed_when: false
+
+    - name: "PHASE 3 | Stop NFS server"
+      ansible.builtin.systemd:
+        name: "{{ _nfs_service }}"
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: "PHASE 3 | Stop rpcbind"
+      ansible.builtin.systemd:
+        name: rpcbind
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: "PHASE 3 | Stop set-readahead service (if present)"
+      ansible.builtin.systemd:
+        name: set-readahead
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    # ==========================================================================
+    # PHASE 4 — Clean exports, stop automount units, unmount, remove fstab
+    #
+    # FIX: fstab removal now uses ansible.posix.mount state:absent instead of
+    # sed. This correctly handles UUID=, LABEL=, and /dev/ source variants
+    # regardless of whitespace format, and is idempotent across re-runs.
+    # ==========================================================================
+
+    - name: "PHASE 4 | Backup /etc/exports before modification"
+      ansible.builtin.copy:
+        src: /etc/exports
+        dest: "/etc/exports.reset-backup.{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        mode: "0644"
+      failed_when: false
+
+    - name: "PHASE 4 | Remove Tier0 entries from /etc/exports"
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        regexp: "^{{ item | regex_escape() }}[[:space:]]"
+        state: absent
+        backup: false
+      loop: "{{ reset_mount_paths }}"
+      failed_when: false
+
+    - name: "PHASE 4 | Stop x-systemd.automount units for each Tier0 mount"
+      # fstab option x-systemd.automount causes systemd to auto-create
+      # <escaped-path>.automount units — must be stopped before umount
+      # or systemd will immediately remount when the directory is accessed
+      ansible.builtin.shell: |
+        unit="{{ item | regex_replace('^/', '') | regex_replace('/', '-') }}.automount"
+        systemctl stop "$unit" 2>/dev/null || true
+        systemctl disable "$unit" 2>/dev/null || true
+      loop: "{{ reset_mount_paths }}"
+      changed_when: true
+      failed_when: false
+
+    - name: "PHASE 4 | Unmount Tier0 filesystems"
+      ansible.builtin.shell: |
+        if mountpoint -q "{{ item }}"; then
+          # Attempt 1 — clean unmount
+          umount "{{ item }}" 2>/dev/null && exit 0
+          # Attempt 2 — force-close remaining handles then retry
+          fuser -km "{{ item }}" 2>/dev/null
+          sleep 2
+          umount "{{ item }}" 2>/dev/null && exit 0
+          # Attempt 3 — lazy detach as last resort
+          umount -l "{{ item }}" 2>/dev/null || true
+        fi
+      loop: "{{ reset_mount_paths }}"
+      changed_when: true
+      failed_when: false
+
+    - name: "PHASE 4 | Remove Tier0 fstab entries (ansible.posix.mount — handles UUID/LABEL/device)"
+      # state:absent removes the fstab entry AND unmounts if still mounted.
+      # This is idempotent and handles all source variants correctly.
+      ansible.posix.mount:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ reset_mount_paths }}"
+      failed_when: false
+
+    # ==========================================================================
+    # PHASE 5 — Destroy RAID arrays and wipe member drives
+    # ==========================================================================
+
+    - name: "PHASE 5 | Wipe filesystem signatures from md array devices"
+      ansible.builtin.command: "wipefs -af {{ item }}"
+      loop: "{{ reset_md_devices }}"
+      changed_when: true
+      failed_when: false
+      when: reset_md_devices | length > 0
+
+    - name: "PHASE 5 | Stop md arrays"
+      ansible.builtin.command: "mdadm --stop {{ item }}"
+      loop: "{{ reset_md_devices }}"
+      changed_when: true
+      failed_when: false
+      when: reset_md_devices | length > 0
+
+    - name: "PHASE 5 | Zero md superblocks on all member drives"
+      ansible.builtin.command: "mdadm --zero-superblock --force {{ item }}"
+      loop: "{{ reset_member_drives }}"
+      changed_when: true
+      failed_when: false
+      when: reset_member_drives | length > 0
+
+    - name: "PHASE 5 | Wipe partition/fs signatures from member drives"
+      ansible.builtin.command: "wipefs -af {{ item }}"
+      loop: "{{ reset_member_drives }}"
+      changed_when: true
+      failed_when: false
+      when: reset_member_drives | length > 0
+
+    - name: "PHASE 5 | blkdiscard member drives (optional — recommended for NVMe demo reset)"
+      ansible.builtin.command: "blkdiscard -f {{ item }}"
+      loop: "{{ reset_member_drives }}"
+      changed_when: true
+      failed_when: false
+      when:
+        - reset_run_blkdiscard | bool
+        - reset_member_drives | length > 0
+
+    # ==========================================================================
+    # PHASE 6 — Remove all Hammerspace systemd unit files and scripts
+    # ==========================================================================
+
+    - name: "PHASE 6 | Remove guard service unit files"
+      ansible.builtin.file:
+        path: "{{ _systemd_unit_dir }}/{{ item }}.service"
+        state: absent
+      loop: "{{ reset_guard_services }}"
+      failed_when: false
+
+    - name: "PHASE 6 | Remove hammerspace-guards.target"
+      ansible.builtin.file:
+        path: "{{ _systemd_unit_dir }}/hammerspace-guards.target"
+        state: absent
+      when: _guards_target_stat.stat.exists | default(false)
+
+    - name: "PHASE 6 | Remove remount watchdog timer unit"
+      ansible.builtin.file:
+        path: "{{ _systemd_unit_dir }}/hammerspace-remount.timer"
+        state: absent
+      when: _remount_timer_stat.stat.exists | default(false)
+
+    - name: "PHASE 6 | Remove remount watchdog service unit"
+      ansible.builtin.file:
+        path: "{{ _systemd_unit_dir }}/hammerspace-remount.service"
+        state: absent
+      when: _remount_service_stat.stat.exists | default(false)
+
+    - name: "PHASE 6 | Remove remount check script"
+      ansible.builtin.file:
+        path: "{{ _remount_script }}"
+        state: absent
+      when: _remount_script_stat.stat.exists | default(false)
+
+    - name: "PHASE 6 | Remove ARRAY entries from /etc/mdadm/mdadm.conf"
+      ansible.builtin.lineinfile:
+        path: /etc/mdadm/mdadm.conf
+        regexp: "^ARRAY {{ item | regex_escape() }}[[:space:]]"
+        state: absent
+        backup: true
+      loop: "{{ reset_md_devices }}"
+      failed_when: false
+
+    - name: "PHASE 6 | Remove ARRAY entries from /etc/mdadm.conf (RHEL symlink)"
+      ansible.builtin.lineinfile:
+        path: /etc/mdadm.conf
+        regexp: "^ARRAY {{ item | regex_escape() }}[[:space:]]"
+        state: absent
+        backup: true
+      loop: "{{ reset_md_devices }}"
+      failed_when: false
+
+    # ==========================================================================
+    # PHASE 7 — Remove mount directories and verify clean state
+    #
+    # FIX 1: Now explicitly removes the /hammerspace root directory as a
+    #         separate task — it was never in reset_mount_paths (which only
+    #         contains subdirs like /hammerspace/hsvol0) so the loop never
+    #         caught it on previous versions.
+    #
+    # FIX 2: The sanity check is relaxed so this phase runs correctly even
+    #         when storage is already reset and mount lists are empty.
+    # ==========================================================================
+
+    - name: "PHASE 7 | Remove Tier0 mount subdirectories (hsvol0, hsvol1, ...)"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ reset_mount_paths }}"
+      when: reset_remove_mount_dirs | bool
+
+    - name: "PHASE 7 | Remove Tier0 root directory {{ reset_mount_root }}"
+      # This is a separate explicit task — reset_mount_root (/hammerspace) is
+      # the parent of all hsvol* paths and was never included in the loop above.
+      ansible.builtin.file:
+        path: "{{ reset_mount_root }}"
+        state: absent
+      when: reset_remove_mount_dirs | bool
+
+    - name: "PHASE 7 | Final systemd daemon reload"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: "PHASE 7 | Verify no Tier0 paths remain mounted"
+      ansible.builtin.shell: |
+        findmnt -rn -o TARGET | \
+          awk -v root="{{ reset_mount_root }}" \
+            '$1 ~ "^" root "(/|$)" {print $1}'
+      register: _remaining_mounts
+      changed_when: false
+
+    - name: "PHASE 7 | Warn if any Tier0 mounts remain"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: These paths are still mounted: {{ _remaining_mounts.stdout_lines }}.
+          Investigate: lsof +D {{ reset_mount_root }}
+      when: _remaining_mounts.stdout_lines | default([]) | length > 0
+
+    - name: "PHASE 7 | Verify no Hammerspace systemd units remain active"
+      ansible.builtin.shell: |
+        systemctl list-units 'hammerspace-*' --no-legend 2>/dev/null \
+          | awk '{print $1}' || true
+      register: _remaining_units
+      changed_when: false
+
+    - name: "PHASE 7 | Warn if any Hammerspace units remain"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: These Hammerspace units are still present in systemd:
+          {{ _remaining_units.stdout_lines }}.
+          Run: systemctl list-units 'hammerspace-*'
+      when: _remaining_units.stdout_lines | default([]) | length > 0
+
+    - name: "PHASE 7 | Confirm {{ reset_mount_root }} directory is removed"
+      ansible.builtin.stat:
+        path: "{{ reset_mount_root }}"
+      register: _hs_root_stat
+      when: reset_remove_mount_dirs | bool
+
+    - name: "PHASE 7 | Warn if {{ reset_mount_root }} still exists"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ reset_mount_root }} still exists after removal attempt.
+          Check for remaining mounts: findmnt | grep hammerspace
+      when:
+        - reset_remove_mount_dirs | bool
+        - _hs_root_stat.stat.exists | default(false)
+
+    # ==========================================================================
+    # SUMMARY
+    # ==========================================================================
+
+    - name: Reset complete — summary
+      ansible.builtin.debug:
+        msg: |
+          =====================================================
+          TIER0 HOST RESET COMPLETE: {{ inventory_hostname }}
+          =====================================================
+          Removed from Hammerspace : {{ reset_hammerspace_cleanup }}
+          Guard services killed    : {{ reset_guard_services | join(', ') if reset_guard_services | length > 0 else 'none found' }}
+          Remount watchdog removed : {{ _remount_timer_stat.stat.exists | default(false) }}
+          Automount units stopped  : yes (x-systemd.automount)
+          fstab entries removed    : yes (ansible.posix.mount state:absent)
+          Mounts cleared           : {{ reset_mount_paths | join(', ') if reset_mount_paths | length > 0 else 'none' }}
+          md arrays destroyed      : {{ reset_md_devices | join(', ') if reset_md_devices | length > 0 else 'none' }}
+          Member drives wiped      : {{ reset_member_drives | join(', ') if reset_member_drives | length > 0 else 'none' }}
+          blkdiscard run           : {{ reset_run_blkdiscard }}
+          Mount dirs removed       : {{ reset_remove_mount_dirs }}
+          Remaining mounts         : {{ _remaining_mounts.stdout_lines | default(['none']) | join(', ') }}
+
+          ---- TO RE-PROVISION THIS NODE ----------------------------
+          ansible-playbook site-onprem-nvme.yml \
+            -i inventory.yml \
+            --limit {{ inventory_hostname }}
+          =====================================================

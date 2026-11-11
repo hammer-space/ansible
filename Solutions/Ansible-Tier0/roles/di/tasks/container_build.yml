@@ -1,0 +1,21 @@
+---
+# Provide the pd-di container image WITHOUT starting it or registering.
+# Used when di_activate is false (pre-deploy mode).
+# The full container_deploy.yml (provide + run + register) is used when
+# di_activate is true.
+#
+# Image source dispatched by di_image_source:
+#   build    — build from Containerfile + RPMs (image_build.yml)
+#   url/local/registry — load pre-built image (image_load.yml)
+
+- name: "Provide pd-di image (di_image_source={{ di_image_source | default('build') }})"
+  ansible.builtin.include_tasks:
+    file: "image_{{ 'build' if (di_image_source | default('build')) == 'build' else 'load' }}.yml"
+
+- name: Display pre-deploy container status
+  ansible.builtin.debug:
+    msg: >-
+      Container image '{{ di_container_image }}' ready
+      (source={{ di_image_source | default('build') }}).
+      Container is NOT running (di_activate=false).
+      Activate later with: --tags di-activate -e di_activate=true

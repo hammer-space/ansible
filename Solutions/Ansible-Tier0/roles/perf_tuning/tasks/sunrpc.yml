@@ -1,0 +1,40 @@
+---
+# sunrpc TCP slot table tuning (Hammerspace BKM).
+# Default kernel values (tcp_slot_table_entries=2) bottleneck high-throughput
+# clients. Hammerspace recommends 128 / 65536.
+
+- name: Configure sunrpc TCP slot table sysctl (runtime)
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: false
+    sysctl_set: true
+    ignoreerrors: true
+  loop:
+    - {key: "sunrpc.tcp_slot_table_entries", value: "{{ perf_sunrpc_tcp_slot_table_entries }}"}
+    - {key: "sunrpc.tcp_max_slot_table_entries", value: "{{ perf_sunrpc_tcp_max_slot_table_entries }}"}
+  failed_when: false
+
+- name: Persist sunrpc sysctl settings in /etc/sysctl.d/99-hammerspace-sunrpc.conf
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-hammerspace-sunrpc.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Hammerspace Tier 0 BKM: NFS client RPC slot tuning
+      sunrpc.tcp_slot_table_entries = {{ perf_sunrpc_tcp_slot_table_entries }}
+      sunrpc.tcp_max_slot_table_entries = {{ perf_sunrpc_tcp_max_slot_table_entries }}
+  notify: reload sysctl
+
+- name: Persist sunrpc slot table via modprobe options (applies before mount)
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/sunrpc-slots.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Hammerspace Tier 0 BKM: applied at module load (before any NFS mount)
+      options sunrpc tcp_slot_table_entries={{ perf_sunrpc_tcp_slot_table_entries }}
+      options sunrpc tcp_max_slot_table_entries={{ perf_sunrpc_tcp_max_slot_table_entries }}

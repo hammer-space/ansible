@@ -1,0 +1,193 @@
+---
+# Apply the volume group's own place-on objective to the Tier 0 shares.
+#
+# WHY THIS EXISTS
+# ---------------
+# With only the default objectives a share spreads new files across EVERY
+# volume with free space — LSS/DSX-backed ones included (Tier 0 Deployment
+# Guide, "Default Behavior"). A write from a Tier 0 node then lands on the
+# DSX, and a copy appears on Tier 0 later via the mover. Joining the volumes
+# to a volume group does nothing by itself: the group is only a target that
+# an objective has to point at.
+#
+# Hammerspace auto-creates place-on-<group>, confine-to-<group> and
+# exclude-from-<group> for every volume group (guide, "Data Placement Using
+# Objectives"). So nothing is created here — the existing place-on-<group> is
+# APPLIED to each share, which is what makes first instances land on Tier 0.
+#
+# This makes writes go to A Tier 0 volume in the group, not necessarily the
+# writing node's own. Node-local first-write needs per-node place-on-<node>
+# objectives on per-node directories (guide, "Configure Tier 0 Nodes to Write
+# Local") and is out of scope here.
+#
+# Enabled by hammerspace_tier0_place_on_group: true. Requires
+# hammerspace_volume_group (the group the volumes were joined to). Shares
+# default to the names in hammerspace_shares; override with
+# hammerspace_tier0_place_on_shares to target shares this playbook did not
+# create.
+#
+# Misconfiguration is a hard failure, not a skip: the operator asked for
+# Tier 0 placement, and silently not applying it reproduces the exact symptom
+# this fixes.
+
+- name: Apply the volume group place-on objective to the Tier 0 shares
+  run_once: true
+  block:
+    - name: Resolve the place-on objective and the target shares
+      ansible.builtin.set_fact:
+        _t0po_objective: >-
+          {{ hammerspace_tier0_place_on_objective
+             | default('place-on-' ~ (hammerspace_volume_group | default('')), true) }}
+        _t0po_shares: >-
+          {{ hammerspace_tier0_place_on_shares
+             | default(hammerspace_shares | default([]) | map(attribute='name') | list, true) }}
+        _t0po_applicability: "{{ hammerspace_tier0_place_on_applicability | default('TRUE') }}"
+
+    - name: Fail if no volume group is configured
+      ansible.builtin.fail:
+        msg: |
+          hammerspace_tier0_place_on_group is true but hammerspace_volume_group
+          is empty. The place-on objective is derived from the group name
+          (place-on-<group>), and the volumes must be members of that group
+          for the objective to place anything on them.
+
+          Set hammerspace_volume_group to the existing group the Tier 0
+          volumes belong to, or set hammerspace_tier0_place_on_objective to
+          name the objective explicitly.
+      when:
+        - (hammerspace_volume_group | default('')) | length == 0
+        - (hammerspace_tier0_place_on_objective | default('')) | length == 0
+
+    # THE GUARD.
+    #
+    # The objective name is derived from ONE group, and the shares are
+    # cluster-wide, so "which group" has a single answer here. The join step,
+    # by contrast, legitimately handles several (per-AZ group_vars). When the
+    # run names more than one group, applying place-on-<first> to the share
+    # would confine the share to one AZ's volumes and silently exclude the
+    # rest — so this is a hard failure that names the groups it saw.
+    - name: Resolve the volume groups this run's hosts name
+      ansible.builtin.set_fact:
+        _t0po_groups: >-
+          {{ ansible_play_hosts
+             | map('extract', hostvars, 'hammerspace_volume_group')
+             | select('defined') | map('string') | map('trim')
+             | reject('equalto', '') | unique | sort | list }}
+
+    - name: Fail if this run names more than one volume group
+      ansible.builtin.fail:
+        msg: |
+          This run names {{ _t0po_groups | length }} volume groups
+          ({{ _t0po_groups | join(', ') }}), so place-on-<group> is ambiguous:
+          a share objective is cluster-wide and can name only one.
+
+          The volumes themselves were joined to the right group each — that
+          part is per-host. It is only the SHARE objective that has to pick.
+
+          Either:
+            - name the objective explicitly, if one group is the intended
+              placement target for these shares:
+                hammerspace_tier0_place_on_objective: "place-on-{{ _t0po_groups | first }}"
+            - or apply an objective naming a group that CONTAINS them all (a
+              volume group may hold other volume groups — create an "all AZs"
+              group in the UI and use place-on-<that group>)
+            - or run one AZ at a time:
+                ansible-playbook site.yml --limit AZ1 \
+                  -e hammerspace_volume_group={{ _t0po_groups | first }} \
+                  -e hammerspace_tier0_place_on_group=true
+      when:
+        - _t0po_groups | length > 1
+        - (hammerspace_tier0_place_on_objective | default('')) | length == 0
+
+    - name: Fail if there is no share to apply the objective to
+      ansible.builtin.fail:
+        msg: |
+          hammerspace_tier0_place_on_group is true but no share was resolved.
+
+          Shares default to hammerspace_shares (the shares this playbook
+          creates). To target shares created elsewhere, list them:
+
+            hammerspace_tier0_place_on_shares:
+              - checkpoints
+      when: _t0po_shares | length == 0
+
+    # Hammerspace creates place-on-<group> when the group is created, but not
+    # necessarily by the time the create call returns. For a group created
+    # earlier in THIS run (hammerspace_create_volume_groups), the lookup is
+    # retried; for any other group a miss is a misconfiguration and fails
+    # on the first answer, as before.
+    - name: Decide whether to wait for the objective
+      ansible.builtin.set_fact:
+        _t0po_wait: >-
+          {{ (hammerspace_volume_group | default('') | trim) in (_hs_vg_created_groups | default([]))
+             and (hammerspace_tier0_place_on_objective | default('')) | length == 0 }}
+
+    - name: "Look up objective {{ _t0po_objective }}"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "{{ hs_api_url }}/objectives/{{ _t0po_objective | urlencode }}"
+      register: _t0po_obj_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+      until: >-
+        (not (_t0po_wait | bool))
+        or (((_t0po_obj_raw.stdout_lines | default(['0']))[-1] | default('0') | int) == 200)
+      retries: "{{ (hammerspace_tier0_objective_wait_retries | default(12)) if (_t0po_wait | bool) else 1 }}"
+      delay: "{{ (hammerspace_tier0_objective_wait_delay | default(5)) if (_t0po_wait | bool) else 0 }}"
+
+    - name: Parse the objective lookup
+      ansible.builtin.set_fact:
+        _t0po_obj_status: "{{ (_t0po_obj_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+
+    # A hard failure. The group's auto-created objective is named after the
+    # group, so a miss almost always means the group was created under a
+    # different name than hammerspace_volume_group — but volume_group_join
+    # would already have failed on that. The other cause is an objective that
+    # was renamed or deleted in the UI.
+    - name: "Fail if objective {{ _t0po_objective }} does not exist"
+      ansible.builtin.fail:
+        msg: |
+          Objective '{{ _t0po_objective }}' was not found (HTTP {{ _t0po_obj_status }}){{
+            (' after waiting ' ~ ((hammerspace_tier0_objective_wait_retries | default(12) | int)
+              * (hammerspace_tier0_objective_wait_delay | default(5) | int)) ~ 's for the group created in this run')
+            if (_t0po_wait | bool) else '' }}.
+
+          Hammerspace creates place-on-<group> automatically when a volume
+          group is created, so for group '{{ hammerspace_volume_group | default('') }}'
+          this objective should exist. List what does:
+            curl -sk -u '{{ hammerspace_api_user }}:<password>' \
+              '{{ hs_api_url }}/objectives' | jq -r '.[].name' | grep -i place-on
+
+          If it was renamed, set hammerspace_tier0_place_on_objective to the
+          actual name.
+          {% if _t0po_obj_status | int == 0 %}
+
+          HTTP 0 means curl produced no output. stderr:
+            {{ (_t0po_obj_raw.stderr | default('') | regex_replace('Basic [A-Za-z0-9+/=]+', 'Basic <redacted>')) | trim | default('(none)', true) }}
+          {% endif %}
+      when: _t0po_obj_status | int != 200
+
+    - name: Show the placement plan
+      ansible.builtin.debug:
+        msg: |
+          Tier 0 placement:
+            objective     : {{ _t0po_objective }}
+            applicability : {{ _t0po_applicability }}
+            shares        : {{ _t0po_shares | join(', ') }}
+
+    - name: "Apply {{ _t0po_objective }} to each Tier 0 share"
+      ansible.builtin.include_tasks: share_apply_objective.yml
+      vars:
+        share_objective_config:
+          share_name: "{{ _t0po_share }}"
+          objective: "{{ _t0po_objective }}"
+          applicability: "{{ _t0po_applicability }}"
+      loop: "{{ _t0po_shares }}"
+      loop_control:
+        loop_var: _t0po_share
+        label: "{{ _t0po_share }} <- {{ _t0po_objective }}"

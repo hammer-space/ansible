@@ -1,0 +1,220 @@
+---
+# Two defects from the 2026-09-03 real decommission run, both visible in one
+# task dump.
+#
+# 1. STATUS PARSING. Every API call in the role used
+#
+#      curl -s -o /dev/stdout -w "\n%{http_code}" ...
+#
+#    and read the code back as `stdout_lines[-1]`. With `-o /dev/stdout` curl
+#    opens a SECOND stream on fd 1 for the body while the write-out string
+#    goes to its own stdout. The two buffers flush independently, so on a
+#    large response the status code can land BEFORE the body. `[-1]` is then
+#    a fragment of JSON, `| int` makes it 0, and a successful PUT is reported
+#    as rejected — which is exactly what happened to vg-tier0: the response
+#    body was a complete, valid VOLUME_GROUP object.
+#
+#    `-o /dev/stdout` is redundant; curl writes the body to stdout by default,
+#    through the same stream as -w, in order. Removing it makes the ordering
+#    deterministic.
+#
+# 2. CREDENTIAL DISCLOSURE. The rejection check looped over the registered
+#    results of a `no_log: true` curl task. `no_log` protects the task that
+#    carries it; it does NOT protect a downstream task that loops over the
+#    results, because Ansible prints the `item` — and the item is the whole
+#    curl result, including `cmd` and `invocation.module_args._raw_params`:
+#
+#      curl ... -H "Authorization: Basic YWRtaW46<...>" ...
+#
+#    which is base64 of admin:<password>. scripts/run.sh sends every run to a
+#    log file, so a rejected update wrote the cluster admin credential to disk.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_api_curl_status.yml \
+#       -i localhost, -c local
+
+- name: API curl status-parsing and credential-disclosure tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+
+  tasks:
+    # ========================================================================
+    # TEST 1 (audit): no call may reintroduce the dual-stream form.
+    # ========================================================================
+    - name: 'TEST 1: audit — no curl uses -o /dev/stdout with -w'
+      block:
+        - name: Search for the dual-stream form
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} && grep -rn -- "-o /dev/stdout" roles/ ./*.yml 2>/dev/null || true
+          register: _dual
+          changed_when: false
+          check_mode: false
+
+        - name: 'TEST 1 ASSERT: none remain'
+          ansible.builtin.assert:
+            that:
+              - (_dual.stdout | trim) | length == 0
+            fail_msg: |
+              REGRESSION: `curl -o /dev/stdout -w "\n%{http_code}"` is back.
+              The body and the write-out string then travel on two separate
+              streams over the same fd, so on a large response the status code
+              can precede the body and stdout_lines[-1] is JSON, not a code.
+              A successful call is then reported as rejected.
+
+              Drop `-o /dev/stdout` — curl writes the body to stdout anyway.
+
+              {{ _dual.stdout }}
+
+        - name: Count the calls that were converted
+          ansible.builtin.shell:
+            cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} && grep -rc -- 'curl -s -w "\\n%{http_code}"' roles/ ./*.yml 2>/dev/null | awk -F: '{n+=$2} END {print n+0}'
+          register: _converted
+          changed_when: false
+          check_mode: false
+
+        - name: 'TEST 1 ASSERT: the audit is not passing vacuously'
+          ansible.builtin.assert:
+            that:
+              # Guards against the grep silently matching nothing because the
+              # idiom was renamed wholesale.
+              - (_converted.stdout | trim | int) >= 35
+            fail_msg: |
+              Only {{ _converted.stdout | trim }} single-stream curl calls
+              found; expected the ~40 that were converted. Either the idiom
+              changed or this audit is no longer looking at the right thing.
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: audit — ' ~ (_converted.stdout | trim) ~ ' curl calls single-stream, none using -o /dev/stdout'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2: curl really does emit body-then-code on one stream. Skipped if
+    # there is no local HTTP server to talk to; the ordering property is what
+    # matters and it is checked against a real curl when one is available.
+    # ========================================================================
+    - name: 'TEST 2: curl -w emits the status code last'
+      block:
+        - name: Probe a file:// URL, which needs no network
+          ansible.builtin.shell:
+            cmd: >-
+              printf 'line-one\nline-two\n' > {{ _tmp | quote }} && curl -s -w "\n%{http_code}" "file://{{ _tmp }}"
+          register: _probe
+          changed_when: false
+          check_mode: false
+          failed_when: false
+          vars:
+            _tmp: "{{ lookup('env', 'TMPDIR') | default('/tmp/', true) }}hs_curl_probe.txt"
+
+        - name: 'TEST 2 ASSERT: the body comes first and the code is last'
+          ansible.builtin.assert:
+            that:
+              # Body first, in order.
+              - _probe.stdout_lines[0] == 'line-one'
+              - _probe.stdout_lines[1] == 'line-two'
+              # The code is LAST, which is what stdout_lines[-1] relies on.
+              # file:// reports 000, but the POSITION is the property here.
+              #
+              # Note the count is 4, not 3: the body already ends in a newline
+              # and -w adds another, so there is a blank line before the code.
+              # That is exactly why the role must read [-1] and never [2].
+              - _probe.stdout_lines[-1] | trim | length > 0
+              - (_probe.stdout_lines[-1] | trim) is match('^[0-9]+$')
+              - "'line-' not in _probe.stdout_lines[-1]"
+            fail_msg: |
+              curl did not put the write-out string after the body on a single
+              stream. stdout_lines[-1] is how every API call in this role reads
+              its status code.
+              Got: {{ _probe.stdout_lines }}
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: curl -w places the status code after the body on one stream'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3 (audit): no task may loop over the results of a no_log curl task.
+    # ========================================================================
+    - name: 'TEST 3: audit — no loop over a no_log curl result'
+      block:
+        - name: Scan for downstream loops over no_log results
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ playbook_dir }}/check_no_log_loops.py"
+              - "{{ playbook_dir }}/../../roles"
+          register: _leak
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: 'TEST 3 ASSERT: nothing loops over a censored result'
+          ansible.builtin.assert:
+            that:
+              - _leak.rc == 0
+            fail_msg: |
+              REGRESSION: a task loops over the registered results of a
+              `no_log: true` task.
+
+              {{ _leak.stdout }}
+
+              For a looped task Ansible prints the `item`. When the item is a
+              curl result it carries `cmd` and
+              `invocation.module_args._raw_params`, both containing
+              -H "Authorization: Basic <base64 admin:password>". no_log on the
+              producing task does not cover the consumer, and scripts/run.sh
+              writes every run to ~/logs.
+
+              Reduce the results to safe fields first (loop over INDICES so the
+              item is an integer), then report from a non-looped task.
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: audit — no task loops over the results of a no_log curl task'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          API CURL STATUS / DISCLOSURE TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

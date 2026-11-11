@@ -1,0 +1,24 @@
+---
+# Fail fast when no Anvil address was supplied.
+#
+# vars/main.yml ships hammerspace_api_host empty so a site never inherits
+# another site's cluster by accident. Set it on the command line:
+#   -e hammerspace_api_host=<anvil-ip>
+# or in a file passed with -e @site-overrides.yml
+#
+# Include with `include_role` + `tasks_from: require_api_host`, BEFORE the
+# Key Vault lookup and before anything authenticates against the Anvil.
+- name: Require hammerspace_api_host (Anvil management IP)
+  ansible.builtin.assert:
+    that:
+      - (hammerspace_api_host | default('', true) | string | trim) | length > 0
+    quiet: true
+    fail_msg: >-
+      hammerspace_api_host is not set. Pass the Anvil management IP on the
+      command line, e.g.  -e hammerspace_api_host=10.0.0.10  (or put it in a
+      file and pass -e @site-overrides.yml). vars/main.yml leaves it empty on
+      purpose. hammerspace_nodes, network_test_targets and
+      hammerspace_cluster_mgmt_ip follow it automatically; mover_nodes is
+      separate (-e '{"mover_nodes": ["10.0.0.20"]}').
+  run_once: true
+  tags: [always]

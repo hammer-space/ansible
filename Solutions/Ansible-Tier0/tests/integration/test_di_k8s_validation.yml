@@ -1,0 +1,124 @@
+---
+# Validate the deployment-type / runtime validators accept 'kubernetes' and
+# 'containerd' while still rejecting genuinely invalid values.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_di_k8s_validation.yml -i localhost, -c local
+
+- name: K8s validation test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _repo: "{{ playbook_dir }}/../.."
+
+  tasks:
+    # ------------------------------------------------------------------
+    # TEST 1: di_deployment_type validator in plays/di.yml accepts the
+    # 'kubernetes' value (literal-string check, since we can't dry-run the
+    # play without inventory).
+    # ------------------------------------------------------------------
+    - name: 'TEST 1: plays/di.yml di_deployment_type validator allows kubernetes'
+      block:
+        - ansible.builtin.set_fact:
+            _di_play: "{{ lookup('file', _repo + '/plays/di.yml') }}"
+        - ansible.builtin.assert:
+            that:
+              - "\"di_deployment_type in ['host', 'container', 'kubernetes']\" in _di_play"
+            fail_msg: "plays/di.yml validator does not include 'kubernetes' in the allow-list"
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: plays/di.yml validator allows kubernetes'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ------------------------------------------------------------------
+    # TEST 2: container_runtime.yml allows 'containerd' as passthrough but
+    # still rejects garbage.
+    # ------------------------------------------------------------------
+    - name: 'TEST 2: container_runtime.yml allows containerd / rejects garbage'
+      block:
+        - ansible.builtin.set_fact:
+            _cr_file: "{{ lookup('file', _repo + '/roles/di/tasks/container_runtime.yml') }}"
+        - ansible.builtin.assert:
+            that:
+              - "\"['podman', 'docker', 'containerd']\" in _cr_file"
+              - "'end_host' in _cr_file"
+            fail_msg: "container_runtime.yml does not list containerd in the allow-list or is missing the end_host short-circuit"
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: container_runtime.yml accepts containerd, short-circuits via end_host'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ------------------------------------------------------------------
+    # TEST 3: roles/di/tasks/main.yml routes the kubernetes branch to
+    # kubernetes_deploy.yml and the status label task is included.
+    # ------------------------------------------------------------------
+    - name: 'TEST 3: main.yml routes k8s mode to kubernetes_deploy + status_label'
+      block:
+        - ansible.builtin.set_fact:
+            _main: "{{ lookup('file', _repo + '/roles/di/tasks/main.yml') }}"
+        - ansible.builtin.assert:
+            that:
+              - "'kubernetes_deploy.yml' in _main"
+              - "'kubernetes_status_label.yml' in _main"
+              - "'di-k8s' in _main"
+              - "'di-k8s-status' in _main"
+            fail_msg: "roles/di/tasks/main.yml missing k8s branch or status-label include"
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: main.yml routes kubernetes mode correctly'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ------------------------------------------------------------------
+    # TEST 4: decommission.yml dispatches to kubernetes_decommission.yml
+    # when k8s mode is selected.
+    # ------------------------------------------------------------------
+    - name: 'TEST 4: decommission.yml dispatches kubernetes_decommission.yml'
+      block:
+        - ansible.builtin.set_fact:
+            _dec: "{{ lookup('file', _repo + '/roles/di/tasks/decommission.yml') }}"
+        - ansible.builtin.assert:
+            that:
+              - "'kubernetes_decommission.yml' in _dec"
+              - "\"di_deployment_type | default('host') == 'kubernetes'\" in _dec"
+            fail_msg: "decommission.yml missing kubernetes dispatch"
+        - ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: decommission.yml dispatches kubernetes_decommission'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ------------------------------------------------------------------
+    # Report
+    # ------------------------------------------------------------------
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          DI K8S VALIDATION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

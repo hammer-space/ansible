@@ -1,0 +1,65 @@
+---
+# MTU / Jumbo Frame Validation
+# Checks interface MTU settings and tests jumbo frame connectivity
+
+- name: Check MTU settings on network interfaces
+  ansible.builtin.shell: |
+    ip link show | grep -E "^[0-9]+:" | while read line; do
+      iface=$(echo "$line" | awk -F: '{print $2}' | tr -d ' ')
+      mtu=$(echo "$line" | grep -oE 'mtu [0-9]+' | awk '{print $2}')
+      state=$(echo "$line" | grep -oE 'state [A-Z]+' | awk '{print $2}')
+      if [ -n "$mtu" ] && [ "$state" = "UP" ]; then
+        echo "$iface:$mtu:$state"
+      fi
+    done
+  register: mtu_settings
+  changed_when: false
+
+- name: Display MTU settings
+  ansible.builtin.debug:
+    msg: |
+      Network Interface MTU Settings:
+      ============================================
+      {% for line in mtu_settings.stdout_lines %}
+      {% set parts = line.split(':') %}
+      {{ parts[0] }}: MTU {{ parts[1] }} ({{ parts[2] }}) {% if parts[1] | int < (expected_mtu | default(9000)) %}[BELOW RECOMMENDED]{% else %}[OK]{% endif %}
+      {% endfor %}
+      ============================================
+      Hammerspace recommends MTU {{ expected_mtu | default(9000) }} for nodes, 9216 for switches
+
+- name: Test jumbo frame connectivity to test targets
+  ansible.builtin.command: "ping -M do -s {{ mtu_ping_size | default(8972) }} -c 3 -W 2 {{ item }}"
+  loop: "{{ network_test_targets | default([]) }}"
+  register: ping_results
+  changed_when: false
+  failed_when: false
+  when: network_test_targets is defined and network_test_targets | length > 0
+
+- name: Display jumbo frame test results
+  ansible.builtin.debug:
+    msg: |
+      Jumbo Frame Connectivity Tests (MTU {{ expected_mtu | default(9000) }}):
+      ============================================
+      {% for item in ping_results.results | default([]) %}
+      {{ item.item }}: {% if item.rc == 0 %}PASS{% else %}FAIL - Check MTU configuration{% endif %}
+      {% endfor %}
+      {% if ping_results.results | default([]) | selectattr('rc', 'ne', 0) | list | length > 0 %}
+
+      WARNING: Some jumbo frame tests failed. Ensure:
+        - All network switches have MTU 9216 or higher
+        - All interfaces in the path support jumbo frames
+        - No firewall is blocking ICMP
+      {% endif %}
+      ============================================
+  when: ping_results.results is defined
+
+- name: Fail if MTU test fails and enforced
+  ansible.builtin.fail:
+    msg: |
+      ERROR: Jumbo frame test failed to: {{ ping_results.results | selectattr('rc', 'ne', 0) | map(attribute='item') | join(', ') }}
+
+      Set enforce_mtu_test: false to continue despite MTU issues.
+  when:
+    - ping_results.results is defined
+    - ping_results.results | selectattr('rc', 'ne', 0) | list | length > 0
+    - enforce_mtu_test | default(false)

@@ -1,0 +1,31 @@
+---
+- name: Install podman (RedHat)
+  ansible.builtin.dnf:
+    name: podman
+    state: present
+  when: ansible_os_family == 'RedHat'
+
+- name: Install podman (Debian)
+  ansible.builtin.apt:
+    name: podman
+    state: present
+    update_cache: true
+  when: ansible_os_family == 'Debian'
+
+# Without this service, podman does not honor --restart policies across host
+# reboots. Docker has a daemon; podman relies on this one-shot unit instead.
+- name: Enable podman-restart.service (honors --restart across host reboots)
+  ansible.builtin.systemd:
+    name: podman-restart.service
+    enabled: true
+    daemon_reload: true
+  failed_when: false
+  register: podman_restart_svc
+
+- name: Warn if podman-restart.service unavailable
+  ansible.builtin.debug:
+    msg: >-
+      podman-restart.service could not be enabled on this host. The pd-di
+      container will not auto-start after host reboots unless you manage
+      lifecycle via `podman generate systemd` or equivalent.
+  when: podman_restart_svc is failed or (podman_restart_svc.status is not defined)

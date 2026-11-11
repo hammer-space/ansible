@@ -1,0 +1,48 @@
+---
+# Performance tuning role - Hammerspace Tier 0 BKMs not covered by nfs_setup.
+# Each section is independently toggleable via perf_*_enabled flags.
+# The role itself is gated by perf_tuning_enabled in plays/storage.yml.
+
+- name: Include sunrpc tunables
+  ansible.builtin.include_tasks: sunrpc.yml
+  when: perf_sunrpc_tunables_enabled | default(true) | bool
+  tags: [perf, sunrpc]
+
+- name: Include NFSD server-side tunables
+  ansible.builtin.include_tasks: nfsd.yml
+  when: perf_nfsd_tunables_enabled | default(true) | bool
+  tags: [perf, nfsd]
+
+- name: Include block device read-ahead tuning
+  ansible.builtin.include_tasks: readahead.yml
+  when: perf_readahead_enabled | default(true) | bool
+  tags: [perf, readahead]
+
+- name: Include NIC IRQ pinning
+  ansible.builtin.include_tasks: irq_pinning.yml
+  when: perf_irq_pinning_enabled | default(true) | bool
+  tags: [perf, irq]
+
+- name: Include TCP sysctl tuning
+  ansible.builtin.include_tasks: tcp_sysctl.yml
+  when: perf_tcp_sysctl_enabled | default(true) | bool
+  tags: [perf, tcp]
+
+- name: Include vm dirty-page writeback limits (NFS client ingest)
+  ansible.builtin.include_tasks: vm_writeback.yml
+  when: perf_vm_writeback_enabled | default(false) | bool
+  tags: [perf, writeback]
+
+- name: Display perf_tuning summary
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+      PERF TUNING APPLIED
+      ============================================
+      sunrpc slot tables:  {{ 'YES (' ~ perf_sunrpc_tcp_slot_table_entries ~ '/' ~ perf_sunrpc_tcp_max_slot_table_entries ~ ')' if perf_sunrpc_tunables_enabled else 'skipped' }}
+      NFSD tunables:       {{ 'YES (max_block_size=' ~ perf_nfsd_max_block_size ~ ', direct_io=' ~ perf_nfsd_direct_io ~ ')' if perf_nfsd_tunables_enabled else 'skipped' }}
+      Block read-ahead:    {{ 'YES (' ~ perf_readahead_kb ~ ' KB)' if perf_readahead_enabled else 'skipped' }}
+      NIC IRQ pinning:     {{ 'YES' if perf_irq_pinning_enabled else 'skipped' }}
+      TCP sysctl:          {{ 'YES' if perf_tcp_sysctl_enabled else 'skipped' }}
+      vm writeback limits: {{ 'YES (' ~ (perf_vm_writeback | dict2items | map(attribute='key') | join(', ')) ~ ')' if perf_vm_writeback_enabled | default(false) | bool else 'skipped (opt-in: perf_vm_writeback_enabled)' }}
+      ============================================

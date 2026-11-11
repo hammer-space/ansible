@@ -1,0 +1,222 @@
+---
+# Deploy DI as a Kubernetes DaemonSet. Runs from the Ansible controller
+# (delegate_to: localhost, run_once: true). Per-host work (firewall, selinux)
+# is handled separately by main.yml.
+
+- name: Validate k8s deployment inputs
+  ansible.builtin.assert:
+    that:
+      - di_k8s_kubeconfig | length > 0
+      - di_k8s_namespace | length > 0
+      - di_k8s_registry_namespace | length > 0
+      - hammerspace_api_user | default('') | length > 0
+      - hammerspace_api_password | default('') | length > 0
+    fail_msg: >-
+      Missing k8s deployment inputs. Required: di_k8s_kubeconfig,
+      di_k8s_namespace, di_k8s_registry_namespace, hammerspace_api_user,
+      hammerspace_api_password.
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Auto-install kubernetes.core (controller)
+  ansible.builtin.command:
+    cmd: ansible-galaxy collection install -r {{ repo_root }}/requirements.yml kubernetes.core
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: di_k8s_auto_install_collection | bool
+  register: _di_k8s_galaxy
+  changed_when: "'was installed successfully' in (_di_k8s_galaxy.stdout | default(''))"
+  failed_when: false
+
+- name: Probe kubectl availability
+  ansible.builtin.command:
+    cmd: kubectl --kubeconfig {{ di_k8s_kubeconfig }} version --client=true -o json
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: _di_k8s_kubectl
+  changed_when: false
+  failed_when: _di_k8s_kubectl.rc != 0
+
+- name: Compute effective image reference
+  ansible.builtin.set_fact:
+    _di_k8s_image_ref: >-
+      {{ di_k8s_registry }}/{{ di_k8s_registry_namespace }}/{{ di_k8s_image_repository }}:{{ di_k8s_image_tag }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# Determine which nodes get the di-deployed label.
+# Priority: di_k8s_target_nodes (explicit list) > di_nodes inventory group.
+# ---------------------------------------------------------------------------
+
+- name: Compute target node list
+  ansible.builtin.set_fact:
+    _di_k8s_target_nodes: >-
+      {{ di_k8s_target_nodes
+         if (di_k8s_target_nodes | length > 0)
+         else (groups['di_nodes'] | default([])
+               | map('extract', hostvars, 'inventory_hostname') | list) }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Fail if no target nodes
+  ansible.builtin.fail:
+    msg: >-
+      No k8s target nodes. Set di_k8s_target_nodes or populate di_nodes
+      inventory group with hostnames matching `kubectl get nodes`.
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: _di_k8s_target_nodes | length == 0
+
+# ---------------------------------------------------------------------------
+# Label nodes BEFORE applying the DaemonSet so the first roll has a target.
+# ---------------------------------------------------------------------------
+
+- name: "Label target nodes ({{ di_k8s_node_selector_label }}={{ di_k8s_node_selector_value }})"
+  ansible.builtin.command:
+    cmd: >-
+      kubectl --kubeconfig {{ di_k8s_kubeconfig }} label node {{ item }}
+      {{ di_k8s_node_selector_label }}={{ di_k8s_node_selector_value }} --overwrite
+  loop: "{{ _di_k8s_target_nodes }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# Namespace + PSA labels.
+# ---------------------------------------------------------------------------
+
+- name: Render namespace manifest
+  ansible.builtin.template:
+    src: namespace.yaml.j2
+    dest: "{{ _di_k8s_render_dir }}/namespace.yaml"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  vars:
+    _di_k8s_render_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/di-k8s-{{ ansible_date_time.epoch | default('0') }}"
+  register: _di_k8s_ns_render
+
+- name: Apply namespace
+  ansible.builtin.command:
+    cmd: kubectl --kubeconfig {{ di_k8s_kubeconfig }} apply -f {{ _di_k8s_ns_render.dest }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# Pull secret (only if registry creds supplied).
+# ---------------------------------------------------------------------------
+
+- name: Build dockerconfigjson for pull secret
+  ansible.builtin.set_fact:
+    _di_k8s_dockerconfigjson_b64: >-
+      {{ ({'auths': {
+              di_k8s_registry: {
+                'username': di_k8s_registry_username,
+                'password': di_k8s_registry_password,
+                'email': di_k8s_registry_email,
+                'auth': ((di_k8s_registry_username ~ ':' ~ di_k8s_registry_password)
+                         | b64encode)
+              }}} | to_json) | b64encode }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  when:
+    - di_k8s_registry_username | length > 0
+    - di_k8s_registry_password | length > 0
+
+- name: Render pull secret manifest
+  ansible.builtin.template:
+    src: image_pull_secret.yaml.j2
+    dest: "{{ _di_k8s_ns_render.dest | dirname }}/pull-secret.yaml"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  register: _di_k8s_pull_render
+  when:
+    - di_k8s_registry_username | length > 0
+    - di_k8s_registry_password | length > 0
+
+- name: Apply pull secret
+  ansible.builtin.command:
+    cmd: kubectl --kubeconfig {{ di_k8s_kubeconfig }} apply -f {{ _di_k8s_pull_render.dest }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  changed_when: true
+  when: _di_k8s_pull_render is changed or _di_k8s_pull_render is not skipped
+
+# ---------------------------------------------------------------------------
+# API credentials secret (always created).
+# ---------------------------------------------------------------------------
+
+- name: Render API credentials secret
+  ansible.builtin.template:
+    src: api_credentials_secret.yaml.j2
+    dest: "{{ _di_k8s_ns_render.dest | dirname }}/api-credentials.yaml"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  register: _di_k8s_creds_render
+
+- name: Apply API credentials secret
+  ansible.builtin.command:
+    cmd: kubectl --kubeconfig {{ di_k8s_kubeconfig }} apply -f {{ _di_k8s_creds_render.dest }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# DaemonSet.
+# ---------------------------------------------------------------------------
+
+- name: Render DaemonSet
+  ansible.builtin.template:
+    src: daemonset.yaml.j2
+    dest: "{{ _di_k8s_ns_render.dest | dirname }}/daemonset.yaml"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: _di_k8s_ds_render
+
+- name: Apply DaemonSet
+  ansible.builtin.command:
+    cmd: kubectl --kubeconfig {{ di_k8s_kubeconfig }} apply -f {{ _di_k8s_ds_render.dest }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: true
+
+- name: "Wait for DaemonSet rollout (timeout {{ di_k8s_rollout_timeout }}s)"
+  ansible.builtin.command:
+    cmd: >-
+      kubectl --kubeconfig {{ di_k8s_kubeconfig }} -n {{ di_k8s_namespace }}
+      rollout status daemonset/hammerspace-di
+      --timeout={{ di_k8s_rollout_timeout }}s
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: _di_k8s_rollout
+  changed_when: false
+  failed_when:
+    - _di_k8s_rollout.rc != 0
+    - "'successfully rolled out' not in (_di_k8s_rollout.stdout | default(''))"

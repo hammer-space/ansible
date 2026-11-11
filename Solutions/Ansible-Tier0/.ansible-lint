@@ -1,0 +1,16 @@
+---
+skip_list:
+  - yaml[line-length]
+  - name[template]
+  - name[casing]
+  - role-name
+  - jinja[spacing]
+  - no-changed-when
+  - command-instead-of-shell
+  - risky-shell-pipe
+
+warn_list:
+  - experimental
+  - ignore-errors
+
+offline: true

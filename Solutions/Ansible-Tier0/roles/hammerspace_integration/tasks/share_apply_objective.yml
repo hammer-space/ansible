@@ -1,0 +1,141 @@
+---
+# Apply Share Objective
+# Called from main.yml, create_share.yml or tier0_place_on_group.yml with
+# share_objective_config: {share_name, objective, applicability}
+# Reference: hs_ops share_apply_objective.yml
+#
+# Available objectives include:
+# - availability-3-nines (99.9% availability)
+# - availability-4-nines (99.99% availability)
+# - performance-high
+# - durability-high
+# - place-on-<volume group> / confine-to-<volume group> / exclude-from-<volume group>
+#   (auto-created by Hammerspace for every volume group)
+#
+# Every task is run_once: a share objective is cluster-wide, and
+# hammerspace_integration runs on every storage_server in parallel, so a
+# per-host apply is N identical POSTs to the same share.
+
+- name: "Set objective hash for {{ share_objective_config.share_name }}"
+  ansible.builtin.set_fact:
+    _objective_hash: "{{ (share_objective_config.share_name ~ share_objective_config.objective) | hash('md5') }}"
+  run_once: true
+
+# no_log because the command line carries the API password. failed_when: false
+# so a curl failure cannot be the task that fails the play — no_log censors the
+# WHOLE result, failure message included, so the error is reported from the
+# un-censored task below (2026-09-03 keyvault rule).
+- name: "Apply objective {{ share_objective_config.objective }} to share {{ share_objective_config.share_name }}"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      -X POST -H "Content-Type: application/json"
+      -D /tmp/hs_objective_{{ _objective_hash }}_headers.txt
+      -d ''
+      "{{ hs_api_url }}/shares/{{ share_objective_config.share_name | urlencode }}/objective-set?objective-identifier={{ share_objective_config.objective | urlencode }}&applicability={{ share_objective_config.applicability | default('TRUE') | upper | urlencode }}"
+  register: objective_apply_raw
+  changed_when: true
+  failed_when: false
+  no_log: true
+  run_once: true
+  when: not ansible_check_mode
+
+- name: "Extract location header from objective application"
+  ansible.builtin.shell: |
+    grep -i '^Location:' /tmp/hs_objective_{{ _objective_hash }}_headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r\n'
+  register: objective_location_raw
+  changed_when: false
+  run_once: true
+  when: not ansible_check_mode
+
+- name: "Parse objective application result"
+  ansible.builtin.set_fact:
+    objective_apply_result:
+      status: "{{ (objective_apply_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+      json: "{{ ((objective_apply_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+      location: "{{ objective_location_raw.stdout | default('') }}"
+  run_once: true
+  when: not ansible_check_mode
+
+# The HTTP status was never checked here before. A typo in the objective name,
+# a share that does not exist, or a group created under a different name all
+# return 4xx with NO Location header — the poll below is skipped, nothing
+# fails, and the final task prints "applied". The objective is silently never
+# applied, and data lands wherever the default objectives put it.
+- name: "Fail if objective application was rejected"
+  ansible.builtin.fail:
+    msg: |
+      Applying objective '{{ share_objective_config.objective }}' to share
+      '{{ share_objective_config.share_name }}' failed with
+      HTTP {{ objective_apply_result.status }} (curl exit {{ objective_apply_raw.rc | default('?') }}).
+
+      POST {{ hs_api_url }}/shares/{{ share_objective_config.share_name | urlencode }}/objective-set
+           ?objective-identifier={{ share_objective_config.objective }}
+           &applicability={{ share_objective_config.applicability | default('TRUE') | upper }}
+
+      The API said:
+        {{ (objective_apply_raw.stdout_lines | default([]))[:-1] | join('\n  ') | trim | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+
+      The curl task carries no_log (its command line holds the API password),
+      so the body above is the only record of what the API objected to.
+      {% if objective_apply_result.status | int == 404 %}
+
+      404 means the share OR the objective does not exist under that name.
+      Check both — the names are case-sensitive:
+        curl -sk -u '{{ hammerspace_api_user }}:<password>' '{{ hs_api_url }}/shares' | jq -r '.[].name'
+        curl -sk -u '{{ hammerspace_api_user }}:<password>' '{{ hs_api_url }}/objectives' | jq -r '.[].name'
+      {% elif objective_apply_result.status | int == 0 %}
+
+      HTTP 0 with no body means curl produced no output at all — `-w` always
+      emits a code when curl runs. So curl did not run, or was killed. stderr:
+        {{ (objective_apply_raw.stderr | default('') | regex_replace('Basic [A-Za-z0-9+/=]+', 'Basic <redacted>')) | trim | default('(none)', true) }}
+      {% endif %}
+  run_once: true
+  when:
+    - not ansible_check_mode
+    - objective_apply_result.status | int not in [200, 201, 202]
+
+- name: "Wait for objective application to complete"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      "{{ objective_apply_result.location }}"
+  register: objective_status_raw
+  changed_when: false
+  no_log: true
+  run_once: true
+  until: (objective_status_raw.stdout | default('{}') | from_json).status | default('') in ["COMPLETED", "FAILED", "CANCELLED"]
+  retries: 30
+  delay: 5
+  when:
+    - not ansible_check_mode
+    - objective_apply_result is defined
+    - objective_apply_result.location | default('') | length > 0
+
+- name: "Fail if objective application did not complete successfully"
+  ansible.builtin.fail:
+    msg: |
+      Objective application task for '{{ share_objective_config.objective }}' on
+      share '{{ share_objective_config.share_name }}' ended with status
+      {{ (objective_status_raw.stdout | default('{}') | from_json).status | default('UNKNOWN') }}.
+
+      Task: {{ objective_apply_result.location }}
+      {{ (objective_status_raw.stdout | default('{}') | from_json).statusMessage | default('') }}
+  run_once: true
+  when:
+    - not ansible_check_mode
+    - objective_status_raw is defined
+    - objective_status_raw.stdout is defined
+    - (objective_status_raw.stdout | default('{}') | from_json).status | default('') in ["FAILED", "CANCELLED"]
+
+- name: "Display objective application status"
+  ansible.builtin.debug:
+    msg: >-
+      Objective '{{ share_objective_config.objective }}' applied to share '{{ share_objective_config.share_name }}'
+      with applicability={{ share_objective_config.applicability | default('TRUE') }}
+      {{ '(check mode — not applied)' if ansible_check_mode else '' }}
+  run_once: true

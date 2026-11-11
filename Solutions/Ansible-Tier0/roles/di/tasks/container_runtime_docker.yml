@@ -1,0 +1,39 @@
+---
+# Docker install. On RHEL-family we use Docker CE (the vendor repo works for
+# RHEL, Rocky, and Alma). On Debian/Ubuntu we use the distro docker.io which
+# is fine for this workload; swap for Docker CE if you need the newest engine.
+
+- name: Install Docker CE (RedHat family)
+  when: ansible_os_family == 'RedHat'
+  block:
+    - name: Ensure dnf-plugins-core
+      ansible.builtin.dnf:
+        name: dnf-plugins-core
+        state: present
+
+    - name: Add Docker CE repo (uses centos path for all RHEL-family)
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/centos/docker-ce.repo
+        dest: /etc/yum.repos.d/docker-ce.repo
+        mode: "0644"
+
+    - name: Install Docker packages
+      ansible.builtin.dnf:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+
+- name: Install docker.io (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: docker.io
+    state: present
+    update_cache: true
+  when: ansible_os_family == 'Debian'
+
+- name: Enable and start the docker service
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true

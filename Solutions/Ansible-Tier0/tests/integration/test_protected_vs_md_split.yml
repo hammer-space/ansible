@@ -1,0 +1,445 @@
+---
+# Integration test for the 2026-05-18 "0 RAID arrays" regression (Peter's bug).
+#
+# Symptom: nvme_discovery aborts with
+#   Discovery produced 0 RAID arrays.
+#   - storage_type is set correctly (current: scsi)
+#   - Drives exist and are not excluded by boot device detection
+# on a host that has VALID existing RAID arrays from previous runs.
+#
+# Cause: the boot-drive safety overhaul put md array members in
+# `_protected_disks`, so on a re-run all the data disks got excluded from
+# `nvme_devices`/`scsi_devices` and there was nothing left to plan a RAID on.
+#
+# Fix: split detection into three lists:
+#   _protected_disks  (STRICT) — boot / mounted FS / swap. EXCLUDED.
+#   _md_member_disks  (ADOPT)  — existing md members. NOT excluded; raid_setup
+#                                detects existing membership and remaps.
+#   _lvm_pv_disks     (INFO)   — informational only.
+#
+# This test simulates the three lists and exercises the rejectattr filter from
+# nvme_discovery/main.yml to confirm md members are NOT excluded from
+# discovery anymore.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_protected_vs_md_split.yml \
+#       -i localhost, -c local
+
+- name: Protected-disk vs md-member split regression test
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+
+    # Realistic mocked discovery: 1 boot disk (sda) + 2 data disks already in
+    # md127 from a prior run (sdb, sdc) + 1 fresh data disk (sdd).
+    scsi_all_devices_mock:
+      - name: sda
+        device: /dev/sda
+        numa: 0
+        serial: BOOT01
+        model: BOOT-DISK
+        pcie_address: "N/A"
+        rotational: 0
+      - name: sdb
+        device: /dev/sdb
+        numa: 0
+        serial: DATA01
+        model: DATA-SSD
+        pcie_address: "N/A"
+        rotational: 0
+      - name: sdc
+        device: /dev/sdc
+        numa: 0
+        serial: DATA02
+        model: DATA-SSD
+        pcie_address: "N/A"
+        rotational: 0
+      - name: sdd
+        device: /dev/sdd
+        numa: 0
+        serial: DATA03
+        model: DATA-SSD
+        pcie_address: "N/A"
+        rotational: 0
+
+  tasks:
+    # ========================================================================
+    # TEST 1: with the OLD merged behavior (md members in _protected_disks),
+    # the rejectattr filter strips out sdb/sdc and leaves only sdd. That's
+    # what caused Peter's "0 RAID arrays" failure when ALL drives were md
+    # members.
+    # ========================================================================
+    - name: 'TEST 1: simulate OLD behavior (md members in _protected_disks)'
+      block:
+        - name: OLD-behavior protected list includes md members
+          ansible.builtin.set_fact:
+            _protected_disks_old:
+              - sda      # boot
+              - sdb      # md member (wrongly excluded)
+              - sdc      # md member (wrongly excluded)
+
+        - name: Apply rejectattr with OLD list
+          ansible.builtin.set_fact:
+            scsi_devices_old: >-
+              {{ scsi_all_devices_mock
+                 | rejectattr('name', 'in', _protected_disks_old)
+                 | list }}
+
+        - name: 'TEST 1 ASSERT: OLD behavior leaves only sdd (the regression)'
+          ansible.builtin.assert:
+            that:
+              - scsi_devices_old | length == 1
+              - scsi_devices_old[0].name == 'sdd'
+            fail_msg: |
+              Sanity check failed — the mocked OLD behavior should leave only
+              sdd. Got: {{ scsi_devices_old | map(attribute='name') | list }}
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: OLD merged behavior reproduced (sdb/sdc wrongly excluded)'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 2: with the NEW split (md members in their own list), the
+    # rejectattr filter only strips sda (the boot disk). sdb/sdc/sdd all
+    # survive — discovery succeeds and raid_setup adopts the existing array.
+    # ========================================================================
+    - name: 'TEST 2: simulate NEW split behavior'
+      block:
+        - name: NEW _protected_disks excludes md members
+          ansible.builtin.set_fact:
+            _protected_disks:
+              - sda      # boot / mounted FS only
+            _md_member_disks:
+              - sdb
+              - sdc      # informational — NOT excluded from discovery
+            _lvm_pv_disks: []
+
+        - name: Apply rejectattr with NEW list
+          ansible.builtin.set_fact:
+            scsi_devices_new: >-
+              {{ scsi_all_devices_mock
+                 | rejectattr('name', 'in', _protected_disks)
+                 | list }}
+
+        - name: 'TEST 2 ASSERT: sdb, sdc, sdd survive discovery; sda excluded'
+          ansible.builtin.assert:
+            that:
+              - scsi_devices_new | length == 3
+              - (scsi_devices_new | map(attribute='name') | list | sort) == ['sdb', 'sdc', 'sdd']
+            fail_msg: |
+              REGRESSION: NEW _protected_disks should only exclude sda.
+              Got: {{ scsi_devices_new | map(attribute='name') | list }}
+
+        - name: 'TEST 2 ASSERT: md members appear in the informational list'
+          ansible.builtin.assert:
+            that:
+              - "'sdb' in _md_member_disks"
+              - "'sdc' in _md_member_disks"
+              - "'sda' not in _md_member_disks"
+            fail_msg: "Bookkeeping check: md member list is wrong."
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: NEW split — md members pass discovery (Peter\\'s bug fixed)'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 3: the safety gate in build_raid_arrays.yml must still trigger if
+    # somehow the BOOT disk ends up in the candidate list. (Negative test —
+    # the split must not regress the original boot-drive protection.)
+    # ========================================================================
+    - name: 'TEST 3: safety gate still catches boot-drive overlap'
+      block:
+        - name: Simulate a bug where sda (boot) leaks into the candidate list
+          ansible.builtin.set_fact:
+            _protected_disks:
+              - sda
+            allow_empty_protected_disks: false
+            nvme_devices_bug:
+              - name: sda
+                device: /dev/sda
+                numa: 0
+              - name: sdb
+                device: /dev/sdb
+                numa: 0
+
+        - name: Run the safety gate from build_raid_arrays.yml
+          ansible.builtin.fail:
+            msg: |
+              REFUSING TO PROCEED — overlap: {{ (nvme_devices_bug | map(attribute='name') | list)
+                | intersect(_protected_disks) | join(', ') }}
+          when:
+            - (nvme_devices_bug | map(attribute='name') | list)
+              | intersect(_protected_disks) | length > 0
+            - not (allow_empty_protected_disks | default(false) | bool)
+
+        - name: 'TEST 3 FAIL: safety gate did NOT fire'
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: safety gate failed to catch sda in candidate list (boot-drive regression)'] }}"
+      rescue:
+        - name: 'TEST 3 PASS: safety gate caught the boot disk'
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: safety gate still protects boot drive after the split'] }}"
+
+    # ========================================================================
+    # TEST 4: end-to-end — md member disks survive discovery AND get remapped
+    # via raid_setup's idempotency logic. This is the happy path Peter wanted.
+    # ========================================================================
+    - name: 'TEST 4: end-to-end — discovery + raid_setup adopt existing array'
+      block:
+        - name: 'NEW split: sdb/sdc available for discovery'
+          ansible.builtin.set_fact:
+            _protected_disks: [sda]
+            _md_member_disks: [sdb, sdc]
+            scsi_devices: >-
+              {{ scsi_all_devices_mock
+                 | rejectattr('name', 'in', _protected_disks)
+                 | list }}
+
+        - name: Discovery plans md0 from sdb+sdc (sdd ends up in a separate array; ignore for this test)
+          ansible.builtin.set_fact:
+            raid_arrays:
+              - name: md0
+                device: /dev/md0
+                level: 0
+                drives: [/dev/sdb, /dev/sdc]
+            mount_points:
+              - path: /hammerspace/hsvol0
+                device: /dev/md0
+                fstype: xfs
+                label: hsvol0
+                mount_opts: defaults,nofail,discard
+                is_raid: true
+
+        - name: Simulate raid_setup _array_md_lookup finding /dev/md127 for sdb
+          ansible.builtin.set_fact:
+            _array_md_lookup:
+              results:
+                - item: "{{ raid_arrays[0] }}"
+                  stdout: "/dev/md127"
+
+        - name: Compute _device_remap
+          ansible.builtin.set_fact:
+            _device_remap: >-
+              {{ dict(_array_md_lookup.results
+                      | map(attribute='item')
+                      | map(attribute='device')
+                      | zip(_array_md_lookup.results
+                            | map(attribute='stdout')
+                            | map('trim')
+                            | list))
+                 | dict2items
+                 | selectattr('value', 'ne', '')
+                 | items2dict }}
+
+        - name: Remap mount_points individually
+          ansible.builtin.set_fact:
+            mount_points: >-
+              {{ (mount_points | rejectattr('path', 'equalto', item.path) | list)
+                 + [ item | combine({'device': _device_remap[item.device]
+                                      | default(item.device)}) ] }}
+          loop: "{{ mount_points }}"
+          when: item.device in _device_remap
+
+        - name: 'TEST 4 ASSERT: mount_points.device now points at the real /dev/md127'
+          ansible.builtin.assert:
+            that:
+              - mount_points[0].device == '/dev/md127'
+              - mount_points[0].path == '/hammerspace/hsvol0'
+            fail_msg: |
+              End-to-end remap failed.
+              mount_points: {{ mount_points }}
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: discovery + raid_setup remap adopts /dev/md127 cleanly'] }}"
+      rescue:
+        - name: Record TEST 4 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 5: 2026-05-20 regression — /dev/mdN mounted at a DATA path
+    # (/hammerspace/*) must NOT cause its members to be classified as
+    # protected. scan_disks.sh now restricts the mount-walk to a
+    # SYSTEM-mountpoint allow-list; this test simulates the shell output
+    # under the old vs new behavior.
+    # ========================================================================
+    - name: 'TEST 5: md mounted at /hammerspace/* — members must NOT be protected'
+      block:
+        # Old behavior: walk all /proc/mounts, lsblk -nrpso resolves md127
+        # mounted at /hammerspace/hsvol0 to its members sdb+sdc → they
+        # incorrectly end up in _protected_disks.
+        - name: Simulate OLD shell output (walked all mounts)
+          ansible.builtin.set_fact:
+            _protected_disks_OLD:
+              - sda      # boot (correct)
+              - sdb      # md member, incorrectly marked (BUG)
+              - sdc      # md member, incorrectly marked (BUG)
+
+        # New behavior: only system mountpoints walked. /hammerspace/* is
+        # NOT in the allow-list → sdb/sdc are not added to _protected_disks.
+        - name: Simulate NEW shell output (system-only walk)
+          ansible.builtin.set_fact:
+            _protected_disks_NEW:
+              - sda      # boot, mounted at / (correct)
+            _md_member_disks_NEW:
+              - sdb      # informational
+              - sdc      # informational
+
+        - name: 'TEST 5 ASSERT: NEW behavior excludes only the boot disk'
+          ansible.builtin.assert:
+            that:
+              - _protected_disks_NEW == ['sda']
+              - _md_member_disks_NEW | sort == ['sdb', 'sdc']
+            fail_msg: |
+              NEW system-mount-only walk should yield protected=[sda]
+              and md-member=[sdb,sdc]. Got protected={{ _protected_disks_NEW }},
+              md-members={{ _md_member_disks_NEW }}.
+
+        - name: Apply rejectattr with NEW list to mock scsi_all_devices
+          ansible.builtin.set_fact:
+            scsi_devices_NEW: >-
+              {{ scsi_all_devices_mock
+                 | rejectattr('name', 'in', _protected_disks_NEW)
+                 | list }}
+
+        - name: 'TEST 5 ASSERT: sdb, sdc, sdd survive discovery; sda excluded'
+          ansible.builtin.assert:
+            that:
+              - scsi_devices_NEW | length == 3
+              - (scsi_devices_NEW | map(attribute='name') | list | sort) == ['sdb', 'sdc', 'sdd']
+            fail_msg: |
+              REGRESSION: with /dev/md127 mounted at /hammerspace/hsvol0, sdb
+              and sdc should still pass discovery. Got:
+              {{ scsi_devices_NEW | map(attribute='name') | list }}
+
+        - name: Record TEST 5 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 5: /dev/md127 mounted at /hammerspace/* — members survive discovery'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 5: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # TEST 6: Azure ephemeral RESOURCE DISK safety.
+    #
+    # On Azure VMs cloud-init formats and mounts the temporary resource disk
+    # (typically /dev/sdb) at /mnt (or /mnt/resource on some images). That
+    # disk is NOT durable — it is wiped on deallocate/redeploy — so it must
+    # never be RAIDed or mkfs'd. Before Azure support, /mnt was absent from
+    # the SYSTEM_MOUNTS allow-list, so a `storage_type: ssd|hdd` run on Azure
+    # would treat /dev/sdb as an ordinary unprotected /dev/sd* candidate.
+    #
+    # Two assertions:
+    #   a) the literal allow-list in files/scan_disks.sh still contains
+    #      /mnt and /mnt/resource (audit — stops a silent removal), and
+    #   b) with sdb resolved from /mnt, discovery keeps the real data disks
+    #      and drops only boot + resource disk.
+    # ========================================================================
+    - name: 'TEST 6: Azure ephemeral resource disk (/mnt) is protected'
+      block:
+        - name: Read the real scan_disks.sh allow-list
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../roles/nvme_discovery/files/scan_disks.sh"
+          register: _detect_src
+
+        # regex_search over the whole blob rather than splitlines: inside a
+        # YAML folded scalar a Jinja '\n' literal is not a newline, so a
+        # .split('\n') here silently yields a single element.
+        - name: Extract the SYSTEM_MOUNTS assignment
+          ansible.builtin.set_fact:
+            _system_mounts_line: >-
+              {{ (_detect_src.content | b64decode)
+                 | regex_search('SYSTEM_MOUNTS="[^"]*"') | default('', true) }}
+
+        - name: 'TEST 6 ASSERT (audit): /mnt and /mnt/resource are in SYSTEM_MOUNTS'
+          ansible.builtin.assert:
+            that:
+              - _system_mounts_line | length > 0
+              - "' /mnt ' in _system_mounts_line"
+              - "'/mnt/resource' in _system_mounts_line"
+            fail_msg: |
+              REGRESSION: the Azure ephemeral resource disk mountpoints were
+              removed from the SYSTEM_MOUNTS allow-list in
+              roles/nvme_discovery/files/scan_disks.sh. Without them a
+              storage_type: ssd|hdd run on Azure can mkfs/RAID /dev/sdb, the
+              non-durable temp disk. Line found: {{ _system_mounts_line }}
+
+        # Azure layout: sda = OS disk (/), sdb = resource disk (/mnt),
+        # sdc + sdd = attached premium/local data disks to be RAIDed.
+        - name: Simulate Azure protected walk (system mounts incl. /mnt)
+          ansible.builtin.set_fact:
+            _protected_disks_AZURE:
+              - sda      # OS disk, mounted at /
+              - sdb      # ephemeral resource disk, mounted at /mnt
+            scsi_all_devices_azure:
+              - {name: sda, device: /dev/sda, numa: 0, serial: OSDISK, model: "Virtual Disk", pcie_address: "N/A", rotational: 0}
+              - {name: sdb, device: /dev/sdb, numa: 0, serial: RESRC1, model: "Virtual Disk", pcie_address: "N/A", rotational: 0}
+              - {name: sdc, device: /dev/sdc, numa: 0, serial: DATA01, model: "Virtual Disk", pcie_address: "N/A", rotational: 0}
+              - {name: sdd, device: /dev/sdd, numa: 0, serial: DATA02, model: "Virtual Disk", pcie_address: "N/A", rotational: 0}
+
+        - name: Apply rejectattr with the Azure protected list
+          ansible.builtin.set_fact:
+            scsi_devices_AZURE: >-
+              {{ scsi_all_devices_azure
+                 | rejectattr('name', 'in', _protected_disks_AZURE)
+                 | list }}
+
+        - name: 'TEST 6 ASSERT: only sdc + sdd reach discovery'
+          ansible.builtin.assert:
+            that:
+              - (scsi_devices_AZURE | map(attribute='name') | list | sort) == ['sdc', 'sdd']
+              - "'sdb' not in (scsi_devices_AZURE | map(attribute='name') | list)"
+            fail_msg: |
+              Azure resource disk sdb must be excluded from discovery and the
+              two data disks must survive. Got:
+              {{ scsi_devices_AZURE | map(attribute='name') | list }}
+
+        - name: Record TEST 6 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 6: Azure ephemeral resource disk (/mnt) excluded; data disks survive'] }}"
+      rescue:
+        - ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 6: ' ~ (ansible_failed_result.msg | default('unknown'))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          PROTECTED-VS-MD-SPLIT REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

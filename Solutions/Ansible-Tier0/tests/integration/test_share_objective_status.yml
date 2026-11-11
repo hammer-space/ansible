@@ -1,0 +1,414 @@
+---
+# Tests for share objective application and Tier 0 placement.
+#
+# Field report (2026-09-18): a write from a Tier 0 node (A100) went to the
+# DSX first and was copied to the node's local NVMe afterwards. With only the
+# default objectives that is the documented behaviour — new files spread over
+# every volume with free space. Nothing in the playbook applied a placement
+# objective to the share, and the one task that CAN apply objectives failed
+# silently when it was given a name the cluster did not have.
+#
+# Two defects pinned:
+#
+#   1. share_apply_objective.yml never checked the HTTP status of the
+#      objective-set POST. A 4xx has no Location header, so the task poll is
+#      skipped, the only failure gate (task status FAILED/CANCELLED) never
+#      fires, and the final task prints "applied". The objective is silently
+#      not applied.
+#   2. Joining a volume group placed nothing. Hammerspace auto-creates
+#      place-on-<group>; tier0_place_on_group.yml applies it to the shares.
+#      Misconfiguration must be a hard failure — a silent skip reproduces
+#      the field symptom exactly.
+#
+# The live API calls cannot run in CI, so these cover the registered-result
+# shapes and the structural guarantees.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_share_objective_status.yml \
+#       -i localhost, -c local
+
+- name: Share objective status + Tier 0 placement tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+    _role_tasks: "{{ playbook_dir }}/../../roles/hammerspace_integration/tasks"
+
+  tasks:
+    # ========================================================================
+    # TEST 1: a 404 from objective-set must be caught by the status gate.
+    #
+    # Reproduces the registered-result shape of the POST when the objective
+    # name is wrong: a JSON error body, the code on the last line, and NO
+    # Location header. Both gates are evaluated exactly as the task file
+    # evaluates them.
+    # ========================================================================
+    - name: 'TEST 1: HTTP 404 from objective-set is not silently accepted'
+      block:
+        - name: Simulate the registered POST result for an unknown objective
+          ansible.builtin.set_fact:
+            objective_apply_raw:
+              rc: 0
+              stdout: '{"status":404,"error":"Not Found","message":"Objective not found: place-on-tier0-nvme"}
+
+                404'
+              stdout_lines:
+                - '{"status":404,"error":"Not Found","message":"Objective not found: place-on-tier0-nvme"}'
+                - ''
+                - '404'
+            objective_location_raw:
+              stdout: ''
+
+        - name: Parse exactly as share_apply_objective.yml does
+          ansible.builtin.set_fact:
+            objective_apply_result:
+              status: "{{ (objective_apply_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+              json: "{{ ((objective_apply_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json }}"
+              location: "{{ objective_location_raw.stdout | default('') }}"
+
+        - name: Evaluate both gates
+          ansible.builtin.set_fact:
+            # The new status gate.
+            _t1_status_gate: "{{ objective_apply_result.status | int not in [200, 201, 202] }}"
+            # The poll is skipped when there is no Location — so the old
+            # task-status gate had nothing to read.
+            _t1_poll_would_run: "{{ objective_apply_result.location | default('') | length > 0 }}"
+
+        - name: 'TEST 1 ASSERT: status gate fires, poll gate alone would not'
+          ansible.builtin.assert:
+            that:
+              - objective_apply_result.status | int == 404
+              - _t1_status_gate | bool
+              - not (_t1_poll_would_run | bool)
+              - objective_apply_result.json.message is search('Objective not found')
+            fail_msg: |
+              REGRESSION: a rejected objective-set is not caught.
+              status: {{ objective_apply_result.status }}
+              status gate: {{ _t1_status_gate }}  poll would run: {{ _t1_poll_would_run }}
+              Without the status gate the poll is skipped (no Location), the
+              task-status gate never fires, and "applied" is printed for an
+              objective the cluster does not have.
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: 404 from objective-set trips the status gate; the old task-status gate alone would have passed'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2: a 202 with a Location still goes to the poll (no false positive).
+    # ========================================================================
+    - name: 'TEST 2: HTTP 202 passes the status gate and reaches the poll'
+      block:
+        - name: Simulate an accepted POST
+          ansible.builtin.set_fact:
+            objective_apply_raw:
+              rc: 0
+              stdout_lines:
+                - '{"_type":"TASK","uoid":{"uuid":"abc"},"status":"EXECUTING"}'
+                - ''
+                - '202'
+            objective_location_raw:
+              stdout: 'https://anvil:8443/mgmt/v1.2/rest/tasks/abc'
+
+        - name: Parse exactly as share_apply_objective.yml does
+          ansible.builtin.set_fact:
+            objective_apply_result:
+              status: "{{ (objective_apply_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+              location: "{{ objective_location_raw.stdout | default('') }}"
+
+        - name: 'TEST 2 ASSERT: accepted request is not rejected'
+          ansible.builtin.assert:
+            that:
+              - objective_apply_result.status | int in [200, 201, 202]
+              - objective_apply_result.location | length > 0
+            fail_msg: "REGRESSION: a 202 with a Location header would be reported as a failure."
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: 202 + Location passes the gate and proceeds to the task poll'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3 (audit): share_apply_objective.yml structural guarantees
+    # ========================================================================
+    - name: 'TEST 3: audit share_apply_objective.yml'
+      block:
+        - name: Read the task file
+          ansible.builtin.slurp:
+            src: "{{ _role_tasks }}/share_apply_objective.yml"
+          register: _sao_src
+
+        - name: Decode
+          ansible.builtin.set_fact:
+            _sao: "{{ _sao_src.content | b64decode }}"
+
+        # The POST task, from its name to the next task boundary.
+        - name: Isolate the objective-set POST task
+          ansible.builtin.set_fact:
+            _sao_post: >-
+              {{ _sao | regex_search('- name: "Apply objective(?:.|\n)*?(?=\n- name:)') }}
+
+        - name: 'TEST 3 ASSERT: POST is no_log + failed_when false, and a status gate follows'
+          ansible.builtin.assert:
+            that:
+              # The command line holds the password.
+              - "_sao_post is search('no_log: true')"
+              # A no_log task must never be the one that fails the play.
+              - "_sao_post is search('failed_when: false')"
+              # A rejected POST must be a hard failure...
+              - _sao is search('objective_apply_result\.status \| int not in \[200, 201, 202\]')
+              # ...that prints the response body (the only record, since the
+              # curl task is censored).
+              - _sao is search('objective_apply_raw\.stdout_lines \| default\(\[\]\)\)\[:-1\]')
+              # 2026-09-03 (f): never -o /dev/stdout with -w.
+              - _sao is not search('-o /dev/stdout')
+              # Cluster-wide operation: every task runs once, not per host.
+              - >-
+                (_sao | regex_findall('^- name:', multiline=True) | length)
+                == (_sao | regex_findall('^  run_once: true', multiline=True) | length)
+            fail_msg: |
+              REGRESSION in share_apply_objective.yml. Required:
+                - the POST task carries no_log: true AND failed_when: false
+                - a fail task gated on objective_apply_result.status | int not in [200, 201, 202]
+                - that fail task prints the response body
+                - no `-o /dev/stdout`
+                - run_once: true on every task ({{ _sao | regex_findall('^- name:', multiline=True) | length }} tasks,
+                  {{ _sao | regex_findall('^  run_once: true', multiline=True) | length }} run_once)
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: share_apply_objective.yml — censored POST, un-censored status gate with body, run_once throughout'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 4: objective / share derivation in tier0_place_on_group.yml
+    # ========================================================================
+    - name: 'TEST 4: place-on objective and share list are derived correctly'
+      block:
+        - name: Derive with defaults (group set, shares from hammerspace_shares)
+          ansible.builtin.set_fact:
+            _t4_objective: >-
+              {{ hammerspace_tier0_place_on_objective
+                 | default('place-on-' ~ (hammerspace_volume_group | default('')), true) }}
+            _t4_shares: >-
+              {{ hammerspace_tier0_place_on_shares
+                 | default(hammerspace_shares | default([]) | map(attribute='name') | list, true) }}
+          vars:
+            hammerspace_volume_group: "tier0-nvme"
+            hammerspace_shares:
+              - {name: checkpoints, path: /checkpoints}
+              - {name: models, path: /models}
+
+        - name: Derive with explicit overrides (empty objective string must NOT override)
+          ansible.builtin.set_fact:
+            _t4_objective_override: >-
+              {{ hammerspace_tier0_place_on_objective
+                 | default('place-on-' ~ (hammerspace_volume_group | default('')), true) }}
+            _t4_shares_override: >-
+              {{ hammerspace_tier0_place_on_shares
+                 | default(hammerspace_shares | default([]) | map(attribute='name') | list, true) }}
+          vars:
+            hammerspace_volume_group: "tier0-nvme"
+            hammerspace_tier0_place_on_objective: ""
+            hammerspace_tier0_place_on_shares: ["existing-share"]
+            hammerspace_shares:
+              - {name: checkpoints, path: /checkpoints}
+
+        - name: Evaluate the misconfiguration gates
+          ansible.builtin.set_fact:
+            # No group AND no explicit objective -> must fail.
+            _t4_gate_no_group: >-
+              {{ ('' | length == 0) and ('' | length == 0) }}
+            # No group but explicit objective -> allowed.
+            _t4_gate_explicit_ok: >-
+              {{ not (('' | length == 0) and ('place-on-custom' | length == 0)) }}
+
+        - name: 'TEST 4 ASSERT: derivation and overrides'
+          ansible.builtin.assert:
+            that:
+              - _t4_objective == 'place-on-tier0-nvme'
+              - _t4_shares == ['checkpoints', 'models']
+              - _t4_objective_override == 'place-on-tier0-nvme'
+              - _t4_shares_override == ['existing-share']
+              - _t4_gate_no_group | bool
+              - _t4_gate_explicit_ok | bool
+            fail_msg: |
+              REGRESSION in Tier 0 placement derivation.
+              objective: {{ _t4_objective }} (expected place-on-tier0-nvme)
+              shares:    {{ _t4_shares }} (expected [checkpoints, models])
+              override objective: {{ _t4_objective_override }} — an EMPTY string must fall back to the derived name
+              override shares:    {{ _t4_shares_override }} (expected [existing-share])
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: place-on-<group> derived from hammerspace_volume_group; shares from hammerspace_shares; overrides honoured; empty override ignored'] }}"
+      rescue:
+        - name: Record TEST 4 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 5 (audit): tier0_place_on_group.yml is wired, gated, and fails hard
+    # ========================================================================
+    - name: 'TEST 5: audit tier0_place_on_group.yml and its wiring'
+      block:
+        - name: Read the files
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          loop:
+            - "{{ _role_tasks }}/tier0_place_on_group.yml"
+            - "{{ _role_tasks }}/main.yml"
+            - "{{ playbook_dir }}/../../vars/main.yml"
+            - "{{ playbook_dir }}/../../VARIABLE_REFERENCE.md"
+          register: _t5_src
+
+        - name: Decode
+          ansible.builtin.set_fact:
+            _t5_po: "{{ _t5_src.results[0].content | b64decode }}"
+            _t5_main: "{{ _t5_src.results[1].content | b64decode }}"
+            _t5_vars: "{{ _t5_src.results[2].content | b64decode }}"
+            _t5_ref: "{{ _t5_src.results[3].content | b64decode }}"
+
+        - name: Isolate the include in main.yml
+          ansible.builtin.set_fact:
+            _t5_include: >-
+              {{ _t5_main | regex_search('- name: [^\n]*\n  ansible.builtin.include_tasks: tier0_place_on_group.yml\n(?:  [^\n]*\n)*') }}
+
+        - name: 'TEST 5 ASSERT: wiring, gating, hard failures'
+          ansible.builtin.assert:
+            that:
+              # Wired into the role, gated on the flag, AFTER share creation.
+              - _t5_include | length > 0
+              - _t5_include is search('hammerspace_tier0_place_on_group \| default\(false\) \| bool')
+              - "_t5_main.index('include_tasks: create_share.yml') < _t5_main.index('include_tasks: tier0_place_on_group.yml')"
+              # Cluster-wide: one run, not one per host.
+              - "_t5_po is search('run_once: true')"
+              # Nothing is CREATED — the group's own objective is looked up...
+              - _t5_po is search('/objectives/\{\{ _t0po_objective \| urlencode \}\}')
+              - _t5_po is not search('-X POST[^\n]*objectives"')
+              # ...and a miss is a hard failure, not a skip.
+              - _t5_po is search('_t0po_obj_status \| int != 200')
+              # Misconfiguration is a hard failure.
+              - _t5_po is search('hammerspace_volume_group \| default\(.*\)\) \| length == 0')
+              - _t5_po is search('_t0po_shares \| length == 0')
+              # The lookup is censored and cannot fail the play itself.
+              - "_t5_po | regex_search('- name: \"Look up objective(?:.|\\n)*?(?=\\n    - name:)') is search('no_log: true')"
+              - "_t5_po | regex_search('- name: \"Look up objective(?:.|\\n)*?(?=\\n    - name:)') is search('failed_when: false')"
+              # Application goes through the (now status-checked) shared task.
+              - "_t5_po is search('include_tasks: share_apply_objective.yml')"
+              # Off by default and documented.
+              - "_t5_vars is search('^hammerspace_tier0_place_on_group: false', multiline=True)"
+              - _t5_ref is search('hammerspace_tier0_place_on_group')
+            fail_msg: |
+              REGRESSION in tier0_place_on_group.yml wiring. Required:
+                - main.yml includes it, gated on hammerspace_tier0_place_on_group, after create_share.yml
+                - run_once
+                - GET /objectives/<name> (never POST /objectives — nothing is created)
+                - hard failure on lookup != 200, on empty group, on empty share list
+                - lookup task no_log + failed_when false
+                - include_tasks: share_apply_objective.yml
+                - vars/main.yml default false; VARIABLE_REFERENCE.md documents it
+
+        - name: Record TEST 5 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 5: tier0_place_on_group.yml wired after shares, run_once, GET-only, hard failures, documented'] }}"
+      rescue:
+        - name: Record TEST 5 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 5: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 6: the ambiguity guard. The join handles several volume groups
+    # (per-AZ group_vars); a SHARE objective cannot — it is cluster-wide and
+    # names one group. So a multi-group run must fail rather than confine the
+    # share to one AZ's volumes.
+    # ========================================================================
+    - name: 'TEST 6: a multi-group run fails unless the objective is explicit'
+      block:
+        - name: Resolve groups exactly as tier0_place_on_group.yml does
+          ansible.builtin.set_fact:
+            _t6_one: >-
+              {{ ['tier0-nvme', 'tier0-nvme'] | map('string') | map('trim')
+                 | reject('equalto', '') | unique | sort | list }}
+            _t6_many: >-
+              {{ ['tier0-az2', 'tier0-az1', 'tier0-az2'] | map('string') | map('trim')
+                 | reject('equalto', '') | unique | sort | list }}
+
+        - name: Evaluate the guard for each case
+          ansible.builtin.set_fact:
+            # when: _t0po_groups | length > 1 and no explicit objective
+            _t6_gate_one: "{{ (_t6_one | length > 1) and (('' | length) == 0) }}"
+            _t6_gate_many: "{{ (_t6_many | length > 1) and (('' | length) == 0) }}"
+            _t6_gate_many_explicit: >-
+              {{ (_t6_many | length > 1)
+                 and (('place-on-tier0-all' | length) == 0) }}
+
+        - name: 'TEST 6 ASSERT: fires only on ambiguity, and the escape works'
+          ansible.builtin.assert:
+            that:
+              # One group (however many hosts name it) — proceed.
+              - _t6_one == ['tier0-nvme']
+              - not (_t6_gate_one | bool)
+              # Two groups, no explicit objective — hard failure.
+              - "_t6_many == ['tier0-az1', 'tier0-az2']"
+              - _t6_gate_many | bool
+              # Two groups, objective named explicitly — proceed.
+              - not (_t6_gate_many_explicit | bool)
+            fail_msg: |
+              REGRESSION in the share-objective ambiguity guard.
+              one: {{ _t6_one }} gate={{ _t6_gate_one }} (expected false)
+              many: {{ _t6_many }} gate={{ _t6_gate_many }} (expected true)
+              many + explicit objective: {{ _t6_gate_many_explicit }} (expected false)
+              Applying place-on-<first group> to a cluster-wide share would
+              confine it to one AZ's volumes and silently exclude the rest;
+              failing on every multi-AZ run would make the flag unusable.
+
+        - name: Record TEST 6 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 6: ambiguity guard — fires on 2+ groups, not on one, and is escapable with an explicit objective'] }}"
+      rescue:
+        - name: Record TEST 6 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 6: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          SHARE OBJECTIVE STATUS + TIER 0 PLACEMENT TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

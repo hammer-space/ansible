@@ -1,0 +1,53 @@
+---
+# Serialized Hammerspace Integration (Option A: serial play).
+# Imported by site.yml.
+#
+# When hammerspace_serial > 0, this play processes N nodes at a time for
+# Hammerspace API integration. Prevents overwhelming Anvil with concurrent
+# node registrations and volume adds (e.g., 10+ nodes x 4 volumes).
+#
+# Usage:
+#   vars/main.yml:   hammerspace_serial: 2    (process 2 nodes at a time)
+#   command line:    -e hammerspace_serial=2
+#
+# When hammerspace_serial is 0 (default), this play is skipped and integration
+# runs inline in plays/storage.yml (all hosts in parallel, original behavior).
+
+- name: Hammerspace Integration (serialized)
+  hosts: storage_servers
+  become: true
+  gather_facts: false
+  serial: "{{ hammerspace_serial | default(0) }}"
+
+  vars_files:
+    - ../vars/main.yml
+
+  pre_tasks:
+    # vars/main.yml defines repo_root = "{{ playbook_dir }}/..", which handles
+    # the plays/-subdirectory resolution. See vars/main.yml header for context.
+    - name: Load vault variables (if available)
+      ansible.builtin.include_vars:
+        file: "{{ repo_root }}/vars/vault.yml"
+      failed_when: false
+      no_log: true
+
+    - name: Require hammerspace_api_host (set with -e hammerspace_api_host=<anvil-ip>)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: require_api_host
+      tags: [always]
+
+    # Azure Key Vault (opt-in) — overrides vars/vault.yml when set. Must
+    # resolve BEFORE anything authenticates against the Anvil.
+    - name: Retrieve Hammerspace password from Azure Key Vault (optional)
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: keyvault_password
+      when: (hammerspace_keyvault_uri | default('')) | length > 0
+
+  roles:
+    - role: hammerspace_integration
+      when:
+        - hammerspace_api_host is defined
+        - (hammerspace_serial | default(0) | int) > 0
+      tags: [hammerspace, integration]

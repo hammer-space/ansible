@@ -1,0 +1,35 @@
+- kernel upgrade
+- server block device read a head 1MB
+- client mount point read a head 1MB
+- sunrpc module parameter pool_mode = pernode 
++ check nvme drives and define the boot drive 
++ numa node nvme match
++ /hsvol0 => /hammerspace/hsvol0, hammerspace-hsvol0
++ /dev/md0p1 ? /dev/md0
+- deny root umount. or create README
+- default fault domains
+- --create-placement-objectives node and volumes, low-threshold 90, high-threshold 95 --skip-configuration-test, --skip-performance-test flag enable/disable, az${ser}:$hostname:$vol, additional-ip-add 
+if az there, no need for volume group
+
+# plsm221h-01 latest # grep . /sys/class/nvme/nvme*/device/numa_node
+# /sys/class/nvme/nvme0/device/numa_node:1
+# /sys/class/nvme/nvme1/device/numa_node:1
+# /sys/class/nvme/nvme2/device/numa_node:1
+# /sys/class/nvme/nvme3/device/numa_node:1
+# /sys/class/nvme/nvme4/device/numa_node:0
+# /sys/class/nvme/nvme5/device/numa_node:0
+# /sys/class/nvme/nvme6/device/numa_node:0
+# /sys/class/nvme/nvme7/device/numa_node:0
+# /sys/class/nvme/nvme8/device/numa_node:0
+# /sys/class/nvme/nvme9/device/numa_node:0
+
++ persist mdadm /etc/mdadm.conf
++ fstab entry should be UUID based
+- 
+
+# # cat /etc/fstab
+# #
+# #
+# /etc/fstab
+
+# UUID=cb87a349-b9ad-4f6f-8ad4-1e46004133a /boot

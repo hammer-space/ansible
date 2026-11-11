@@ -1,0 +1,270 @@
+---
+# Regression test: read-only detection must still RUN under `--check`.
+#
+# Reported 2026-08-26 (second report on the same host). A dry run of site.yml
+# against an Azure HBv3 node aborted at the boot-drive safety gate with all four
+# classification lists empty:
+#
+#   Disk classification (boot-drive safety):
+#     STRICT protected (...):  (none — detection returned empty)
+#     Existing md array members:  (none)
+#     LVM PV disks:  (none)
+#     Primary boot disk:
+#   TASK [nvme_discovery : FAIL if no protected disks were detected ...]
+#   ok=28  changed=4  unreachable=0  failed=1
+#
+# Cause: command / shell / script do NOT support check mode, so Ansible SKIPS
+# them under `--check`. The detection tasks therefore never ran, every list came
+# back empty, and the gate — which exists to catch a REAL empty result — fired
+# on a SIMULATED one. The playbook could not be dry-run at all.
+#
+# Fix: `check_mode: false` on the read-only detection tasks (they only read
+# /sys, /proc, findmnt, pvs, lscpu — no side effects), matching the idiom
+# already used in roles/di/ and roles/filesystem_setup/.
+#
+# There is a second, subtler trap covered here. Two kinds of "skipped" register
+# DIFFERENT shapes:
+#
+#   when-skipped        {skipped: true, changed: false}          <- NO stdout key
+#   check-mode-skipped  {skipped: true, stdout: '', rc: 0, ...}  <- stdout EXISTS, empty
+#
+# So the project's standing `result.attr is defined` guard is necessary but NOT
+# sufficient for check-mode skips: `stdout is defined` is TRUE and the fallback
+# never fires, which is why the failure message's diagnostics block rendered as
+# a blank line and the report could not be diagnosed from the log.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_check_mode_detection.yml \
+#       -i localhost, -c local
+
+- name: Check-mode detection regression tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+
+  tasks:
+    # Gathered here rather than inside TEST 3's block: a block-level `when` is
+    # evaluated BEFORE the block's own tasks run, so gathering inside it would
+    # leave ansible_system undefined and silently skip TEST 3 on Linux too.
+    - name: Gather platform facts for the Linux gate
+      ansible.builtin.setup:
+        gather_subset: ['!all', '!min', 'platform']
+
+    # ========================================================================
+    # TEST 1: document the two skip shapes. Pure data — runs everywhere, and
+    # it is the reason `is defined` alone is not a sufficient guard.
+    # ========================================================================
+    - name: 'TEST 1: when-skipped vs check-mode-skipped register different shapes'
+      block:
+        - name: Simulate both skip shapes
+          ansible.builtin.set_fact:
+            _when_skipped: {"skipped": true, "changed": false}
+            _check_skipped: {"skipped": true, "changed": false, "stdout": "",
+                             "stderr": "", "rc": 0, "stdout_lines": []}
+
+        - name: 'TEST 1 ASSERT: only the check-mode shape carries an empty stdout'
+          ansible.builtin.assert:
+            that:
+              - _when_skipped.stdout is not defined
+              - _check_skipped.stdout is defined
+              - _check_skipped.stdout | length == 0
+            fail_msg: |
+              The two skip shapes are no longer distinguishable as documented.
+              Re-derive the guard in detect_boot_device.yml before relying on it.
+
+        - name: 'TEST 1 ASSERT: `is defined` alone does NOT catch a check-mode skip'
+          ansible.builtin.assert:
+            that:
+              # This is the bug: the guard passes, so the fallback never fires
+              # and the diagnostics block renders blank.
+              - (_check_skipped.stdout if _check_skipped.stdout is defined
+                 else 'FALLBACK') == ''
+              # The length-aware guard used in detect_boot_device.yml is correct
+              # for BOTH shapes.
+              - (_check_skipped.stdout if (_check_skipped.stdout is defined
+                 and _check_skipped.stdout | length > 0) else 'FALLBACK') == 'FALLBACK'
+              - (_when_skipped.stdout if (_when_skipped.stdout is defined
+                 and _when_skipped.stdout | length > 0) else 'FALLBACK') == 'FALLBACK'
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: check-mode skip registers an empty stdout; length-aware guard handles both shapes'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2 (audit): every read-only detection task in the discovery path
+    # must carry `check_mode: false`. This is the audit that would have caught
+    # the bug — it is a property of the source, so it runs on any platform.
+    # ========================================================================
+    - name: 'TEST 2: audit check_mode: false on read-only detection tasks'
+      block:
+        - name: Read the discovery task files
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../roles/nvme_discovery/tasks/{{ item }}"
+          register: _srcs
+          loop:
+            - detect_boot_device.yml
+            - cpu_optimization.yml
+            - main.yml
+
+        - name: Count registered detection tasks vs check_mode declarations
+          ansible.builtin.set_fact:
+            _audit: >-
+              {{ _audit | default([]) + [{
+                   'file': item.item,
+                   'registers': (item.content | b64decode
+                                 | regex_findall('\n\s+register:\s+(\S+)') | length),
+                   'check_modes': (item.content | b64decode
+                                 | regex_findall('\n\s+check_mode:\s+false') | length)
+                 }] }}
+          loop: "{{ _srcs.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: 'TEST 2 ASSERT: detect_boot_device.yml guards both of its tasks'
+          ansible.builtin.assert:
+            that:
+              - (_audit | selectattr('file', 'equalto', 'detect_boot_device.yml')
+                 | map(attribute='check_modes') | first) == 2
+            fail_msg: |
+              REGRESSION: detect_boot_device.yml must carry `check_mode: false` on
+              BOTH the scan_disks.sh script task and the diagnostics shell task.
+              Without it, `--check` skips them, every classification list comes
+              back empty and the boot-drive gate aborts the dry run.
+              Found: {{ _audit | selectattr('file', 'equalto', 'detect_boot_device.yml') | list }}
+
+        - name: 'TEST 2 ASSERT: cpu_optimization.yml guards all 5 detection tasks'
+          ansible.builtin.assert:
+            that:
+              - (_audit | selectattr('file', 'equalto', 'cpu_optimization.yml')
+                 | map(attribute='check_modes') | first) == 5
+            fail_msg: |
+              REGRESSION: all 5 CPU detection tasks in cpu_optimization.yml need
+              `check_mode: false`. Under --check they register stdout: '', and
+              "Set CPU facts" then derives a 0-core / 0-NUMA-node machine and
+              mis-plans the RAID layout for the dry run.
+              Found: {{ _audit | selectattr('file', 'equalto', 'cpu_optimization.yml') | list }}
+
+        - name: 'TEST 2 ASSERT: main.yml guards both device-discovery scans'
+          ansible.builtin.assert:
+            that:
+              - (_audit | selectattr('file', 'equalto', 'main.yml')
+                 | map(attribute='check_modes') | first) >= 2
+            fail_msg: |
+              REGRESSION: the NVMe and SCSI discovery scans in main.yml need
+              `check_mode: false`, otherwise a dry run reports
+              "Discovery produced 0 RAID arrays".
+              Found: {{ _audit | selectattr('file', 'equalto', 'main.yml') | list }}
+
+        # cab3ef3 moved detection to the `script` module, which resolves files/
+        # from the ROLE CONTEXT of the including task. A raw-path
+        # `include_tasks: ../nvme_discovery/tasks/detect_boot_device.yml` from
+        # another role leaves that context pointing at the WRONG role, and the
+        # script is searched for in <that role>/files/ — a hard failure. This
+        # actually shipped in precheck and would have broken the next run that
+        # got past discovery.
+        - name: 'TEST 2 ASSERT: no role raw-path includes of another role''s tasks'
+          ansible.builtin.assert:
+            that:
+              - _cross_role_includes | length == 0
+            fail_msg: |
+              REGRESSION: {{ _cross_role_includes | length }} cross-role
+              raw-path include(s) found. detect_boot_device.yml runs
+              `script: scan_disks.sh`, which only resolves with its OWN role's
+              context — use `include_role` + `tasks_from:` instead:
+              {{ _cross_role_includes | join('\n') }}
+          vars:
+            # [.][.] rather than \.\. so the pattern survives YAML + Jinja +
+            # shell quoting without a stack of backslashes. Covers BOTH
+            # include_tasks and import_tasks, both the ../<role>/tasks/ and
+            # roles/<role>/tasks/ spellings, across roles/, plays/ and the
+            # tests themselves. The trailing grep -v drops commented-out
+            # examples — this very file documents the bad form in a comment.
+            _audit_cmd: >-
+              cd {{ (playbook_dir ~ '/../..') | quote }} &&
+              grep -rnE
+              "(include_tasks|import_tasks):.*([.][.]/[a-z_]*|roles/[a-z_]*)/tasks/"
+              roles/ plays/ tests/integration/
+              | grep -v ":[0-9]*: *#" || true
+            _cross_role_includes: >-
+              {{ lookup('ansible.builtin.pipe', _audit_cmd)
+                 | split('\n') | reject('equalto', '') | list }}
+
+        - name: Record TEST 2 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: audit — all read-only detection tasks carry check_mode: false'] }}"
+      rescue:
+        - name: Record TEST 2 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 3: end-to-end — run the real detection under check mode and confirm
+    # the script actually EXECUTED. Linux only: it needs a real /sys tree to
+    # produce output. The point is not what it found, but that it ran at all.
+    # ========================================================================
+    - name: 'TEST 3: detection executes under --check (Linux only)'
+      when: ansible_system | default('') == 'Linux'
+      block:
+        - name: Run the real scan under simulated check mode
+          ansible.builtin.script:
+            cmd: "{{ playbook_dir }}/../../roles/nvme_discovery/files/scan_disks.sh"
+          register: _cm_scan
+          changed_when: false
+          check_mode: false
+
+        - name: 'TEST 3 ASSERT: the task ran rather than being skipped'
+          ansible.builtin.assert:
+            that:
+              - _cm_scan.skipped is not defined or not _cm_scan.skipped
+              - _cm_scan.stdout is defined
+              - _cm_scan.stdout_lines | select('match', '^PROTECTED ') | list | length > 0
+            fail_msg: |
+              REGRESSION: scan_disks.sh did not execute under check mode.
+              `check_mode: false` is missing or ineffective — the dry run will
+              abort at the boot-drive safety gate.
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: scan_disks.sh executes (not skipped) under check mode'] }}"
+      rescue:
+        - name: Record TEST 3 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          CHECK-MODE DETECTION REGRESSION TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

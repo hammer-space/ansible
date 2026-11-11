@@ -1,0 +1,27 @@
+#cloud-config
+write_files:
+  - path: /etc/tier0-bootstrap.conf
+    permissions: '0600'
+    content: |
+      ANSIBLE_REPO_URL="${ansible_repo_url}"
+      ANSIBLE_REPO_BRANCH="main"
+      HAMMERSPACE_API_HOST="${hammerspace_api_host}"
+      HAMMERSPACE_API_USER="admin"
+      HAMMERSPACE_API_PASSWORD="${hammerspace_api_password}"
+      DEPLOY_DI="${deploy_di}"
+      DI_DEPLOYMENT_TYPE="container"
+      DI_IMAGE_SOURCE="build"
+
+runcmd:
+  - |
+    set -e
+    source /etc/tier0-bootstrap.conf
+    export ANSIBLE_REPO_URL ANSIBLE_REPO_BRANCH
+    export HAMMERSPACE_API_HOST HAMMERSPACE_API_USER HAMMERSPACE_API_PASSWORD
+    export DEPLOY_DI DI_DEPLOYMENT_TYPE DI_IMAGE_SOURCE
+    curl -fsSL "$${ANSIBLE_REPO_URL%.git}/raw/$${ANSIBLE_REPO_BRANCH}/cloud-init/tier0-bootstrap.sh" \
+      -o /tmp/tier0-bootstrap.sh
+    chmod +x /tmp/tier0-bootstrap.sh
+    /tmp/tier0-bootstrap.sh
+
+final_message: "Tier 0 bootstrap completed after $UPTIME seconds"

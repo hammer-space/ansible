@@ -1,0 +1,272 @@
+---
+# Remove a set of volumes from every volume group that contains them.
+#
+# The inverse of volume_group_join.yml, and the step that has to happen BEFORE
+# the volumes themselves are deleted — otherwise the groups are left holding
+# references to storage that no longer exists.
+#
+# Input:
+#   _vgl_volumes  list of volume names to remove (exact names as Hammerspace
+#                 knows them, e.g. "AZ1:node-1::/nvme/tier0")
+#
+# CONTRACT — this task file will NOT:
+#   - delete a volume group, even if removing these volumes empties it
+#   - remove any volume that is not in _vgl_volumes
+#   - touch groups that contain none of the listed volumes
+#   - touch any data on any host
+# It removes only the named volumes, from only the groups that hold them.
+#
+# Like the join, this is run_once with a single read-modify-write per affected
+# group: hammerspace_integration-style parallel execution would otherwise race
+# and let one host's PUT reinstate volumes another host just removed.
+
+- name: Remove volumes from any volume group that contains them
+  when: (_vgl_volumes | default([])) | length > 0
+  run_once: true
+  delegate_to: localhost
+  become: false
+  block:
+    - name: List all volume groups
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "{{ hs_api_url }}/volume-groups"
+      register: _vgl_all_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Parse the volume group list
+      ansible.builtin.set_fact:
+        _vgl_all: "{{ (_vgl_all_raw.stdout | default('[]') | trim | default('[]', true)) | from_json }}"
+
+    # `keep` is built by REJECTING the entries being removed from the original
+    # list, not by selecting the ones to retain. Two reasons:
+    #
+    #   - order is preserved, so the PUT does not reshuffle the group;
+    #   - entries with no storageVolume.name survive. Not every location names
+    #     a storage volume, and a bare rejectattr('storageVolume.name', ...)
+    #     raises "'dict object' has no attribute 'storageVolume'" on a group
+    #     that is perfectly valid. Such an entry is by definition not a volume
+    #     being decommissioned, so it must be kept.
+    #
+    # `_remove_locs` filters on 'defined' FIRST for the same reason.
+    - name: Build the per-group removal plan
+      ansible.builtin.set_fact:
+        _vgl_plan: >-
+          {{ (_vgl_plan | default([])) + [{
+               'name': item.name,
+               'uuid': item.uoid.uuid | default(''),
+               'obj': item,
+               'keep': _vgl_locs | reject('in', _vgl_remove_locs) | list,
+               'remove': _vgl_remove_locs
+                         | selectattr('storageVolume.name', 'defined')
+                         | map(attribute='storageVolume.name') | list
+             }] }}
+      vars:
+        _vgl_locs: "{{ item.expressions[0].locations | default([]) }}"
+        _vgl_remove_locs: >-
+          {{ (item.expressions[0].locations | default([]))
+             | selectattr('storageVolume.name', 'defined')
+             | selectattr('storageVolume.name', 'in', _vgl_volumes) | list }}
+      loop: "{{ _vgl_all | selectattr('expressions', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.name | default('?') }}"
+
+    - name: Narrow to groups that actually change
+      ansible.builtin.set_fact:
+        _vgl_changes: "{{ (_vgl_plan | default([])) | selectattr('remove', 'ne', []) | list }}"
+
+    - name: Report when no volume group holds these volumes
+      ansible.builtin.debug:
+        msg: >-
+          None of the {{ _vgl_volumes | length }} volume(s) being decommissioned
+          are members of any volume group — nothing to remove.
+      when: _vgl_changes | length == 0
+
+    # Not a silent skip. If a group cannot be addressed, its volumes stay in
+    # the group and are then deleted underneath it — the dangling-reference
+    # state this whole file exists to prevent. Stop instead.
+    - name: Fail if an affected volume group has no UUID
+      ansible.builtin.fail:
+        msg: |
+          Volume group '{{ item.name }}' holds volumes being decommissioned but
+          the API returned it without a uoid.uuid, so it cannot be updated
+          (every write in this role PUTs to /volume-groups/<uuid>).
+
+          Nothing has been changed and no volume has been deleted.
+
+          Inspect it:
+            curl -sk -u '{{ hammerspace_api_user }}:<password>' \
+              '{{ hs_api_url }}/volume-groups' | jq '.[] | select(.name=="{{ item.name }}")'
+      loop: "{{ _vgl_changes | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: (item.uuid | default('')) | length == 0
+
+    - name: Show exactly what will change
+      ansible.builtin.debug:
+        msg: |
+          Volume group membership changes:
+          {% for g in _vgl_changes %}
+            {{ g.name }}
+              removing ({{ g.remove | length }}):
+          {% for v in g.remove %}      - {{ v }}
+          {% endfor %}
+              keeping  ({{ g.keep | length }}):
+          {% for v in g.keep | selectattr('storageVolume.name', 'defined') | map(attribute='storageVolume.name') | list %}      = {{ v }}
+          {% endfor %}
+          {% endfor %}
+      when: _vgl_changes | length > 0
+
+    # The group itself is never deleted, even when it ends up empty — it may
+    # carry placement objectives that other deployments will populate later.
+    # The payload goes in a FILE, not on the command line.
+    #
+    # It is the whole volume group object round-tripped (so a PUT, which
+    # REPLACES the resource, cannot drop placement objectives), and that object
+    # embeds the expanded volumes, their nodes and logical volumes. Inlining
+    # that as -d '<json>' put tens of kilobytes of arbitrary API-controlled
+    # text inside shell single quotes: one apostrophe anywhere in it ends the
+    # quoting and the shell never runs curl at all. The symptom is a curl that
+    # produced NO stdout — reported as "HTTP 0 / (empty response body)", since
+    # -w always emits a code when curl actually runs.
+    #
+    # -d @file sidesteps shell quoting and any ARG_MAX ceiling entirely.
+    - name: Create a temporary directory for the volume group payloads
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: hs-vg
+      register: _vgl_tmp
+      when: not ansible_check_mode
+
+    - name: Write each volume group payload to a file
+      ansible.builtin.copy:
+        content: >-
+          {{ item.obj | combine({'expressions':
+               [ ((item.obj.expressions | default([])) | first
+                  | default({'_type': 'EXPRESSION'}, true))
+                 | combine({'operator': 'IN', 'locations': item.keep}) ]}) | to_json }}
+        dest: "{{ _vgl_tmp.path }}/{{ item.uuid }}.json"
+        mode: "0600"
+      loop: "{{ _vgl_changes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - not ansible_check_mode
+        - item.uuid | length > 0
+
+    - name: Update each affected volume group
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          -X PUT -H "Content-Type: application/json"
+          -d @{{ (_vgl_tmp.path ~ '/' ~ item.uuid ~ '.json') | quote }}
+          "{{ hs_api_url }}/volume-groups/{{ item.uuid | urlencode }}"
+      register: _vgl_put
+      changed_when: true
+      failed_when: false
+      no_log: true
+      loop: "{{ _vgl_changes }}"
+      loop_control:
+        label: "{{ item.name }} (-{{ item.remove | length }})"
+      when:
+        - not ansible_check_mode
+        # PUT targets the UUID, as every other write in this role does; a
+        # group the API returned without one cannot be addressed. Caught
+        # explicitly below rather than PUT to an empty path.
+        - item.uuid | length > 0
+
+    # Immediately after the PUT, not at the end of the play: the rejection
+    # check below is a hard failure, and cleanup placed after it would be
+    # skipped on exactly the runs that created the files.
+    - name: Remove the payload directory
+      ansible.builtin.file:
+        path: "{{ _vgl_tmp.path }}"
+        state: absent
+      when:
+        - not ansible_check_mode
+        - _vgl_tmp.path is defined
+
+    # SECURITY: this must NOT loop over _vgl_put.results.
+    #
+    # `no_log: true` on the PUT above protects that task's own output. It does
+    # NOT protect a downstream task that loops over the registered results: for
+    # a looped task Ansible prints the `item`, and here the item is the whole
+    # curl result — including `cmd` and `invocation.module_args._raw_params`,
+    # both of which contain
+    #
+    #     -H "Authorization: Basic <base64 of admin:password>"
+    #
+    # A rejected update therefore wrote the cluster admin credential into
+    # ~/logs, where scripts/run.sh sends every run.
+    #
+    # So the results are reduced to name/status/body FIRST — none of which can
+    # contain the credential — and the failure is reported from a NON-looped
+    # task over that summary.
+    # Loops over INDICES, not over the results themselves. If this task ever
+    # fails, Ansible dumps its `item` — and an item that is an integer cannot
+    # carry the Authorization header, whereas the raw result would.
+    - name: Summarize rejected volume group updates
+      ansible.builtin.set_fact:
+        _vgl_rejected: >-
+          {{ (_vgl_rejected | default([])) + ([{
+               'name':   _r.item.name | default('?'),
+               'uuid':   _r.item.uuid | default(''),
+               'status': (_r.stdout_lines | default(['0']))[-1] | default('0'),
+               'body':   (_r.stdout_lines | default([]))[:-1] | join('\n'),
+               'rc':     _r.rc | default('?'),
+               'stderr': (_r.stderr | default('')) | regex_replace('Basic [A-Za-z0-9+/=]+', 'Basic <redacted>')
+             }] if _vgl_bad else []) }}
+      vars:
+        _r: "{{ (_vgl_put.results | default([]))[item] }}"
+        _vgl_bad: >-
+          {{ (not (_r.skipped | default(false)))
+             and (((_r.stdout_lines | default(['0']))[-1] | default('0') | int)
+                  not in [200, 201, 202]) }}
+      loop: "{{ range((_vgl_put.results | default([])) | length) | list }}"
+      loop_control:
+        label: "{{ (_vgl_put.results | default([]))[item].item.name | default('?') }}"
+      when: not ansible_check_mode
+
+    - name: Fail if any volume group update was rejected
+      ansible.builtin.fail:
+        msg: |
+          {{ _vgl_rejected | length }} volume group update(s) were rejected.
+          {% for g in _vgl_rejected %}
+          '{{ g.name }}' — HTTP {{ g.status }} (curl exit {{ g.rc }})
+            PUT {{ hs_api_url }}/volume-groups/{{ g.uuid }}
+            The API said:
+              {{ g.body | trim | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) | replace('\n', '\n    ') }}
+          {% if (g.stderr | trim) | length > 0 %}
+            stderr:
+              {{ g.stderr | trim | replace('\n', '\n    ') }}
+          {% endif %}
+          {% if g.status | int == 0 %}
+            HTTP 0 with no body means curl produced no output at all — `-w`
+            always emits a code when curl runs. So curl did not run, or was
+            killed. The exit code and stderr above say which; a shell quoting
+            error (exit 2, "unexpected EOF while looking for matching quote")
+            means the payload broke the command line, which is why the payload
+            is written to a file and passed as -d @file rather than inlined.
+          {% endif %}
+          {% endfor %}
+          The volumes have NOT been deleted — decommission stopped here so the
+          groups and the volumes stay consistent. Re-run after resolving the
+          API error.
+      when: (_vgl_rejected | default([])) | length > 0
+
+    - name: Report volume group removal complete
+      ansible.builtin.debug:
+        msg: >-
+          Removed {{ _vgl_changes | map(attribute='remove') | map('length') | sum }}
+          volume reference(s) from {{ _vgl_changes | length }} volume group(s).
+          No volume group was deleted.
+      when:
+        - _vgl_changes | length > 0
+        - not ansible_check_mode

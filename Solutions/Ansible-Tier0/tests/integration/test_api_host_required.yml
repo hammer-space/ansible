@@ -1,0 +1,72 @@
+---
+# Regression test: hammerspace_api_host ships EMPTY and an empty value fails
+# fast, naming the variable, instead of dying later on `https://:8443/...`.
+#
+# vars/main.yml used to carry one site's Anvil IP as the default, so any site
+# that forgot to override it silently talked to that cluster.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_api_host_required.yml -i localhost, -c local
+
+- name: hammerspace_api_host required regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _roles_dir: "{{ playbook_dir }}/../../roles"
+    _plays_with_gate:
+      - plays/storage.yml
+      - plays/hammerspace_serial.yml
+      - plays/di.yml
+      - preflight_check.yml
+      - decommission_tier0.yml
+      - site-onprem-nvme.yml
+      - decommission_di.yml
+      - reset-tier0-host.yml
+
+  tasks:
+    - name: 'TEST 1: shipped default is empty (read raw file, no templating)'
+      block:
+        - name: Read vars/main.yml
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../vars/main.yml"
+          register: _vm
+        - name: 'TEST 1 ASSERT: default is "" and no IP literal'
+          vars:
+            _raw: "{{ _vm.content | b64decode }}"
+          ansible.builtin.assert:
+            that:
+              - "_raw is search('(?m)^hammerspace_api_host: \"\"\\s*$')"
+              - "_raw is not search('(?m)^hammerspace_api_host: \"[0-9]')"
+            quiet: true
+
+    - name: 'TEST 2: empty / unset / None / blank host all FAIL, real IP passes'
+      ansible.builtin.include_tasks: _api_host_probe.yml
+      loop:
+        - { v: "", expect_fail: true }
+        - { v: "   ", expect_fail: true }
+        - { v: "10.0.0.10", expect_fail: false }
+      loop_control:
+        label: "'{{ item.v }}'"
+
+    - name: 'TEST 3: every play that talks to the Anvil runs the gate under --tags'
+      ansible.builtin.assert:
+        that:
+          - "(lookup('file', playbook_dir ~ '/../../' ~ item) | regex_findall('tasks_from.{1,2}require_api_host') | length) >= 1"
+          - "(lookup('file', playbook_dir ~ '/../../' ~ item) | regex_search('require_api_host\\s+tags.{1,2}\\[always\\]')) is not none"
+        quiet: true
+      loop: "{{ _plays_with_gate }}"
+
+    - name: 'TEST 3b: gate precedes the (last) Key Vault lookup in each play'
+      vars:
+        _t: "{{ lookup('file', playbook_dir ~ '/../../' ~ item) }}"
+      ansible.builtin.assert:
+        that:
+          - "_t.rindex('require_api_host') < _t.rindex('keyvault_password')"
+        quiet: true
+      loop: "{{ _plays_with_gate }}"
+
+    - name: PASSED
+      ansible.builtin.debug:
+        msg: "test_api_host_required PASSED (3 tests)"

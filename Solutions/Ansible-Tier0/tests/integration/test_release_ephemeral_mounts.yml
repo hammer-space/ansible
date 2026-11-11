@@ -1,0 +1,240 @@
+---
+# Tests for the opt-in "release cloud ephemeral mounts" feature.
+#
+# Azure — CycleCloud especially — auto-mounts local NVMe as scratch. On the
+# reported HB120rs_v3 the 894 GB NVMe comes up as:
+#
+#   nvme0n1  259:0  0  894.3G  0 disk  /tmp
+#                                      /nvme
+#
+# /tmp is a SYSTEM mountpoint, so detection correctly marks nvme0n1 PROTECTED
+# and discovery reports 0 RAID arrays. release_ephemeral_mountpoints lets an
+# operator hand those mounts back so the disk becomes a Tier 0 candidate.
+#
+# This is the most dangerous feature in the repo: it unmounts filesystems on a
+# path that ends in mkfs. These tests exist to keep its rails intact.
+#
+# The disk-resolution half (--disk-for-mount / --critical-disks against a fake
+# sysfs) lives in test_scan_disks.sh. This file covers the Ansible-side policy.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_release_ephemeral_mounts.yml \
+#       -i localhost, -c local
+
+- name: Ephemeral mount release safety tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    _test_passes: []
+    _test_failures: []
+
+    # Host shape from the report: sda = OS (critical), sdd = /var (critical),
+    # nvme0n1 = CycleCloud scratch at /tmp + /nvme (releasable).
+    _critical_disks_mock: [sda, sdd]
+    _plan_mock:
+      - ['/tmp', ['nvme0n1']]      # releasable
+      - ['/nvme', ['nvme0n1']]     # releasable, same disk
+      - ['/var', ['sdd']]          # MUST be refused
+      - ['/boot', ['sda']]         # MUST be refused
+      - ['/gone', []]              # not mounted — no-op, not an error
+
+  tasks:
+    # ========================================================================
+    # TEST 1: the refuse condition selects exactly the critical mountpoints
+    # ========================================================================
+    - name: 'TEST 1: refuse condition fires only for critical-backed mounts'
+      block:
+        - name: 'TEST 1 ASSERT: /var and /boot refused, /tmp and /nvme allowed'
+          ansible.builtin.assert:
+            that:
+              # Mirrors: when: item[1] | intersect(_critical_disks) | length > 0
+              - "(['nvme0n1'] | intersect(_critical_disks_mock) | length) == 0"
+              - "(['sdd'] | intersect(_critical_disks_mock) | length) > 0"
+              - "(['sda'] | intersect(_critical_disks_mock) | length) > 0"
+              - "([] | intersect(_critical_disks_mock) | length) == 0"
+            fail_msg: |
+              REGRESSION: the refuse condition no longer distinguishes a
+              scratch disk from a critical one. Releasing a mount on the OS
+              disk would make it a RAID candidate.
+            success_msg: "OK — nvme0n1 releasable; sda/sdd refused"
+
+        - name: Record TEST 1 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 1: refuse condition allows scratch disks and blocks critical ones'] }}"
+      rescue:
+        - name: Record TEST 1 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 1: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # TEST 2: the refuse task actually ABORTS. A condition that evaluates
+    # correctly but never fails would be worthless.
+    # ========================================================================
+    - name: 'TEST 2: a critical-backed mountpoint hard-fails the play'
+      block:
+        - name: Run the real refuse task against a critical mountpoint
+          ansible.builtin.fail:
+            msg: |
+              REFUSING to release {{ item[0] }} — its disk ({{ item[1] | join(', ') }})
+              also backs a critical system mount.
+          loop: "{{ _plan_mock }}"
+          loop_control:
+            label: "{{ item[0] }}"
+          when: item[1] | intersect(_critical_disks_mock) | length > 0
+
+        - name: 'TEST 2 FAIL: refuse task did NOT abort on a critical mount'
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 2: releasing a mount on the OS disk was ALLOWED (REGRESSION — boot drive would become a RAID candidate)'] }}"
+      rescue:
+        - name: 'TEST 2 PASS: refuse task aborted as expected'
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 2: critical-backed mountpoint hard-fails before any unmount'] }}"
+
+    # ========================================================================
+    # TEST 3: a plan with only scratch disks must NOT abort (negative test —
+    # a refuse-list that blocks everything is just as broken).
+    # ========================================================================
+    - name: 'TEST 3: scratch-only plan passes the refuse gate'
+      block:
+        - name: Run the refuse task against scratch-only mountpoints
+          ansible.builtin.fail:
+            msg: "Should not fire — nvme0n1 is not critical."
+          loop:
+            - ['/tmp', ['nvme0n1']]
+            - ['/nvme', ['nvme0n1']]
+            - ['/gone', []]
+          when: item[1] | intersect(_critical_disks_mock) | length > 0
+
+        - name: Record TEST 3 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 3: scratch-only plan passes the gate (no false positives)'] }}"
+      rescue:
+        - name: 'TEST 3 FAIL: gate blocked a legitimate release'
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 3: refuse gate fired on a scratch-only plan (feature is unusable)'] }}"
+
+    # ========================================================================
+    # TEST 4 (audit): the rails must still be in the source.
+    # ========================================================================
+    - name: 'TEST 4: audit the release feature source'
+      block:
+        - name: Read the release task file
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../roles/nvme_discovery/tasks/release_ephemeral_mounts.yml"
+          register: _rel_src
+
+        - name: Read scan_disks.sh and vars/main.yml
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../{{ item }}"
+          register: _other_src
+          loop:
+            - roles/nvme_discovery/files/scan_disks.sh
+            - vars/main.yml
+            - roles/nvme_discovery/tasks/main.yml
+
+        - name: Decode sources
+          ansible.builtin.set_fact:
+            _rel: "{{ _rel_src.content | b64decode }}"
+            _scan: "{{ _other_src.results[0].content | b64decode }}"
+            _vars: "{{ _other_src.results[1].content | b64decode }}"
+            _main: "{{ _other_src.results[2].content | b64decode }}"
+
+        # Comment-stripped views. Both files DISCUSS `umount -l` and reference
+        # detect_boot_device.yml in explanatory comments, so auditing the raw
+        # text would match prose rather than behaviour.
+        - name: Strip comments for the behavioural audits
+          ansible.builtin.set_fact:
+            _rel_code: "{{ _rel.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+            _main_code: "{{ _main.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+
+        - name: 'TEST 4 ASSERT: feature ships OFF by default'
+          ansible.builtin.assert:
+            that:
+              - "'release_ephemeral_mountpoints: []' in _vars"
+              - "'release_ephemeral_mountpoints | default([]) | length > 0' in _main"
+            fail_msg: |
+              REGRESSION: the release feature must ship disabled. vars/main.yml
+              must default release_ephemeral_mountpoints to [] and main.yml must
+              gate the include on it being non-empty.
+
+        - name: 'TEST 4 ASSERT: no lazy unmount anywhere in the release path'
+          ansible.builtin.assert:
+            that:
+              - "'umount -l' not in _rel_code"
+              - "'--lazy' not in _rel_code"
+              - "'force: true' not in _rel_code"
+            fail_msg: |
+              REGRESSION: a lazy or forced unmount appeared in the release path.
+              `umount -l` returns success while the filesystem is still
+              referenced, so a later mkfs can hit a live device. The safe
+              recovery is fstab removal + reboot, which is already implemented.
+
+        - name: 'TEST 4 ASSERT: the hard refuse-list exists and excludes scratch'
+          ansible.builtin.assert:
+            that:
+              - "'HARD_SYSTEM_MOUNTS' in _scan"
+              - "'--critical-disks' in _scan"
+              - "'--disk-for-mount' in _scan"
+              # /tmp must NOT be hard-critical or the Azure case is unfixable...
+              - "'/tmp' not in (_scan | regex_search('HARD_SYSTEM_MOUNTS=\"[^\"]*\"') | default('', true))"
+              # ...but the OS mounts must be.
+              - "'/boot' in (_scan | regex_search('HARD_SYSTEM_MOUNTS=\"[^\"]*\"') | default('', true))"
+              - "'/var' in (_scan | regex_search('HARD_SYSTEM_MOUNTS=\"[^\"]*\"') | default('', true))"
+              # /tmp stays PROTECTED by default — only naming it releases it.
+              - "'/tmp' in (_scan | regex_search('SYSTEM_MOUNTS=\"[^\"]*\"') | default('', true))"
+            fail_msg: |
+              REGRESSION: the non-overridable refuse-list is missing or wrong.
+              HARD_SYSTEM_MOUNTS must contain the OS mounts and must NOT contain
+              /tmp; SYSTEM_MOUNTS must still contain /tmp so it stays protected
+              unless explicitly released.
+
+        - name: 'TEST 4 ASSERT: release runs before detection and HW RAID'
+          ansible.builtin.assert:
+            that:
+              - "_main_code.index('release_ephemeral_mounts.yml') < _main_code.index('detect_boot_device.yml')"
+              - "_main_code.index('release_ephemeral_mounts.yml') < _main_code.index('Handle hardware RAID devices')"
+            fail_msg: |
+              REGRESSION: the release must happen BEFORE detect_boot_device.yml
+              (or the disk is still mounted and still classified PROTECTED) and
+              before the HW RAID block (or a still-mounted device is handed
+              straight to mkfs).
+
+        - name: Record TEST 4 pass
+          ansible.builtin.set_fact:
+            _test_passes: "{{ _test_passes + ['TEST 4: audit — opt-in default, no lazy unmount, refuse-list intact, correct ordering'] }}"
+      rescue:
+        - name: Record TEST 4 failure
+          ansible.builtin.set_fact:
+            _test_failures: "{{ _test_failures + ['TEST 4: ' ~ (ansible_failed_result.msg | default('unknown') | replace('\n', ' '))] }}"
+
+    # ========================================================================
+    # Report
+    # ========================================================================
+    - name: Print test report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          EPHEMERAL MOUNT RELEASE SAFETY TEST REPORT
+          ============================================================
+          PASSED ({{ _test_passes | length }}):
+          {% for t in _test_passes %}
+            ✓ {{ t }}
+          {% endfor %}
+
+          {% if _test_failures | length > 0 %}
+          FAILED ({{ _test_failures | length }}):
+          {% for t in _test_failures %}
+            ✗ {{ t }}
+          {% endfor %}
+          {% else %}
+          FAILED: 0
+          {% endif %}
+          ============================================================
+
+    - name: Fail the play if any test failed
+      ansible.builtin.fail:
+        msg: "{{ _test_failures | length }} test(s) failed."
+      when: _test_failures | length > 0

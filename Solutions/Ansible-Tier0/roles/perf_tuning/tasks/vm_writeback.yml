@@ -1,0 +1,294 @@
+---
+# vm dirty-page writeback limits for NFS *client* ingest (Hammerspace BKM).
+#
+# Everything else in this role tunes the server side (nfsd threads, sunrpc
+# pools, block read-ahead, NIC IRQs) or the wire (TCP buffers). This file is
+# the one knob that governs how much dirty page cache a bulk writer on an NFS
+# *mount* may accumulate before the kernel makes it wait.
+#
+# Why it matters: with no explicit cap the global dirty limit is
+# vm.dirty_ratio (20%) of available memory. On a large-memory ingest node that
+# is hundreds of GB of dirty NFS pages, which presents as the ingest tool
+# ("azcopy consumes crazy amounts of memory") — the pages are charged to the
+# page cache and to NFS_Unstable, not to the process RSS.
+#
+# ---------------------------------------------------------------------------
+# WHY ONLY THE *_bytes FORM IS ACCEPTED
+# ---------------------------------------------------------------------------
+# vm.dirty_bytes and vm.dirty_ratio are two views of ONE limit, and the kernel
+# keeps them exclusive by zeroing the other on write
+# (mm/page-writeback.c — dirty_bytes_handler / dirty_ratio_handler /
+# dirty_background_*_handler):
+#
+#   writing dirty_background_bytes -> dirty_background_ratio = 0  (always)
+#   writing dirty_background_ratio -> dirty_background_bytes = 0  (always)
+#   writing dirty_bytes            -> vm_dirty_ratio        = 0   (on change)
+#   writing dirty_ratio            -> vm_dirty_bytes        = 0   (on change)
+#
+# So the four-line recipe that circulates for azcopy tuning —
+#
+#     vm.dirty_background_bytes = 268435456   # 256 MB
+#     vm.dirty_bytes            = 1073741824  # 1 GB
+#     vm.dirty_background_ratio = 0
+#     vm.dirty_ratio            = 0
+#
+# — silently discards its own first line. Line 3 resets
+# dirty_background_bytes to 0, so the background threshold ends up 0 pages,
+# not 256 MB. Line 4 happens to be a no-op only because line 2 already set
+# the ratio to 0 and that handler acts on a change; reorder the lines and
+# line 4 wipes the 1 GB cap as well, leaving a 0-page dirty limit that
+# throttles the writer on every single page.
+#
+# The *_ratio = 0 lines are not needed: the kernel zeroes the ratio itself.
+# Mixing the two forms in one sysctl.d file cannot be correct, so the assert
+# below refuses it rather than shipping a config whose meaning depends on
+# line order.
+# ---------------------------------------------------------------------------
+
+- name: Collect writeback keys split by form
+  ansible.builtin.set_fact:
+    _vmwb_keys: "{{ perf_vm_writeback | dict2items | map(attribute='key') | list }}"
+    # Values are coerced to int once, here. An operator who quotes a number in
+    # vars/main.yml would otherwise make the `lt` comparisons below compare a
+    # string to an int, which fails with a Jinja type error instead of the
+    # guard's own message. A non-numeric value coerces to 0 and then trips the
+    # two-page floor, which says something useful.
+    _vmwb_cfg: >-
+      {{ dict(perf_vm_writeback | dict2items | map(attribute='key') | list
+              | zip(perf_vm_writeback | dict2items | map(attribute='value')
+                    | map('int') | list)) }}
+    _vmwb_ratio_keys: >-
+      {{ perf_vm_writeback | dict2items | map(attribute='key')
+         | select('match', '^vm\.dirty(_background)?_ratio$') | list }}
+    _vmwb_bytes_keys: >-
+      {{ perf_vm_writeback | dict2items | map(attribute='key')
+         | select('match', '^vm\.dirty(_background)?_bytes$') | list }}
+
+# Read-only probe. check_mode: false — its output feeds the safety assert
+# below, and a --check skip would register stdout: '' and let the assert pass
+# on an empty page size.
+- name: Probe page size and conflicting sysctl.d entries
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export LC_ALL=C LANG=C
+    echo "PAGESIZE=$(getconf PAGESIZE)"
+    # Every file OTHER than ours that sets any of the four writeback keys.
+    # procps `sysctl --system` applies /etc/sysctl.d/*.conf in lexical
+    # filename order and /etc/sysctl.conf LAST, so a later file setting a
+    # *_ratio key zeroes the *_bytes value this role writes.
+    for f in /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf /etc/sysctl.conf; do
+      [ -f "$f" ] || continue
+      case "$f" in */{{ perf_vm_writeback_sysctl_filename }}) continue ;; esac
+      if grep -Eq '^[[:space:]]*vm\.dirty(_background)?_(bytes|ratio)[[:space:]]*=' "$f"; then
+        echo "CONFLICT=$f"
+      fi
+    done
+  args:
+    executable: /bin/bash
+  register: _vmwb_probe
+  changed_when: false
+  check_mode: false
+
+- name: Parse probe output
+  ansible.builtin.set_fact:
+    _vmwb_pagesize: >-
+      {{ (_vmwb_probe.stdout_lines | default([]) | select('match', '^PAGESIZE=')
+          | list | first | default('PAGESIZE=4096')).split('=')[1] | int }}
+    _vmwb_conflicts: >-
+      {{ _vmwb_probe.stdout_lines | default([]) | select('match', '^CONFLICT=')
+         | map('regex_replace', '^CONFLICT=', '') | list }}
+
+- name: Reject a writeback config whose meaning depends on line order
+  ansible.builtin.assert:
+    that:
+      # The *_bytes and *_ratio forms of the SAME limit cancel each other out.
+      - not ('vm.dirty_bytes' in _vmwb_keys and 'vm.dirty_ratio' in _vmwb_keys)
+      - >-
+        not ('vm.dirty_background_bytes' in _vmwb_keys
+             and 'vm.dirty_background_ratio' in _vmwb_keys)
+      # A *_bytes value below two pages is SILENTLY IGNORED by the kernel and
+      # the previous configuration is retained — a no-op that looks applied.
+      - >-
+        _vmwb_cfg | dict2items
+          | selectattr('key', 'match', '^vm\.dirty(_background)?_bytes$')
+          | selectattr('value', 'lt', (_vmwb_pagesize | int) * 2)
+          | list | length == 0
+      # background >= dirty makes the kernel silently substitute dirty / 2.
+      - >-
+        not ('vm.dirty_background_bytes' in _vmwb_keys
+             and 'vm.dirty_bytes' in _vmwb_keys)
+        or (_vmwb_cfg['vm.dirty_background_bytes'] | int
+            < _vmwb_cfg['vm.dirty_bytes'] | int)
+      # A *_ratio of 0 written on its own means a ZERO-page threshold: the
+      # kernel throttles the writer on every page. It is only ever correct as
+      # the kernel's own side effect of setting the *_bytes form.
+      - >-
+        _vmwb_cfg | dict2items
+          | selectattr('key', 'match', '^vm\.dirty(_background)?_ratio$')
+          | selectattr('value', 'eq', 0)
+          | list | length == 0
+      - _vmwb_pagesize | int > 0
+    fail_msg: |
+      perf_vm_writeback is not a config the kernel can honour as written.
+
+      Requested: {{ _vmwb_cfg }}
+      Page size: {{ _vmwb_pagesize }}
+
+      Rules (mm/page-writeback.c):
+        - vm.dirty_bytes and vm.dirty_ratio are ONE limit in two units. Writing
+          either zeroes the other, so setting both means the last line wins and
+          the config's meaning depends on file order. Pick one form; prefer
+          *_bytes, which does not scale with RAM.
+        - Same for vm.dirty_background_bytes / vm.dirty_background_ratio.
+        - A *_bytes value below two pages ({{ (_vmwb_pagesize | int) * 2 }})
+          is ignored by the kernel and the old value is kept.
+        - vm.dirty_background_bytes must be < vm.dirty_bytes, or the kernel
+          uses vm.dirty_bytes / 2 for the background threshold instead.
+        - vm.dirty_ratio / vm.dirty_background_ratio = 0 is a ZERO-page
+          threshold, not "unlimited" and not "disabled". The kernel sets the
+          ratio to 0 by itself when you set the *_bytes form; you never write
+          it. Drop the line.
+    success_msg: >-
+      perf_vm_writeback uses a single form per limit
+      ({{ _vmwb_bytes_keys | length }} *_bytes,
+      {{ _vmwb_ratio_keys | length }} *_ratio) — safe to persist.
+
+# Single source of truth: the sysctl module writes the value into our own
+# sysctl.d file AND sets it at runtime. Not /etc/sysctl.conf (the module
+# default) — procps applies /etc/sysctl.conf last, so an entry there would
+# shadow the sysctl.d file and give two places to keep in step.
+- name: Apply vm writeback limits (runtime + /etc/sysctl.d/{{ perf_vm_writeback_sysctl_filename }})
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: "/etc/sysctl.d/{{ perf_vm_writeback_sysctl_filename }}"
+    state: present
+    reload: false
+    sysctl_set: true
+    ignoreerrors: true
+  loop: "{{ _vmwb_cfg | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  failed_when: false
+
+# Read back what the kernel actually kept. The kernel reports the unit it is
+# NOT using as 0, so this is the only way to prove the values took — a
+# successful `sysctl -w` says nothing about what a later line did to it.
+# An unreadable knob is skipped rather than emitted empty. `printf "$(cat ...)"`
+# does NOT trip `set -e` when the substitution fails -- printf itself succeeds --
+# so without the readability test this task exits 0 with empty values and the
+# verification below passes on nothing.
+- name: Read back effective writeback limits
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export LC_ALL=C LANG=C
+    for k in dirty_background_bytes dirty_background_ratio dirty_bytes dirty_ratio; do
+      f=/proc/sys/vm/$k
+      if [ -r "$f" ]; then
+        printf '%s=%s\n' "vm.$k" "$(cat "$f")"
+      fi
+    done
+  args:
+    executable: /bin/bash
+  register: _vmwb_effective
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Parse effective writeback limits
+  ansible.builtin.set_fact:
+    _vmwb_effective_map: >-
+      {{ dict(_vmwb_effective.stdout_lines | default([])
+              | map('regex_replace', '^([^=]+)=(.*)$', '\1|\2')
+              | map('split', '|') | list) }}
+
+# The kernel reports the unit it is NOT using as 0, so a requested non-zero
+# value reading back as 0 is the signature of the ordering footgun this file
+# exists to prevent: something zeroed it after we wrote it.
+#
+# _vmwb_unread is the other half, and it is why the check is on LENGTH rather
+# than on the key merely being defined: a knob this kernel does not expose
+# produces no line at all, and an empty value is neither 0 nor the requested
+# figure -- so without this the verification would confirm nothing and pass.
+- name: Determine which requested limits are unreadable or were zeroed out
+  ansible.builtin.set_fact:
+    _vmwb_unread: >-
+      {{ _vmwb_cfg | dict2items
+         | map(attribute='key')
+         | reject('in', (_vmwb_effective_map | dict2items
+                         | rejectattr('value', 'eq', '')
+                         | map(attribute='key') | list))
+         | list }}
+    _vmwb_zeroed_out: >-
+      {{ _vmwb_cfg | dict2items
+         | rejectattr('value', 'eq', 0)
+         | map(attribute='key')
+         | select('in', (_vmwb_effective_map | dict2items
+                         | selectattr('value', 'eq', '0')
+                         | map(attribute='key') | list))
+         | list }}
+
+- name: Warn about other files that set vm.dirty_* keys
+  ansible.builtin.debug:
+    msg: |
+      WARNING: {{ _vmwb_conflicts | length }} other sysctl file(s) set
+      vm.dirty_* keys and will be applied alongside
+      /etc/sysctl.d/{{ perf_vm_writeback_sysctl_filename }}:
+
+      {% for f in _vmwb_conflicts %}
+        - {{ f }}
+      {% endfor %}
+
+      `sysctl --system` applies /etc/sysctl.d/*.conf in lexical filename order
+      and /etc/sysctl.conf LAST. Because writing a *_ratio key zeroes its
+      *_bytes partner, any of the above that sets vm.dirty_ratio or
+      vm.dirty_background_ratio and is applied after ours will silently revert
+      this tuning on the next boot. Remove the *_ratio lines from those files.
+  when: _vmwb_conflicts | length > 0
+
+- name: Report effective writeback limits
+  ansible.builtin.debug:
+    msg: |
+      vm writeback limits{{ ' (check mode — values below are the host'
+                            ~ "'" ~ 's current state, nothing was applied)'
+                            if ansible_check_mode else '' }}:
+      {% for k, v in _vmwb_effective_map.items() %}
+        {{ '%-32s' | format(k) }} {{ v }}{{ ' <- requested' if k in _vmwb_keys else '' }}
+      {% endfor %}
+      A 0 on a *_ratio key is expected when its *_bytes partner is set (and
+      vice versa) — the kernel reports the unit it is not using as 0.
+
+# Only enforced on a real run: under --check nothing was applied, so the
+# read-back is just the host's pre-existing state.
+- name: Verify the kernel kept every requested value
+  ansible.builtin.assert:
+    that:
+      - _vmwb_unread | length == 0
+      - _vmwb_zeroed_out | length == 0
+    fail_msg: |
+      {% if _vmwb_unread | length > 0 %}
+      These keys could not be read back from /proc/sys/vm at all:
+        {{ _vmwb_unread | join(', ') }}
+      Either this kernel does not expose them or the key name is wrong. The
+      value was NOT verified, so it is reported as a failure rather than
+      assumed applied (read-back rc={{ _vmwb_effective.rc | default('?') }}).
+      {% endif %}
+      {% if _vmwb_zeroed_out | length > 0 %}
+      The kernel did not keep these requested writeback limits:
+        {{ _vmwb_zeroed_out | join(', ') }}
+      {% endif %}
+
+      requested: {{ _vmwb_cfg }}
+      effective: {{ _vmwb_effective_map }}
+
+      A value read back as 0 when a non-zero one was requested means another
+      sysctl write zeroed it - see the *_bytes / *_ratio exclusivity note at
+      the top of roles/perf_tuning/tasks/vm_writeback.yml.
+      {% if _vmwb_conflicts | length > 0 %}
+      These files also set vm.dirty_* keys and may be the cause:
+      {{ _vmwb_conflicts | join(', ') }}
+      {% endif %}
+    success_msg: >-
+      Kernel kept all {{ perf_vm_writeback | length }} requested writeback
+      limit(s), read back from /proc/sys/vm.
+  when: not ansible_check_mode

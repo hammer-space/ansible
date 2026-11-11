@@ -1,0 +1,269 @@
+---
+# DI Decommission role - Remove DI node from Hammerspace cluster
+# Steps: (k8s only) tear down DaemonSet/secrets/labels FIRST, then proceed
+#        with the API-side teardown shared across all modes.
+
+- name: Tear down Kubernetes DI deployment
+  ansible.builtin.include_tasks:
+    file: kubernetes_decommission.yml
+    apply:
+      tags: [di, di-k8s, di-decommission]
+  when: di_deployment_type | default('host') == 'kubernetes'
+  tags: [di, di-k8s, di-decommission]
+
+- name: Set DI node facts
+  ansible.builtin.set_fact:
+    _di_node_name: "{{ di_node_name | default(inventory_hostname) }}"
+    _di_node_ip: "{{ di_node_ip | default(ansible_default_ipv4.address | default('')) }}"
+    _hs_api_base: "https://{{ hammerspace_cluster_mgmt_ip | default(hammerspace_api_host) }}:{{ hammerspace_api_port | default(8443) }}/mgmt/v1.2/rest"
+
+# Always use curl for API requests (uri module has SSL/compatibility issues)
+- name: Set API method
+  ansible.builtin.set_fact:
+    _hs_use_curl: true
+
+# Check if node exists
+- name: Check if DI node exists in Hammerspace
+  ansible.builtin.include_tasks: _api_request.yml
+  vars:
+    _api_request_url: "{{ _hs_api_base }}/nodes/{{ _di_node_name | urlencode }}"
+    _api_request_method: GET
+
+- name: Set node existence and UUID facts
+  ansible.builtin.set_fact:
+    _di_node_registered: "{{ (_api_response.status | int) == 200 }}"
+    _di_node_uuid: "{{ (_api_response.json.uoid.uuid | default('')) if (_api_response.status | int) == 200 else '' }}"
+
+- name: Display node lookup result
+  ansible.builtin.debug:
+    msg: >-
+      Node '{{ _di_node_name }}': {{ 'FOUND' if _di_node_registered | bool else 'NOT FOUND' }}
+      {{ '(UUID: ' ~ _di_node_uuid ~ ')' if _di_node_uuid | length > 0 else '(no UUID found in response)' }}
+      API status: {{ _api_response.status }}
+
+- name: Skip decommission if node not registered
+  ansible.builtin.debug:
+    msg: "DI node '{{ _di_node_name }}' is not registered in Hammerspace - nothing to decommission"
+  when: not (_di_node_registered | bool)
+
+# Decommission workflow
+- name: Decommission DI node
+  when: _di_node_registered | bool
+  block:
+    # List all volumes and find ones belonging to this node
+    - name: List all volumes
+      ansible.builtin.include_tasks: _api_request.yml
+      vars:
+        _api_request_url: "{{ _hs_api_base }}/storage-volumes"
+        _api_request_method: GET
+
+    - name: Find volumes for this node
+      ansible.builtin.set_fact:
+        _node_volumes: >-
+          {{ _api_response.json | default([]) |
+             selectattr('node.name', 'defined') |
+             selectattr('node.name', 'equalto', _di_node_name) | list
+             +
+             _api_response.json | default([]) |
+             selectattr('name', 'defined') |
+             selectattr('name', 'search', _di_node_name ~ '::') | list
+          }}
+
+    - name: Remove duplicate volumes
+      ansible.builtin.set_fact:
+        _node_volumes: "{{ _node_volumes | unique }}"
+
+    - name: Display volumes found
+      ansible.builtin.debug:
+        msg: "Found {{ _node_volumes | length }} volume(s) for node '{{ _di_node_name }}': {{ _node_volumes | map(attribute='name') | list }}"
+
+    # Decommission each volume
+    - name: Decommission volumes
+      ansible.builtin.include_tasks: decommission_volume.yml
+      loop: "{{ _node_volumes }}"
+      loop_control:
+        loop_var: _volume
+        label: "{{ _volume.name }}"
+      when: _node_volumes | length > 0
+
+    # Remove node from Hammerspace (by UUID if available, fall back to name)
+    #
+    # _api_request.yml runs its curl with check_mode: false (its GETs must run
+    # under --check), so an ungated DELETE here removed the node for real on a
+    # dry run. Writes are skipped under --check and reported instead.
+    - name: "Would remove DI node '{{ _di_node_name }}' (check mode)"
+      ansible.builtin.debug:
+        msg: >-
+          --check: would DELETE /nodes/{{ _di_node_uuid if _di_node_uuid | length > 0 else _di_node_name }}.
+          Nothing was sent.
+      when: ansible_check_mode
+
+    - name: Remove DI node from Hammerspace
+      when: not ansible_check_mode
+      block:
+        - name: "Remove DI node from Hammerspace ({{ 'by UUID' if _di_node_uuid | length > 0 else 'by name' }})"
+          ansible.builtin.include_tasks: _api_request.yml
+          vars:
+            _api_request_url: "{{ _hs_api_base }}/nodes/{{ _di_node_uuid if _di_node_uuid | length > 0 else (_di_node_name | urlencode) }}"
+            _api_request_method: DELETE
+            _api_request_save_headers: true
+
+        - name: Check node removal result
+          ansible.builtin.debug:
+            msg: >-
+              Node '{{ _di_node_name }}' removal:
+              {{ 'SUCCESS' if (_api_response.status | int) in [200, 202, 204]
+              else 'FAILED (HTTP ' ~ _api_response.status ~ ')' }}.
+              DELETE URL: /nodes/{{ _di_node_uuid if _di_node_uuid | length > 0 else _di_node_name }}
+
+        - name: Fail if node removal failed
+          ansible.builtin.fail:
+            msg: >-
+              Failed to remove DI node '{{ _di_node_name }}' from Hammerspace
+              (HTTP {{ _api_response.status }}). Check the Anvil logs or remove manually:
+              anvil> node-delete --name {{ _di_node_name }}
+          when: (_api_response.status | int) not in [200, 202, 204, 404]
+
+        # Poll for node removal task completion if async
+        - name: Poll node removal task
+          ansible.builtin.include_tasks: _api_poll_task.yml
+          vars:
+            _api_poll_url: "{{ _api_response.location }}"
+            _api_poll_retries: "{{ di_decommission_poll_retries | default(30) }}"
+            _api_poll_delay: "{{ di_decommission_poll_delay | default(10) }}"
+          when: _api_response.location | default('') | length > 0
+
+# Stop services (host-mode and container-mode only — k8s pods are already
+# gone via kubernetes_decommission.yml, and there are no host services to stop).
+- name: Stop DI services
+  when:
+    - di_decommission_stop_services | default(true)
+    - di_deployment_type | default('host') != 'kubernetes'
+  block:
+    - name: Stop pd-di service
+      ansible.builtin.systemd:
+        name: pd-di
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Stop pd-di-lttng-recorder service
+      ansible.builtin.systemd:
+        name: pd-di-lttng-recorder
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Stop lttng-sessiond service
+      ansible.builtin.systemd:
+        name: lttng-sessiond
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Display service stop status
+      ansible.builtin.debug:
+        msg: "DI services stopped and disabled"
+
+# ==========================================================================
+# Clean up local DI installation
+# Removes packages, containers, config files, and build artifacts.
+# Controlled by di_decommission_cleanup (default: true)
+# ==========================================================================
+
+- name: Clean up DI installation
+  when:
+    - di_decommission_cleanup | default(true)
+    - di_deployment_type | default('host') != 'kubernetes'
+  block:
+
+    # ---- Container cleanup (if container mode was used) --------------------
+    - name: Check if DI container exists
+      ansible.builtin.command:
+        cmd: "{{ di_container_runtime | default('podman') }} inspect {{ di_container_name | default('pd-di') }}"
+      register: _di_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop and remove DI container
+      ansible.builtin.command:
+        cmd: "{{ di_container_runtime | default('podman') }} rm -f {{ di_container_name | default('pd-di') }}"
+      when: _di_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Remove DI container image
+      ansible.builtin.command:
+        cmd: "{{ di_container_runtime | default('podman') }} rmi -f {{ di_container_image | default('hammerspace-di:local') }}"
+      when: _di_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Remove container build directory
+      ansible.builtin.file:
+        path: "{{ di_container_build_dir | default('/opt/hammerspace/di-container') }}"
+        state: absent
+
+    # ---- Host-mode cleanup (if host mode was used) -------------------------
+    - name: Check if pd-di RPM is installed
+      ansible.builtin.command:
+        cmd: rpm -q pd-di
+      register: _pddi_rpm_check
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family | default('') == 'RedHat'
+
+    - name: Check if pd-di deb is installed
+      ansible.builtin.command:
+        cmd: dpkg -l pd-di
+      register: _pddi_deb_check
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family | default('') == 'Debian'
+
+    - name: Remove pd-di package (RedHat)
+      ansible.builtin.dnf:
+        name: pd-di
+        state: absent
+      when:
+        - ansible_os_family | default('') == 'RedHat'
+        - _pddi_rpm_check.rc | default(1) == 0
+      failed_when: false
+
+    - name: Remove pd-di package (Debian)
+      ansible.builtin.apt:
+        name: pd-di
+        state: absent
+        purge: true
+      when:
+        - ansible_os_family | default('') == 'Debian'
+        - _pddi_deb_check.rc | default(1) == 0
+      failed_when: false
+
+    # ---- Common cleanup ----------------------------------------------------
+    - name: Remove DI install temp directory
+      ansible.builtin.file:
+        path: "{{ di_tmp_dir | default('/tmp/di_install') }}"
+        state: absent
+
+    - name: Remove add_node.py
+      ansible.builtin.file:
+        path: /usr/local/bin/add_node.py
+        state: absent
+
+    - name: Remove Hammerspace cluster entry from /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: ".*{{ hammerspace_cluster_hostname | default('data-cluster') }}$"
+        state: absent
+      failed_when: false
+
+    - name: Remove DI data directory
+      ansible.builtin.file:
+        path: /opt/pd
+        state: absent
+      failed_when: false
+
+    - name: Display cleanup status
+      ansible.builtin.debug:
+        msg: "DI installation cleaned up (packages, containers, config files removed)"

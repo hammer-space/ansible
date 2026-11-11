@@ -1,0 +1,65 @@
+---
+# Firewall setup role - Open DI ports (9095/tcp, 9096/tcp)
+# Adapted from Ansible-Tier0 firewall_setup role
+
+# Check which firewall tools are installed
+- name: Check if firewalld service exists
+  ansible.builtin.stat:
+    path: /usr/lib/systemd/system/firewalld.service
+  register: firewalld_service_file
+
+- name: Check if ufw binary exists
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: ufw_binary
+
+- name: Check alternative ufw path
+  ansible.builtin.stat:
+    path: /usr/bin/ufw
+  register: ufw_binary_alt
+
+- name: Check if iptables binary exists
+  ansible.builtin.stat:
+    path: /usr/sbin/iptables
+  register: iptables_binary
+
+# Detect firewall type
+- name: Detect firewall type
+  ansible.builtin.set_fact:
+    firewall_type: >-
+      {%- if firewalld_service_file.stat.exists | default(false) -%}
+        firewalld
+      {%- elif ufw_binary.stat.exists | default(false) or ufw_binary_alt.stat.exists | default(false) -%}
+        ufw
+      {%- elif iptables_binary.stat.exists | default(false) -%}
+        iptables
+      {%- else -%}
+        none
+      {%- endif -%}
+
+- name: Display detected firewall type
+  ansible.builtin.debug:
+    msg: |
+      Detected firewall type: {{ firewall_type }}
+      OS family: {{ ansible_os_family }}
+      Ports to open: {{ di_firewall_ports | map(attribute='port') | list }}
+
+- name: Include firewalld tasks
+  ansible.builtin.include_tasks: firewall_firewalld.yml
+  when: firewall_type == 'firewalld'
+
+- name: Include ufw tasks
+  ansible.builtin.include_tasks: firewall_ufw.yml
+  when: firewall_type == 'ufw'
+
+- name: Include iptables tasks
+  ansible.builtin.include_tasks: firewall_iptables.yml
+  when: firewall_type == 'iptables'
+
+- name: Skip firewall configuration (no firewall detected)
+  ansible.builtin.debug:
+    msg: |
+      No firewall (firewalld, ufw, or iptables) detected.
+      Skipping firewall configuration.
+      Ensure DI ports are open manually: 9095/tcp, 9096/tcp
+  when: firewall_type == 'none'

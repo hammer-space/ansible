@@ -1,0 +1,198 @@
+---
+# GPU Fabric AZ Detection
+# Automatically determines the AZ prefix for this node based on its GPU memory
+# fabric OCID. Instances sharing the same GPU fabric get the same AZ number.
+#
+# How it works:
+#   1. Query OCI instance metadata for GPU fabric OCID
+#   2. Query Hammerspace for existing volumes to learn fabric→AZ mappings
+#   3. If this fabric is already mapped → reuse that AZ
+#   4. If new fabric → assign next available AZ number
+#   5. Set hammerspace_volume_az_prefix fact for volume naming
+#
+# Requires:
+#   - Running on an OCI instance with GPU memory fabric
+#   - Hammerspace API accessible (to learn existing mappings)
+#   - hammerspace_gpu_fabric_az: true in vars/main.yml
+
+# ---- Step 1: Get GPU fabric OCID from instance metadata --------------------
+
+- name: Query OCI instance metadata for GPU fabric OCID
+  ansible.builtin.uri:
+    url: "http://169.254.169.254/opc/v2/host/rdmaTopologyData/customerGpuMemoryFabric"
+    headers:
+      Authorization: "Bearer Oracle"
+    return_content: true
+    timeout: 10
+  register: _gpu_fabric_raw
+  failed_when: false
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Parse GPU fabric OCID
+  ansible.builtin.set_fact:
+    _gpu_fabric_ocid: "{{ _gpu_fabric_raw.content | default('') | trim }}"
+  when: _gpu_fabric_raw.status | default(0) == 200
+
+- name: Set empty GPU fabric (not available)
+  ansible.builtin.set_fact:
+    _gpu_fabric_ocid: ""
+  when: _gpu_fabric_raw.status | default(0) != 200
+
+- name: Display GPU fabric OCID
+  ansible.builtin.debug:
+    msg: >-
+      GPU fabric: {{ _gpu_fabric_ocid if _gpu_fabric_ocid | length > 0
+      else 'NOT AVAILABLE (not a GPU instance or metadata not accessible)' }}
+
+- name: Skip GPU fabric AZ (no fabric detected)
+  ansible.builtin.debug:
+    msg: "No GPU fabric detected — AZ prefix will use other detection methods (fault domain, inventory groups)"
+  when: _gpu_fabric_ocid | length == 0
+
+# ---- Step 2: Query Hammerspace for existing volume AZ mappings ---------------
+
+- name: Get existing volumes from Hammerspace
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s --max-time 30
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      "{{ hs_api_url }}/storage-volumes"
+  register: _hs_volumes_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: _gpu_fabric_ocid | length > 0
+
+- name: Parse existing volumes
+  ansible.builtin.set_fact:
+    _hs_volumes: "{{ (_hs_volumes_raw.stdout | default('[]') | from_json) }}"
+  when:
+    - _gpu_fabric_ocid | length > 0
+    - _hs_volumes_raw.stdout is defined
+
+# ---- Step 3: Get GPU fabric for all nodes to build the mapping ---------------
+# Query Hammerspace nodes and cross-reference with the instance metadata service
+# to discover which fabrics are already assigned to which AZs.
+
+- name: Extract existing AZ prefixes from volume names
+  ansible.builtin.set_fact:
+    _existing_az_prefixes: >-
+      {{ _hs_volumes | default([])
+         | map(attribute='name')
+         | select('match', '^AZ[0-9]+:')
+         | map('regex_replace', '^(AZ[0-9]+):.*', '\1')
+         | unique | sort | list }}
+  when: _gpu_fabric_ocid | length > 0
+
+- name: Display existing AZ assignments
+  ansible.builtin.debug:
+    msg: "Existing AZs in Hammerspace: {{ _existing_az_prefixes | default([]) | join(', ') | default('none') }}"
+  when: _gpu_fabric_ocid | length > 0
+
+# ---- Step 4: Check if this fabric already has an AZ assigned -----------------
+# Look for volumes from nodes that share our GPU fabric.
+# We do this by checking if any existing node in Hammerspace was registered
+# with the same fabric OCID. The fabric→node mapping is stored in the
+# gpu_fabric_map fact (built from collect_gpu_fabric.yml output or from
+# a shared mapping file).
+
+# Approach: Check if a GPU fabric mapping file exists on the controller
+- name: Check for GPU fabric mapping file
+  ansible.builtin.stat:
+    path: "{{ repo_root }}/gpu_fabric_data.txt"
+  register: _fabric_file_stat
+  delegate_to: localhost
+  become: false
+  when: _gpu_fabric_ocid | length > 0
+
+- name: Read GPU fabric mapping file
+  ansible.builtin.slurp:
+    src: "{{ repo_root }}/gpu_fabric_data.txt"
+  register: _fabric_file_raw
+  delegate_to: localhost
+  become: false
+  when:
+    - _gpu_fabric_ocid | length > 0
+    - _fabric_file_stat.stat.exists | default(false)
+
+- name: Build fabric→node→AZ mapping from file and volumes
+  ansible.builtin.set_fact:
+    _fabric_az_map: >-
+      {%- set ns = namespace(mapping={}, next_az=1) -%}
+      {%- set volume_names = _hs_volumes | default([]) | map(attribute='name') | list -%}
+      {#- Learn existing AZ assignments from volume names -#}
+      {%- if _fabric_file_raw.content is defined -%}
+        {%- set fabric_lines = (_fabric_file_raw.content | b64decode).split('\n') -%}
+        {%- for line in fabric_lines -%}
+          {%- set parts = line.strip().split() -%}
+          {%- if parts | length >= 2 and parts[0].startswith('ocid1.computegpumemoryfabric') -%}
+            {%- set fabric_id = parts[0] -%}
+            {%- set node_name = parts[1] -%}
+            {#- Find AZ for this node from volume names -#}
+            {%- for vname in volume_names -%}
+              {%- if node_name in vname and vname is match('^AZ[0-9]+:') -%}
+                {%- set az = vname | regex_replace('^(AZ[0-9]+):.*', '\1') -%}
+                {%- if ns.mapping.update({fabric_id: az}) -%}{%- endif -%}
+                {%- set az_num = az | regex_replace('^AZ', '') | int -%}
+                {%- if az_num >= ns.next_az -%}
+                  {%- if ns.update(next_az=az_num + 1) -%}{%- endif -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {#- If our fabric is not yet mapped, assign next AZ -#}
+      {%- if _gpu_fabric_ocid not in ns.mapping -%}
+        {%- if ns.mapping.update({_gpu_fabric_ocid: 'AZ' ~ ns.next_az}) -%}{%- endif -%}
+      {%- endif -%}
+      {{ ns.mapping | to_json }}
+  when: _gpu_fabric_ocid | length > 0
+
+- name: Determine AZ for this node's GPU fabric
+  ansible.builtin.set_fact:
+    _gpu_fabric_az: "{{ (_fabric_az_map | from_json)[_gpu_fabric_ocid] | default('') }}"
+  when: _gpu_fabric_ocid | length > 0
+
+- name: Display GPU fabric AZ assignment
+  ansible.builtin.debug:
+    msg: >-
+      GPU fabric {{ _gpu_fabric_ocid[-12:] }}... → {{ _gpu_fabric_az }}
+      (fabric→AZ map: {{ _fabric_az_map | default('{}') }})
+  when:
+    - _gpu_fabric_ocid | length > 0
+    - _gpu_fabric_az | default('') | length > 0
+
+# ---- Step 5: Set the AZ prefix fact -----------------------------------------
+
+- name: Set hammerspace_volume_az_prefix from GPU fabric
+  ansible.builtin.set_fact:
+    hammerspace_volume_az_prefix: "{{ _gpu_fabric_az }}:"
+    hammerspace_volume_az_prefix_enabled: true
+  when:
+    - _gpu_fabric_ocid | length > 0
+    - _gpu_fabric_az | default('') | length > 0
+
+- name: Display final AZ prefix
+  ansible.builtin.debug:
+    msg: "Volume AZ prefix set to: {{ hammerspace_volume_az_prefix | default('(not set)') }}"
+  when:
+    - _gpu_fabric_ocid | length > 0
+    - _gpu_fabric_az | default('') | length > 0
+
+# ---- Step 6: Append this node to gpu_fabric_data.txt (optional) -------------
+# So future nodes can learn the mapping without querying all volumes.
+
+- name: Append this node's fabric mapping to gpu_fabric_data.txt
+  ansible.builtin.lineinfile:
+    path: "{{ repo_root }}/gpu_fabric_data.txt"
+    regexp: ".*{{ inventory_hostname }}.*"
+    line: "{{ _gpu_fabric_ocid }} {{ inventory_hostname }} {{ ansible_default_ipv4.address | default('') }}"
+    create: true
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  when:
+    - _gpu_fabric_ocid | length > 0
+    - hammerspace_gpu_fabric_az_update_file | default(true)

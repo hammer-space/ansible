@@ -1,0 +1,11 @@
+---
+# Default variables for filesystem_setup role
+
+# Force filesystem recreation (DESTRUCTIVE!)
+force_fs_recreate: false
+
+# Default filesystem type
+default_fstype: xfs
+
+# Default mount options
+default_mount_opts: defaults,nofail,discard
