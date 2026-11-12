@@ -546,11 +546,19 @@ controller and talks only to the API.
 |----------|---------|-------------|
 | `decommission_confirm` | `false` | Safety gate — must be passed as `-e decommission_confirm=true` to proceed. Without it the play prints the plan and stops. |
 | `decommission_explicit_volume_group_leave` | `false` | Remove volumes from their volume groups with an explicit PUT *before* deleting them. Not needed: deleting a volume removes it from its groups, and the playbook verifies that after the delete. Set to `true` only if the post-delete verification warns that references survived. |
+| `decommission_delete_volume_groups` | `false` | Also delete the volume groups this run empties, so node, volumes and group go in one command. A group is deleted only if it held at least one of the deleted volumes and **nothing else** — a group that still holds another node's volume, or selects volumes by pattern, is kept with a warning. Each group is re-checked immediately before its delete, and none is deleted if the volume or node delete failed. |
+| `decommission_volume_group_match` | `''` | Regex on the group name. With `decommission_delete_volume_groups`, only matching groups may be deleted — e.g. `'^tier0-12345_'` to limit a Slurm epilog to its own job's group. Empty = any group the run empties. |
 
 Deleting a storage volume also removes it from its volume groups, so the
 playbook relies on that and then re-reads the groups to confirm. If a group
 still references a deleted volume it prints a warning (without failing — the
 volumes and nodes are already gone) and names the flag above.
+
+Without `decommission_delete_volume_groups`, volume groups are never deleted,
+even ones left empty. A group deleted by this playbook takes its
+`place-on-` / `confine-to-` / `exclude-from-<group>` objectives with it, so do
+not enable it for a long-lived group whose objectives are applied to shares;
+use `decommission_volume_group_match` to keep those out of scope.
 
 ## Tier 0 Host Reset (reset-tier0-host.yml)
 

@@ -9,6 +9,8 @@
 #   2. Delete the volumes — which also removes them from any volume group
 #   3. Delete the node
 #   4. Verify no volume group still references a deleted volume
+#   5. Optionally (decommission_delete_volume_groups=true) delete the volume
+#      groups this run emptied
 #
 # Deleting a volume removes it from its volume groups, so this playbook does
 # NOT rewrite the groups first. It confirms the cascade happened instead. Set
@@ -21,7 +23,8 @@
 #   - it does not stop or destroy RAID arrays, wipe superblocks or blkdiscard
 #   - it does not delete the export directory or ANY file on any node
 #   - it does not delete the Azure VM or VMSS instance
-#   - it does not delete volume groups, even ones it empties
+#   - it does not delete volume groups unless asked to, and then only ones
+#     that held these volumes and nothing else
 #
 # It never connects to the storage nodes at all: every task is delegated to the
 # controller and talks only to the Hammerspace API. The nodes keep serving
@@ -41,6 +44,15 @@
 #   ansible-playbook decommission_tier0.yml -i inventory.azure_rm.yml \
 #     --limit 'hb120v3*' -e decommission_confirm=true
 #
+#   # Node + volumes + the volume group(s) they leave empty, in one run
+#   ansible-playbook decommission_tier0.yml -i inventory.azure_rm.yml \
+#     --limit 'hb120v3*' -e decommission_confirm=true \
+#     -e decommission_delete_volume_groups=true
+#
+#   decommission_volume_group_match narrows which emptied groups may be
+#   deleted (a regex on the group name, e.g. '^tier0-12345_'). A group that
+#   still holds any other volume, or selects by pattern, is never deleted.
+#
 # The confirmation flag is mandatory. Without it the play stops before making
 # any change.
 
@@ -55,6 +67,10 @@
   vars:
     # Mandatory safety flag — must be passed as -e decommission_confirm=true
     decommission_confirm: false
+    # Opt-in: also delete the volume groups this run leaves empty.
+    decommission_delete_volume_groups: false
+    # Regex on the group name; only matching groups may be deleted. '' = any.
+    decommission_volume_group_match: ''
 
   pre_tasks:
     # ------------------------------------------------------------------ #
@@ -339,6 +355,72 @@
       delegate_to: localhost
       run_once: true
 
+    # ------------------------------------------------------------------ #
+    # Volume groups to delete (decommission_delete_volume_groups).
+    #
+    # Read BEFORE anything is deleted: once the delete cascades, a group no
+    # longer lists the volume, so afterwards there is no way to tell which
+    # groups held this run's volumes. A candidate is a group that holds at
+    # least one of them and NOTHING else — no other volume, no pattern
+    # expression, no location that does not name a volume. The group is
+    # re-read and re-checked immediately before its own DELETE.
+    # ------------------------------------------------------------------ #
+    - name: List the volume groups before any change
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "{{ hs_api_url }}/volume-groups"
+      register: _dc_vg_before_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+      when: decommission_delete_volume_groups | bool
+
+    - name: Fail if the volume groups could not be listed
+      ansible.builtin.fail:
+        msg: |
+          decommission_delete_volume_groups is true, but listing volume groups
+          returned HTTP {{ (_dc_vg_before_raw.stdout_lines | default(['0']))[-1] | default('0') }}.
+          Nothing has been changed. The groups must be read before the volumes
+          are deleted, or there is no way to tell afterwards which ones held
+          them.
+      when:
+        - decommission_delete_volume_groups | bool
+        - ((_dc_vg_before_raw.stdout_lines | default(['0']))[-1] | default('0') | int) != 200
+      delegate_to: localhost
+      run_once: true
+
+    - name: Select the volume groups this run would empty
+      ansible.builtin.set_fact:
+        _dc_vg_delete: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for g in ((_dc_vg_before_raw.stdout_lines[:-1] | join('\n') | trim | default('[]', true)) | from_json) -%}
+            {%- set c = namespace(ours=0, other=0) -%}
+            {%- for x in g.expressions | default([]) -%}
+              {%- if x.locations is not defined -%}{%- set c.other = c.other + 1 -%}{%- endif -%}
+              {%- for l in x.locations | default([]) -%}
+                {%- if ((l.storageVolume | default({})).name | default('')) in _dc_volumes -%}
+                  {%- set c.ours = c.ours + 1 -%}
+                {%- else -%}
+                  {%- set c.other = c.other + 1 -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {%- if c.ours > 0 and c.other == 0 and (g.name | default('')) | length > 0
+                  and (g.name is search(decommission_volume_group_match | default('', true))) -%}
+              {%- set ns.out = ns.out + [g.name] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.out | unique | sort }}
+      when: decommission_delete_volume_groups | bool
+      delegate_to: localhost
+      run_once: true
+
     - name: Show the decommission plan
       ansible.builtin.debug:
         msg: |
@@ -350,8 +432,12 @@
           Volumes to remove: {{ _dc_volumes | length }}
           {% for v in _dc_volumes %}    - {{ v }}
           {% endfor %}
+          Volume groups to delete: {{ (_dc_vg_delete | default([]) | length) if (decommission_delete_volume_groups | bool) else 'none (decommission_delete_volume_groups=false)' }}
+          {% for g in _dc_vg_delete | default([]) %}    - {{ g }}
+          {% endfor %}
 
-          Order: remove from volume groups -> delete volumes -> delete nodes
+          Order: delete volumes (cascades out of their groups) -> delete nodes
+                 -> verify groups{{ ' -> delete emptied groups' if (decommission_delete_volume_groups | bool) else '' }}
 
           NOT touched: filesystems, mounts, exports, RAID arrays, the export
           directory and its contents, and the Azure VMs themselves. Every node
@@ -582,6 +668,33 @@
               already-deleted volumes, or remove them in the UI.
           when: (_dc_dangling | default([])) | length > 0
 
+    # ------------------------------------------------------------------ #
+    # 5. Delete the volume groups this run emptied (opt-in).
+    #
+    #    Only after the volume/node delete succeeded. Each group is re-read
+    #    and re-checked first — another job may have joined a volume to it
+    #    since the plan was printed — and KEPT with a warning if it holds
+    #    anything else. Under --check it reports what it would delete.
+    # ------------------------------------------------------------------ #
+    - name: Delete the volume groups this decommission emptied
+      ansible.builtin.include_role:
+        name: hammerspace_integration
+        tasks_from: volume_group_delete
+        apply:
+          delegate_to: localhost
+          become: false
+      vars:
+        volume_group_delete_config:
+          name: "{{ _dc_vg_group }}"
+          volumes: "{{ _dc_volumes }}"
+      loop: "{{ _dc_vg_delete | default([]) }}"
+      loop_control:
+        loop_var: _dc_vg_group
+      when:
+        - decommission_delete_volume_groups | bool
+        - inventory_hostname == (ansible_play_hosts | first)
+        - ansible_check_mode or ((_dc_cleanup.rc | default(1)) == 0)
+
     - name: Fail if volume or node deletion reported an error
       ansible.builtin.fail:
         msg: |
@@ -614,7 +727,14 @@
             - the export directory and all of its contents
             - RAID arrays, /etc/fstab, NFS exports
             - the Azure VMs / VMSS instances
-            - all volume groups (emptied ones were kept)
+            - {{ 'every volume group not listed below'
+                 if (decommission_delete_volume_groups | bool)
+                 else 'all volume groups (emptied ones were kept)' }}
+          {% if decommission_delete_volume_groups | bool %}
+
+          Volume groups deleted: {{ _hs_vg_deleted_groups | default([]) | join(', ') | default('(none)', true) }}
+          Volume groups kept (still in use): {{ _hs_vg_kept_groups | default([]) | join(', ') | default('(none)', true) }}
+          {% endif %}
 
           To re-register these nodes later, re-run site.yml.
           ============================================

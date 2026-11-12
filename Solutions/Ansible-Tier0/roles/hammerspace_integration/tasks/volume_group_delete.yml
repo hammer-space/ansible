@@ -1,0 +1,296 @@
+---
+# Delete ONE volume group, but only if it holds nothing except the volumes a
+# decommission just deleted.
+#
+# Caller: decommission_tier0.yml, with decommission_delete_volume_groups: true.
+#
+# Input:  volume_group_delete_config  {name, volumes: [names]}
+#           name     the group to delete
+#           volumes  the volumes this run deleted. A reference to one of
+#                    these may still be listed if the delete did not cascade;
+#                    it does not count as "in use".
+# Output: _vgd_result  'deleted' | 'absent' | 'kept' (still in use) | 'check'
+#         _hs_vg_deleted_groups / _hs_vg_kept_groups  accumulated across calls
+#
+# CONTRACT — this file will NOT delete a group that:
+#   - lists any volume other than the given ones (another node, another job)
+#   - has an expression without an explicit `locations` list (namePattern)
+#   - has a location entry that does not name a storage volume
+# Any of those means the group still selects something, so it is KEPT, with a
+# warning — the decommission has already succeeded and a group that is still
+# in use is not an error.
+#
+# The group is re-read immediately before the DELETE rather than trusted from
+# the plan the playbook printed: between the two, the volume delete ran and
+# another job's prolog may have joined a volume to the same group.
+#
+# Written like volume_group_create.yml: the DELETE addresses the group by
+# uoid.uuid (a write by name is rejected — see the 2026-09-03 PUT), its status
+# is gated, a Location is polled, and the group is then looked up until it is
+# gone. Every curl is no_log (the command line holds the password); failures
+# are reported from un-censored tasks with the body redacted.
+
+- name: "Reset the volume group delete facts for {{ volume_group_delete_config.name }}"
+  ansible.builtin.set_fact:
+    _vgd_result: ""
+    _vgd_status: 0
+    _vgd_json: {}
+    _vgd_other: []
+    _vgd_do_delete: false
+    _vgd_del: {status: 0, location: ""}
+    _vgd_poll_status: ""
+
+- name: "Look up volume group {{ volume_group_delete_config.name }}"
+  ansible.builtin.shell:
+    cmd: >-
+      curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+      {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+      -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+      "{{ hs_api_url }}/volume-groups/{{ volume_group_delete_config.name | urlencode }}"
+  register: _vgd_check_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+- name: "Parse the {{ volume_group_delete_config.name }} lookup"
+  ansible.builtin.set_fact:
+    _vgd_status: "{{ (_vgd_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+    _vgd_json: >-
+      {{ (((_vgd_check_raw.stdout_lines | default(['{}']))[:-1] | join('\n') | trim | default('{}', true)) | from_json)
+         if ((_vgd_check_raw.stdout_lines | default(['0']))[-1] | default('0') | int) == 200 else {} }}
+
+- name: "Fail if the lookup of volume group {{ volume_group_delete_config.name }} failed"
+  ansible.builtin.fail:
+    msg: |
+      Looking up volume group '{{ volume_group_delete_config.name }}' returned
+      HTTP {{ _vgd_status | int }} (curl exit {{ _vgd_check_raw.rc | default('?') }}).
+      The volumes and nodes ARE deleted; the group was not touched.
+
+      The API said:
+        {{ (_vgd_check_raw.stdout_lines | default([]))[:-1] | join('\n  ') | trim | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+      {% if (_vgd_status | int) == 0 %}
+
+      HTTP 0 means curl produced no output, so it did not run or could not
+      connect. stderr:
+        {{ (_vgd_check_raw.stderr | default('') | regex_replace('Basic [A-Za-z0-9+/=]+', 'Basic <redacted>')) | trim | default('(none)', true) }}
+      {% endif %}
+  when: (_vgd_status | int) not in [200, 404]
+
+- name: "Volume group {{ volume_group_delete_config.name }} is already gone"
+  ansible.builtin.set_fact:
+    _vgd_result: absent
+  when: (_vgd_status | int) == 404
+
+# Everything the group still selects that is NOT one of the deleted volumes.
+# An expression with no `locations` (a namePattern) and a location that names
+# no storage volume are both counted: they select something this run did not
+# delete, so the group is in use.
+- name: "Find what else volume group {{ volume_group_delete_config.name }} still selects"
+  ansible.builtin.set_fact:
+    _vgd_other: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for x in _vgd_json.expressions | default([]) -%}
+        {%- if x.locations is not defined -%}
+          {%- set ns.out = ns.out + ['expression ' ~ (x.namePattern | default(x.expressionType | default('?')))] -%}
+        {%- endif -%}
+        {%- for l in x.locations | default([]) -%}
+          {%- set vn = (l.storageVolume | default({})).name | default('') -%}
+          {%- if vn | length == 0 -%}
+            {%- set ns.out = ns.out + [l._type | default('unnamed location')] -%}
+          {%- elif vn not in volume_group_delete_config.volumes -%}
+            {%- set ns.out = ns.out + [vn] -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  when: (_vgd_status | int) == 200
+
+- name: "Keep volume group {{ volume_group_delete_config.name }} — it is still in use"
+  ansible.builtin.debug:
+    msg: |
+      NOT deleting volume group '{{ volume_group_delete_config.name }}': it
+      still selects {{ _vgd_other | length }} thing(s) this decommission did
+      not remove:
+      {% for o in _vgd_other %}    - {{ o }}
+      {% endfor %}
+      The volumes and nodes ARE deleted. Delete the group in the UI once it is
+      no longer needed.
+  when:
+    - (_vgd_status | int) == 200
+    - _vgd_other | length > 0
+
+- name: "Mark volume group {{ volume_group_delete_config.name }} as kept"
+  ansible.builtin.set_fact:
+    _vgd_result: kept
+    _hs_vg_kept_groups: "{{ (_hs_vg_kept_groups | default([])) + [volume_group_delete_config.name] }}"
+  when:
+    - (_vgd_status | int) == 200
+    - _vgd_other | length > 0
+
+- name: "Fail if volume group {{ volume_group_delete_config.name }} has no uuid"
+  ansible.builtin.fail:
+    msg: >-
+      Volume group '{{ volume_group_delete_config.name }}' was returned without
+      a uoid.uuid, so it cannot be addressed for a DELETE. The volumes and
+      nodes ARE deleted; delete the group in the UI.
+  when:
+    - (_vgd_status | int) == 200
+    - _vgd_other | length == 0
+    - (_vgd_json.uoid.uuid | default('', true) | length) == 0
+
+- name: "Would delete volume group {{ volume_group_delete_config.name }} (check mode)"
+  ansible.builtin.debug:
+    msg: >-
+      --check: would DELETE volume group '{{ volume_group_delete_config.name }}'
+      (uuid {{ _vgd_json.uoid.uuid }}). Nothing was sent.
+  when:
+    - (_vgd_status | int) == 200
+    - _vgd_other | length == 0
+    - ansible_check_mode
+
+# Decided ONCE, into a fact: the lookup at the end of the block changes
+# _vgd_status, and a block's `when` is re-evaluated for every task in it.
+- name: "Decide whether to delete volume group {{ volume_group_delete_config.name }}"
+  ansible.builtin.set_fact:
+    _vgd_do_delete: >-
+      {{ ((_vgd_status | int) == 200) and (_vgd_other | length == 0)
+         and not ansible_check_mode }}
+    _vgd_result: "{{ 'check' if ((_vgd_status | int) == 200 and _vgd_other | length == 0 and ansible_check_mode) else _vgd_result }}"
+
+- name: "Delete volume group {{ volume_group_delete_config.name }}"
+  when: _vgd_do_delete | bool
+  block:
+    - name: "Create a temp file for the {{ volume_group_delete_config.name }} response headers"
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .headers
+      register: _vgd_tmp
+
+    - name: "DELETE volume group {{ volume_group_delete_config.name }}"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(180) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          -X DELETE
+          -D {{ _vgd_tmp.path | quote }}
+          "{{ hs_api_url }}/volume-groups/{{ _vgd_json.uoid.uuid | urlencode }}"
+      register: _vgd_del_raw
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: "Read the Location header for {{ volume_group_delete_config.name }}"
+      ansible.builtin.shell:
+        cmd: >-
+          grep -i '^Location:' {{ _vgd_tmp.path | quote }} 2>/dev/null
+          | awk '{print $2}' | tr -d '\r\n'
+      register: _vgd_loc_raw
+      changed_when: false
+      failed_when: false
+
+    # Before the rejection check below, which is a hard failure.
+    - name: "Remove the {{ volume_group_delete_config.name }} temp file"
+      ansible.builtin.file:
+        path: "{{ _vgd_tmp.path }}"
+        state: absent
+
+    - name: "Parse the {{ volume_group_delete_config.name }} delete response"
+      ansible.builtin.set_fact:
+        _vgd_del:
+          status: "{{ (_vgd_del_raw.stdout_lines | default(['0']))[-1] | default('0') | int }}"
+          location: "{{ _vgd_loc_raw.stdout | default('') | trim }}"
+
+    - name: "Fail if deleting volume group {{ volume_group_delete_config.name }} was rejected"
+      ansible.builtin.fail:
+        msg: |
+          Deleting volume group '{{ volume_group_delete_config.name }}' failed
+          with HTTP {{ _vgd_del.status | int }} (curl exit {{ _vgd_del_raw.rc | default('?') }}).
+          The volumes and nodes ARE deleted; only the group is left.
+
+          DELETE {{ hs_api_url }}/volume-groups/{{ _vgd_json.uoid.uuid }}
+
+          The API said:
+            {{ (_vgd_del_raw.stdout_lines | default([]))[:-1] | join('\n  ') | trim | regex_replace('(?i)Basic\s+[A-Za-z0-9+/=]{8,}', 'Basic <redacted>') | default('(empty response body)', true) }}
+          {% if (_vgd_del.status | int) == 0 %}
+
+          HTTP 0 means curl produced no output, so it did not run or could
+          not connect. stderr:
+            {{ (_vgd_del_raw.stderr | default('') | regex_replace('Basic [A-Za-z0-9+/=]+', 'Basic <redacted>')) | trim | default('(none)', true) }}
+          {% endif %}
+      when: (_vgd_del.status | int) not in [200, 202, 204, 404]
+
+    - name: "Wait for the {{ volume_group_delete_config.name }} delete task"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          {{ _vgd_del.location | quote }}
+      register: _vgd_poll_raw
+      changed_when: false
+      failed_when: false
+      no_log: true
+      until: >-
+        (_vgd_poll_raw.stdout | default('') is match('\s*\{'))
+        and ((_vgd_poll_raw.stdout | from_json).status | default('') in ['COMPLETED', 'FAILED', 'CANCELLED'])
+      retries: "{{ hammerspace_volume_group_delete_poll_retries | default(60) }}"
+      delay: 5
+      when: _vgd_del.location | length > 0
+
+    - name: "Record the {{ volume_group_delete_config.name }} task status"
+      ansible.builtin.set_fact:
+        _vgd_poll_status: >-
+          {{ ((_vgd_poll_raw.stdout | from_json).status | default('UNKNOWN', true))
+             if (_vgd_poll_raw.stdout | default('') is match('\s*\{')) else 'UNKNOWN' }}
+      when: _vgd_del.location | length > 0
+
+    - name: "Fail unless the {{ volume_group_delete_config.name }} delete task completed"
+      ansible.builtin.fail:
+        msg: >-
+          The delete task for volume group '{{ volume_group_delete_config.name }}'
+          ended as {{ _vgd_poll_status }}, not COMPLETED. The volumes and nodes
+          ARE deleted. Check the task in the Anvil UI ({{ _vgd_del.location }}).
+      when:
+        - _vgd_del.location | length > 0
+        - _vgd_poll_status != 'COMPLETED'
+
+    # The check that makes "deleted" true.
+    - name: "Wait until volume group {{ volume_group_delete_config.name }} is gone"
+      ansible.builtin.shell:
+        cmd: >-
+          curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+          {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+          -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+          "{{ hs_api_url }}/volume-groups/{{ volume_group_delete_config.name | urlencode }}"
+      register: _vgd_wait_raw
+      changed_when: false
+      failed_when: false
+      no_log: true
+      until: ((_vgd_wait_raw.stdout_lines | default(['0']))[-1] | default('0') | int) == 404
+      retries: "{{ hammerspace_volume_group_delete_wait_retries | default(12) }}"
+      delay: "{{ hammerspace_volume_group_delete_wait_delay | default(5) }}"
+
+    - name: "Fail if volume group {{ volume_group_delete_config.name }} is still listed"
+      ansible.builtin.fail:
+        msg: |
+          Volume group '{{ volume_group_delete_config.name }}' was accepted for
+          deletion (HTTP {{ _vgd_del.status | int }}{{ ', task ' ~ _vgd_poll_status if _vgd_poll_status else ', no task' }})
+          but is still listed after
+          {{ hammerspace_volume_group_delete_wait_retries | default(12) }} lookups
+          (last: HTTP {{ (_vgd_wait_raw.stdout_lines | default(['0']))[-1] | default('0') }}).
+          The volumes and nodes ARE deleted. Check the Anvil UI; re-running is
+          safe.
+      when: ((_vgd_wait_raw.stdout_lines | default(['0']))[-1] | default('0') | int) != 404
+
+    - name: "Volume group {{ volume_group_delete_config.name }} deleted"
+      ansible.builtin.set_fact:
+        _vgd_result: deleted
+        _hs_vg_deleted_groups: "{{ (_hs_vg_deleted_groups | default([])) + [volume_group_delete_config.name] }}"
+
+    - name: "Report volume group {{ volume_group_delete_config.name }}"
+      ansible.builtin.debug:
+        msg: >-
+          Volume group '{{ volume_group_delete_config.name }}' deleted and
+          verified gone (was uuid {{ _vgd_json.uoid.uuid }}).

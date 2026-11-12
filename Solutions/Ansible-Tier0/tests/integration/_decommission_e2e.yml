@@ -1,0 +1,81 @@
+---
+# Helper for test_volume_group_delete.yml: run the REAL decommission_tier0.yml
+# against a fresh TLS mock Anvil, then read back what it did.
+#
+# Input:  _e2e_mode  mock mode ('' | fail-node-delete | join-on-delete)
+#         _e2e_args  extra ansible-playbook arguments (list)
+# Output: _e2e_run     the ansible-playbook result (rc, stdout)
+#         _e2e_calls   every write the mock received, "METHOD path"
+#         _e2e_groups  names of the groups left on the mock
+
+- name: "Pick a port for the mock ({{ _e2e_mode | default('', true) or 'default' }})"
+  ansible.builtin.command:
+    cmd: python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])"
+  register: _e2e_port
+  changed_when: false
+
+- name: Start the mock Anvil
+  ansible.builtin.shell:
+    cmd: >-
+      nohup python3 {{ (playbook_dir ~ '/mock_anvil_decommission.py') | quote }}
+      {{ _e2e_port.stdout | trim }} {{ (_e2e_tmp.path ~ '/cert.pem:' ~ _e2e_tmp.path ~ '/key.pem') | quote }}
+      {{ _e2e_mode | default('', true) | quote }} >/dev/null 2>&1 & echo $!
+  register: _e2e_mock
+  changed_when: false
+
+- name: Run decommission_tier0.yml against the mock, then stop it
+  block:
+    - name: Wait for the mock Anvil
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ _e2e_port.stdout | trim | int }}"
+        timeout: 10
+
+    - name: Run decommission_tier0.yml
+      ansible.builtin.command:
+        chdir: "{{ playbook_dir }}/../.."
+        argv: >-
+          {{ ['ansible-playbook', 'decommission_tier0.yml',
+              '-i', _e2e_tmp.path ~ '/inventory.ini',
+              '-e', {'hammerspace_api_host': '127.0.0.1',
+                     'hammerspace_api_port': _e2e_port.stdout | trim | int,
+                     'hammerspace_api_user': 'admin',
+                     'hammerspace_api_password': 'Mock-Passw0rd!',
+                     'hammerspace_api_validate_certs': false,
+                     'hammerspace_keyvault_uri': '',
+                     'hammerspace_volume_group_delete_wait_retries': 2,
+                     'hammerspace_volume_group_delete_wait_delay': 0} | to_json]
+             + _e2e_args }}
+      environment:
+        PATH: "{{ _e2e_tmp.path }}/bin:{{ _e2e_path_env }}"
+        ANSIBLE_LOG_PATH: "{{ _e2e_tmp.path }}/ansible.log"
+        ANSIBLE_NOCOLOR: "1"
+      register: _e2e_run
+      changed_when: false
+      failed_when: false
+
+    - name: Read what the mock received
+      ansible.builtin.uri:
+        url: "https://127.0.0.1:{{ _e2e_port.stdout | trim }}/_calls"
+        validate_certs: false
+        return_content: true
+      register: _e2e_calls_raw
+
+    - name: Read the groups left on the mock
+      ansible.builtin.uri:
+        url: "https://127.0.0.1:{{ _e2e_port.stdout | trim }}/mgmt/v1.2/rest/volume-groups"
+        validate_certs: false
+        return_content: true
+      register: _e2e_groups_raw
+
+    - name: Record the scenario result
+      ansible.builtin.set_fact:
+        _e2e_calls: "{{ (_e2e_calls_raw.content | from_json) }}"
+        _e2e_groups: "{{ (_e2e_groups_raw.content | from_json) | map(attribute='name') | list | sort }}"
+        _e2e_group_objs: "{{ (_e2e_groups_raw.content | from_json) }}"
+  always:
+    - name: Stop the mock Anvil
+      ansible.builtin.command:
+        cmd: kill {{ _e2e_mock.stdout | trim }}
+      changed_when: false
+      failed_when: false

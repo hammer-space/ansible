@@ -250,6 +250,10 @@ ansible-playbook decommission_tier0.yml -i inventory.yml --limit 'tier0-node-0[1
 
 Without `-e decommission_confirm=true` the playbook prints its plan and stops.
 
+Add `-e decommission_delete_volume_groups=true` to also delete the volume
+groups the run empties (only groups that held these volumes and nothing else;
+narrow further with `-e decommission_volume_group_match='<regex>'`).
+
 ### cleanup_instance_nodes.py — the same, for servers that are already gone
 
 Works from the control machine with only API access — the servers do not

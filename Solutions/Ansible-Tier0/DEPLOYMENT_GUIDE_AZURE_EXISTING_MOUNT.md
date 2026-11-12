@@ -263,9 +263,29 @@ ansible-playbook decommission_tier0.yml \
   -e decommission_confirm=true
 ```
 
-Order is deliberate: **leave the volume groups → delete the volumes → delete the
-node**, so no group is left holding a reference to storage that no longer
-exists.
+Order: **delete the volumes → delete the node → verify the volume groups**.
+Deleting a volume removes it from its volume groups; the playbook then
+re-reads the groups and warns if any still references a deleted volume.
+
+### Node, volumes and volume group in one command
+
+A per-job group (`tier0-<job>_<timestamp>`, created by the prolog with
+`hammerspace_create_volume_groups=true`) is not deleted by default. Add
+`decommission_delete_volume_groups=true` to delete the groups this run empties:
+
+```bash
+ansible-playbook decommission_tier0.yml \
+  -i inventory.azure_rm.yml \
+  --limit '<node-ip>' \
+  -e hammerspace_api_host=<same Anvil as the prolog> \
+  -e decommission_confirm=true \
+  -e decommission_delete_volume_groups=true \
+  -e decommission_volume_group_match='^tier0-<job>_'
+```
+
+A group is deleted only when it held this node's volumes and nothing else.
+A group shared with other nodes still in use is kept and reported. The
+`--check` preview lists the groups that would be deleted.
 
 ### Targeting is identical to deployment
 

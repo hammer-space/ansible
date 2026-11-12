@@ -1,0 +1,373 @@
+---
+# Regression test: decommission_tier0.yml deletes the volume groups it empties
+# (decommission_delete_volume_groups=true) — node, volumes and group in ONE
+# command, as the Slurm epilog needs for its per-job tier0-<job>_<ts> groups.
+#
+# What is pinned:
+#   1. The groups are read BEFORE the volume delete. After the cascade a group
+#      no longer lists the volume, so afterwards there is no telling which
+#      groups held it. (TEST 6 source order; TEST 2 end to end.)
+#   2. Only a group holding this run's volumes and NOTHING else is deleted —
+#      not one that still holds another node's volume, not a namePattern
+#      group, not one outside decommission_volume_group_match. (TESTs 2, 4)
+#   3. The group is re-read just before its DELETE: a volume joined between
+#      plan and delete keeps it. (TEST 3, mock mode join-on-delete)
+#   4. Nothing is deleted from groups when the node/volume delete failed, and
+#      nothing at all under --check. (TESTs 1, 5)
+#   5. DELETE addresses the group by uoid.uuid (the mock rejects a name, like
+#      a real Anvil rejects a PUT by name); its status is gated with the body
+#      redacted; a group still listed after the DELETE fails. (TEST 4)
+#   6. The flag off leaves every group alone. (TEST 7)
+#
+# TESTs 1-3, 5 and 7 run the REAL playbook — and cleanup_instance_nodes.py —
+# against mock_anvil_decommission.py over TLS. TEST 4 runs the task file
+# directly. The mock's responses are written for this test: it proves the
+# gating, not that a real Anvil answers DELETE /volume-groups/<uuid> the way
+# the mock does.
+#
+# Usage:
+#   ansible-playbook tests/integration/test_volume_group_delete.yml -i localhost, -c local
+
+- name: Volume group delete regression test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    _repo: "{{ playbook_dir }}/../.."
+    _role_tasks: "{{ _repo }}/roles/hammerspace_integration/tasks"
+    _vgd_src: "{{ lookup('file', _role_tasks ~ '/volume_group_delete.yml') }}"
+    _dc_src: "{{ lookup('file', _repo ~ '/decommission_tier0.yml') }}"
+    _vgd_code: "{{ _vgd_src.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+    _dc_code: "{{ _dc_src.split('\n') | reject('match', '\\s*#') | join('\n') }}"
+    _e2e_path_env: "{{ lookup('env', 'PATH') }}"
+
+    hammerspace_api_user: admin
+    hammerspace_api_password: "Mock-Passw0rd!"
+    hammerspace_volume_group_delete_wait_retries: 2
+    hammerspace_volume_group_delete_wait_delay: 0
+    _cred_b64: "{{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+    _v1: "hb-1::/nvme/tier0"
+
+  tasks:
+    # -------------------------------------------------------------- TEST 6
+    - name: 'TEST 6: source audit'
+      vars:
+        _curl_tasks: "{{ _vgd_src | regex_findall('ansible\\.builtin\\.shell:\\s*\\n\\s*cmd: >-\\s*\\n\\s*curl') | length }}"
+      ansible.builtin.assert:
+        that:
+          # Groups are read before the volume delete, and deleted after it.
+          - _dc_code.index('List the volume groups before any change')
+            < _dc_code.index('Delete the volumes and nodes from Hammerspace')
+          - _dc_code.index('Delete the volumes and nodes from Hammerspace')
+            < _dc_code.index('Delete the volume groups this decommission emptied')
+          # Only after the volume/node delete succeeded (or under --check).
+          - "'ansible_check_mode or ((_dc_cleanup.rc | default(1)) == 0)' in _dc_code"
+          # Opt-in, and the default is off.
+          - "'decommission_delete_volume_groups: false' in _dc_code"
+          # Never a DELETE under --check.
+          - "_vgd_code is search('_vgd_do_delete: >-\\s*\\n[^\\n]*\\n\\s*and not ansible_check_mode')"
+          # DELETE by uuid, never by name.
+          - _vgd_code is search('-X DELETE')
+          - _vgd_code is search('volume-groups/\{\{ _vgd_json\.uoid\.uuid')
+          # Every curl is no_log (command line holds the password).
+          - _curl_tasks | int >= 4
+          - "(_vgd_src | regex_findall('no_log: true') | length) >= (_curl_tasks | int)"
+        fail_msg: "Source audit of the volume group delete path failed."
+
+    - name: Make a temp dir for the TLS cert, inventory and python shim
+      ansible.builtin.tempfile:
+        state: directory
+      register: _e2e_tmp
+
+    - name: Run the cases, then remove the temp dir
+      block:
+        - name: Create a self-signed certificate for the mock
+          ansible.builtin.command:
+            argv: [openssl, req, -x509, -newkey, 'rsa:2048', -nodes, -days, '1',
+                   -subj, '/CN=127.0.0.1',
+                   -keyout, "{{ _e2e_tmp.path }}/key.pem", -out, "{{ _e2e_tmp.path }}/cert.pem"]
+          changed_when: false
+
+        - name: Write the inventory
+          ansible.builtin.copy:
+            dest: "{{ _e2e_tmp.path }}/inventory.ini"
+            content: |
+              [storage_servers]
+              hb-1 ansible_host=10.1.16.5 ansible_connection=local
+
+        # cleanup_instance_nodes.py needs `requests`, and the playbook runs it
+        # as plain `python3`. Put an interpreter that has it first on PATH:
+        # the one running Ansible, else whatever python3 is.
+        - name: Find a python3 with requests
+          ansible.builtin.shell:
+            cmd: >-
+              for p in {{ ansible_playbook_python | quote }} python3; do
+              "$p" -c 'import requests' 2>/dev/null && command -v "$p" && exit 0; done; exit 1
+            executable: /bin/bash
+          register: _e2e_py
+          changed_when: false
+          failed_when: false
+
+        - name: Fail if no python3 has requests
+          ansible.builtin.fail:
+            msg: >-
+              No python3 with the `requests` module was found (tried
+              {{ ansible_playbook_python }} and python3). The end-to-end cases
+              run cleanup_instance_nodes.py, which needs it — as it does on
+              the scheduler. pip install requests.
+          when: _e2e_py.rc != 0
+
+        # A wrapper, not a symlink: a symlinked venv interpreter does not find
+        # its pyvenv.cfg and loses the venv's site-packages.
+        - name: Create the bin dir
+          ansible.builtin.file:
+            path: "{{ _e2e_tmp.path }}/bin"
+            state: directory
+            mode: "0700"
+
+        - name: Put that python3 first on PATH
+          ansible.builtin.copy:
+            dest: "{{ _e2e_tmp.path }}/bin/python3"
+            mode: "0700"
+            content: |
+              #!/bin/sh
+              exec {{ _e2e_py.stdout_lines | last | quote }} "$@"
+
+        # ---------------------------------------------------------- TEST 1
+        - name: 'TEST 1: --check shows the groups it would delete and sends no DELETE'
+          ansible.builtin.include_tasks: _decommission_e2e.yml
+          vars:
+            _e2e_mode: ""
+            _e2e_args: ['--check', '-e', 'decommission_confirm=true', '-e', 'decommission_delete_volume_groups=true']
+
+        - name: 'TEST 1 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _e2e_run.rc == 0
+              - "'Volume groups to delete: 4' in _e2e_run.stdout"
+              - "'would DELETE volume group' in _e2e_run.stdout"
+              - _e2e_calls | length == 0
+            fail_msg: |
+              rc={{ _e2e_run.rc }} calls={{ _e2e_calls }}
+              {{ _e2e_run.stdout[-3000:] }}
+
+        # ---------------------------------------------------------- TEST 2
+        - name: 'TEST 2: one command deletes the volume, the node and the emptied group'
+          ansible.builtin.include_tasks: _decommission_e2e.yml
+          vars:
+            _e2e_mode: ""
+            _e2e_args: ['-e', 'decommission_confirm=true', '-e', 'decommission_delete_volume_groups=true',
+                        '-e', 'decommission_volume_group_match=^tier0-118_']
+
+        - name: 'TEST 2 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _e2e_run.rc == 0
+              - "'DELETE storage-volumes/' ~ _v1 in _e2e_calls"
+              - "'DELETE nodes/node-1' in _e2e_calls"
+              - "'DELETE volume-groups/uuid-tier0-118_a' in _e2e_calls"
+              # Exactly one group DELETE: not vg-shared (hb-2 still in it), not
+              # vg-pattern, not keep-me-118 (outside the match), not hb-2's node.
+              - _e2e_calls | select('match', 'DELETE volume-groups/') | list | length == 1
+              - "'DELETE nodes/node-2' not in _e2e_calls"
+              - "'tier0-118_a' not in _e2e_groups"
+              - "'vg-shared' in _e2e_groups"
+              - "'vg-pattern' in _e2e_groups"
+              - "'keep-me-118' in _e2e_groups"
+              - "'Volume groups deleted: tier0-118_a' in _e2e_run.stdout"
+            fail_msg: |
+              rc={{ _e2e_run.rc }} calls={{ _e2e_calls }} groups={{ _e2e_groups }}
+              {{ _e2e_run.stdout[-3000:] }}
+
+        # ---------------------------------------------------------- TEST 3
+        - name: 'TEST 3: a group that gained a volume after the plan is kept'
+          ansible.builtin.include_tasks: _decommission_e2e.yml
+          vars:
+            _e2e_mode: join-on-delete
+            _e2e_args: ['-e', 'decommission_confirm=true', '-e', 'decommission_delete_volume_groups=true',
+                        '-e', 'decommission_volume_group_match=^tier0-118_']
+
+        - name: 'TEST 3 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _e2e_run.rc == 0
+              - _e2e_calls | select('match', 'DELETE volume-groups/') | list | length == 0
+              - "'tier0-118_a' in _e2e_groups"
+              - "'NOT deleting volume group' in _e2e_run.stdout"
+              - "'hb-9::/nvme/tier0' in _e2e_run.stdout"
+              - "'Volume groups kept (still in use): tier0-118_a' in _e2e_run.stdout"
+            fail_msg: |
+              rc={{ _e2e_run.rc }} calls={{ _e2e_calls }} groups={{ _e2e_groups }}
+              {{ _e2e_run.stdout[-3000:] }}
+
+        # ---------------------------------------------------------- TEST 5
+        - name: 'TEST 5: when the node delete fails, no group is deleted'
+          ansible.builtin.include_tasks: _decommission_e2e.yml
+          vars:
+            _e2e_mode: fail-node-delete
+            _e2e_args: ['-e', 'decommission_confirm=true', '-e', 'decommission_delete_volume_groups=true']
+
+        - name: 'TEST 5 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _e2e_run.rc != 0
+              - "'cleanup_instance_nodes.py exited' in _e2e_run.stdout"
+              - _e2e_calls | select('match', 'DELETE volume-groups/') | list | length == 0
+              - "'tier0-118_a' in _e2e_groups"
+            fail_msg: |
+              rc={{ _e2e_run.rc }} calls={{ _e2e_calls }} groups={{ _e2e_groups }}
+              {{ _e2e_run.stdout[-3000:] }}
+
+        # ---------------------------------------------------------- TEST 7
+        - name: 'TEST 7: with the flag off, no group is touched'
+          ansible.builtin.include_tasks: _decommission_e2e.yml
+          vars:
+            _e2e_mode: ""
+            _e2e_args: ['-e', 'decommission_confirm=true']
+
+        - name: 'TEST 7 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _e2e_run.rc == 0
+              - "'DELETE nodes/node-1' in _e2e_calls"
+              - _e2e_calls | select('match', 'DELETE volume-groups/') | list | length == 0
+              - "'tier0-118_a' in _e2e_groups"
+              - "'none (decommission_delete_volume_groups=false)' in _e2e_run.stdout"
+            fail_msg: |
+              rc={{ _e2e_run.rc }} calls={{ _e2e_calls }} groups={{ _e2e_groups }}
+              {{ _e2e_run.stdout[-3000:] }}
+
+        # ---------------------------------------------------------- TEST 4
+        # The task file directly, over plain http, for the failure paths.
+        - name: Pick a port for the http mock
+          ansible.builtin.command:
+            cmd: python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])"
+          register: _port
+          changed_when: false
+
+        - name: Start the http mock
+          ansible.builtin.shell:
+            cmd: >-
+              nohup python3 {{ (playbook_dir ~ '/mock_anvil_decommission.py') | quote }}
+              {{ _port.stdout | trim }} - >/dev/null 2>&1 & echo $!
+          register: _mock
+          changed_when: false
+
+        - name: Run the task-file cases, then stop the http mock
+          block:
+            - name: Wait for the http mock
+              ansible.builtin.wait_for:
+                host: 127.0.0.1
+                port: "{{ _port.stdout | trim | int }}"
+                timeout: 10
+
+            - name: Point the role at the http mock
+              ansible.builtin.set_fact:
+                hs_api_url: "http://127.0.0.1:{{ _port.stdout | trim }}/mgmt/v1.2/rest"
+
+            - name: 'TEST 4a: a group holding another volume is kept'
+              ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_delete.yml"
+              vars:
+                volume_group_delete_config: {name: vg-shared, volumes: ["{{ _v1 }}"]}
+
+            - name: 'TEST 4a ASSERT'
+              ansible.builtin.assert:
+                that: [_vgd_result == 'kept', "'hb-2::/nvme/tier0' in _vgd_other"]
+                fail_msg: "result={{ _vgd_result }} other={{ _vgd_other }}"
+
+            - name: 'TEST 4b: a namePattern group is kept'
+              ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_delete.yml"
+              vars:
+                volume_group_delete_config: {name: vg-pattern, volumes: ["{{ _v1 }}"]}
+
+            - name: 'TEST 4b ASSERT'
+              ansible.builtin.assert:
+                that: [_vgd_result == 'kept', "_vgd_other == ['expression *']"]
+                fail_msg: "result={{ _vgd_result }} other={{ _vgd_other }}"
+
+            - name: 'TEST 4c: a missing group is reported absent, not an error'
+              ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_delete.yml"
+              vars:
+                volume_group_delete_config: {name: no-such-group, volumes: []}
+
+            - name: 'TEST 4c ASSERT'
+              ansible.builtin.assert:
+                that: [_vgd_result == 'absent']
+                fail_msg: "result={{ _vgd_result }}"
+
+            - name: 'TEST 4d: a group listing only the deleted volume is deleted by uuid'
+              ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_delete.yml"
+              vars:
+                volume_group_delete_config: {name: tier0-118_a, volumes: ["{{ _v1 }}"]}
+
+            - name: 'TEST 4d ASSERT'
+              ansible.builtin.assert:
+                that: [_vgd_result == 'deleted', "'tier0-118_a' in _hs_vg_deleted_groups"]
+                fail_msg: "result={{ _vgd_result }}"
+
+            - name: 'TEST 4e: a rejected DELETE fails, with the credential redacted'
+              block:
+                - name: 'TEST 4e: run'
+                  ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_delete.yml"
+                  vars:
+                    volume_group_delete_config: {name: tier0-reject, volumes: ["{{ _v1 }}"]}
+                - name: 'TEST 4e FAIL: a rejected DELETE was reported as success'
+                  ansible.builtin.fail:
+                    msg: "result={{ _vgd_result }}"
+              rescue:
+                - name: 'TEST 4e ASSERT'
+                  ansible.builtin.assert:
+                    that:
+                      - "'HTTP 400' in ansible_failed_result.msg"
+                      - "_cred_b64 not in ansible_failed_result.msg"
+                      - "'Basic <redacted>' in ansible_failed_result.msg"
+                    fail_msg: "{{ ansible_failed_result.msg }}"
+
+            - name: 'TEST 4f: a group still listed after the DELETE fails'
+              block:
+                - name: 'TEST 4f: run'
+                  ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_delete.yml"
+                  vars:
+                    volume_group_delete_config: {name: tier0-sticky, volumes: ["{{ _v1 }}"]}
+                - name: 'TEST 4f FAIL: a group that never went away was reported deleted'
+                  ansible.builtin.fail:
+                    msg: "result={{ _vgd_result }}"
+              rescue:
+                - name: 'TEST 4f ASSERT'
+                  ansible.builtin.assert:
+                    that: ["'still listed' in ansible_failed_result.msg"]
+                    fail_msg: "{{ ansible_failed_result.msg }}"
+
+            - name: Read what the http mock received
+              ansible.builtin.uri:
+                url: "http://127.0.0.1:{{ _port.stdout | trim }}/_calls"
+                return_content: true
+              register: _calls
+
+            - name: 'TEST 4 ASSERT: every DELETE addressed a uuid; kept groups got none'
+              ansible.builtin.assert:
+                that:
+                  - >-
+                    (_calls.content | from_json) == ['DELETE volume-groups/uuid-tier0-118_a',
+                                    'DELETE volume-groups/uuid-tier0-reject',
+                                    'DELETE volume-groups/uuid-tier0-sticky']
+                fail_msg: "calls={{ (_calls.content | from_json) }}"
+          always:
+            - name: Stop the http mock
+              ansible.builtin.command:
+                cmd: kill {{ _mock.stdout | trim }}
+              changed_when: false
+              failed_when: false
+      always:
+        - name: Remove the temp dir
+          ansible.builtin.file:
+            path: "{{ _e2e_tmp.path }}"
+            state: absent
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          Volume group delete: TESTs 1-7 passed (check mode, one-command
+          delete, race keep, failed-delete gate, task-file failure paths,
+          source audit, flag off).
