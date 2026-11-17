@@ -391,6 +391,11 @@ hammerspace_api_password: "{{ vault_hammerspace_api_password }}"
 #   auto | cli | credential_file | env | msi
 hammerspace_keyvault_auth_source: "auto"
 #
+# Seconds before the lookup is abandoned and reported (0 = no limit). A
+# healthy lookup takes seconds; an unreachable identity or vault endpoint
+# otherwise hangs for minutes on the Azure SDK's own timeouts.
+hammerspace_keyvault_timeout: 600
+#
 # The identity needs GET on secrets for that vault — the "Key Vault Secrets
 # User" RBAC role, or a `get` secret permission if the vault still uses access
 # policies. Verify by hand first:

@@ -92,6 +92,8 @@ The identity needs **Key Vault Secrets User** on the vault. The lookup runs on
 the scheduler only (`delegate_to: localhost`, `run_once`), so target nodes need
 no vault access.
 
+The password is looked up once per run and reused by the later plays.
+
 > **Security note.** `vars/vault.yml` is tracked by git and is **not** in
 > `.gitignore`. A real password there is one `git add` away from being
 > committed. Encrypt it with `ansible-vault encrypt vars/vault.yml`, or use the
@@ -119,6 +121,8 @@ az keyvault secret show --vault-name <vault> --name hammerspace-admin-password -
 | `(Forbidden)` / 403 | auth worked; the identity lacks **Key Vault Secrets User** on the vault |
 | `SecretNotFound` / empty result | wrong secret name (case-sensitive) |
 | connection timeout | vault is behind a private endpoint the scheduler cannot reach |
+| lookup takes minutes, then succeeds | `hammerspace_keyvault_auth_source: auto` is trying other credential sources before the managed identity — set `msi` |
+| `TIMED OUT after N s` | nothing answered: the identity endpoint (169.254.169.254), the vault, or the login endpoint is unreachable from the scheduler. The message lists the commands to tell which. |
 
 Confirm an identity is actually attached to the scheduler:
 

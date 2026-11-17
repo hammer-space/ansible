@@ -115,7 +115,8 @@ Used when `use_dynamic_discovery: false`.
 | `hammerspace_debug` | `false` | Enable debug output for API calls. |
 | `hammerspace_keyvault_uri` | *(unset)* | **Azure only, opt-in.** Pull the admin password from this Key Vault (`https://<vault>.vault.azure.net`) instead of `vars/vault.yml`. |
 | `hammerspace_keyvault_secret_name` | *(unset)* | Name of the secret in that vault. |
-| `hammerspace_keyvault_auth_source` | `"auto"` | How the control machine authenticates to Azure: `auto`, `cli`, `credential_file`, `env`, `msi`. |
+| `hammerspace_keyvault_auth_source` | `"auto"` | How the control machine authenticates to Azure: `auto`, `cli`, `credential_file`, `env`, `msi`. With a managed identity use `msi`: `auto` tries other sources first and can add minutes per lookup. |
+| `hammerspace_keyvault_timeout` | `600` | Seconds before a Key Vault lookup is abandoned and reported as a reachability problem. `0` = no limit. The lookup runs once per `site.yml` run, not once per play. |
 
 ## Volume Configuration
 

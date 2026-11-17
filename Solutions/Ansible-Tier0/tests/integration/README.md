@@ -892,3 +892,27 @@ command and exits non-zero on any failure.
 - The tests use `block` / `rescue` to convert expected failures into
   test passes. Real failures bubble up via the final `_test_failures`
   list.
+
+## `test_keyvault_password.yml` — TESTs 7–8 (one lookup per run, timeout)
+
+`site.yml` includes the Key Vault lookup from three plays (storage,
+hammerspace_serial, di_exports), and every lookup is a new azure.azcollection
+process. In the field each one took minutes, so a Slurm prolog paid for it
+three times. The lookup now records which vault and secret it loaded
+(`_hs_kv_loaded_from`), and a later play skips the lookup when every play
+host already holds that password. The decision is made across
+`ansible_play_hosts` because the lookup is `run_once`. The lookup also
+carries `timeout: hammerspace_keyvault_timeout`. A task timeout bypasses
+`failed_when`, so the task also needs `ignore_errors`. Without it, the
+timeout aborts the play with a result that `no_log` censors.
+
+| # | Scenario | Expected |
+|---|----------|----------|
+| 7a | Host already holds the password from the same vault/secret (URI given with a trailing slash) | Lookup skipped, password kept |
+| 7b | Different secret name | Lookup runs |
+| 7c | `sleep` task with `timeout`, `failed_when: false`, `ignore_errors` | Registers `failed` + `timedout`, play continues (pins the Ansible behaviour) |
+| 7d | **Audit** | `timeout`, `ignore_errors`, timeout message, `_hs_kv_loaded_from`, `ansible_play_hosts` present |
+| 8 | Two hosts, only the first (`run_once`) host pre-loaded | Both hosts decide the lookup is needed |
+
+Mutation-tested (6/6 caught): per-host decision, no `ignore_errors`, skip
+never fires, key ignores the secret name, block ungated, no `timeout`.
