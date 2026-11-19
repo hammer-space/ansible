@@ -404,7 +404,13 @@
             {%- for x in g.expressions | default([]) -%}
               {%- if x.locations is not defined -%}{%- set c.other = c.other + 1 -%}{%- endif -%}
               {%- for l in x.locations | default([]) -%}
-                {%- if ((l.storageVolume | default({})).name | default('')) in _dc_volumes -%}
+                {%- set vn = (l.storageVolume | default({})).name | default('') -%}
+                {#- a deleted volume is left as a "__z_volume:<name>" group reference -#}
+                {%- if vn | length == 0 and (l._type | default('')) == 'VOLUME_GROUP'
+                      and (l.name | default('')) is match('__z_volume:') -%}
+                  {%- set vn = l.name[('__z_volume:' | length):] -%}
+                {%- endif -%}
+                {%- if vn | length > 0 and vn in _dc_volumes -%}
                   {%- set c.ours = c.ours + 1 -%}
                 {%- else -%}
                   {%- set c.other = c.other + 1 -%}

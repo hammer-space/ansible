@@ -559,8 +559,19 @@ the place-on wait each fails the relevant test.
 `decommission_tier0.yml -e decommission_delete_volume_groups=true` deletes the
 node, its volumes and the volume groups the run empties in one command (the
 Slurm epilog case: per-job `tier0-<job>_<ts>` groups). The groups are read
-BEFORE the volume delete, because once the delete cascades a group no longer
-lists the volume and there is no way to tell which groups held it.
+BEFORE the volume delete: afterwards the volume is gone from the volume list
+and its groups hold only a placeholder, so there is no way to tell which
+run's volume it was.
+
+**A real Anvil does not remove a deleted volume from its groups.** It replaces
+the `VOLUME_LOCATION` entry with a reference to a hidden per-volume group,
+`{"_type": "VOLUME_GROUP", "name": "__z_volume:<volume name>", ...}` (captured
+from a field Anvil; the group's `volumes` was `[]` and the UI showed 0
+volumes). The first mock removed the entry instead — written from the same
+guess as the code — so every emptied group was kept as "still selects
+VOLUME_GROUP" in the field while the test passed. The mock now leaves the
+captured placeholder on every volume delete, and both the plan and the
+pre-DELETE re-read read `__z_volume:<name>` as that volume.
 
 TESTs 1–3, 5 and 7 run the REAL playbook, and `cleanup_instance_nodes.py`,
 against `mock_anvil_decommission.py` over TLS (self-signed cert, made per run)
@@ -573,18 +584,20 @@ over plain http. The mock proves the gating, not that a real Anvil answers
 | # | Scenario | Expected |
 |---|----------|----------|
 | 1 | `--check`, flag on, no match filter | Plan lists the 4 groups holding only hb-1; "would DELETE"; the mock receives no write at all |
-| 2 | Flag on, `decommission_volume_group_match=^tier0-118_` | Volume, node and `tier0-118_a` deleted (by uuid) in one run; `vg-shared` (hb-2 still in it), `vg-pattern` and `keep-me-118` (outside the match) kept; exactly one group DELETE |
+| 2 | Flag on, `decommission_volume_group_match=^tier0-118_` | Volume, node and `tier0-118_a` deleted (by uuid) in one run, its hb-1 entry having become a `__z_volume:` placeholder; `vg-shared` (hb-2 still in it), `vg-pattern`, `tier0-118_old` (placeholder of an older volume) and `keep-me-118` (outside the match) kept; exactly one group DELETE |
 | 3 | A volume joins the group between plan and delete (mock `join-on-delete`) | Group re-read before its DELETE, kept, the new member named, rc 0 |
-| 4 | Task file: shared group / namePattern / missing / emptied / DELETE 400 echoing `authorization` / DELETE 202 but still listed | kept / kept / absent / deleted / hard failure with `Basic <redacted>` and no base64 / hard failure "still listed"; every DELETE addressed a uuid, kept groups got none |
+| 4 | Task file: shared group / namePattern / missing / emptied / DELETE 400 echoing `authorization` / DELETE 202 but still listed / placeholder for a volume this run did NOT delete (4g) | kept / kept / absent / deleted / hard failure with `Basic <redacted>` and no base64 / hard failure "still listed" / kept, naming `hb-0::/nvme/tier0`; every DELETE addressed a uuid, kept groups got none |
 | 5 | Node delete fails (mock `fail-node-delete`) | Play fails on the cleanup exit code; no group DELETE |
-| 6 | **Audit** | Groups listed before the volume delete, deleted after it; include gated on `--check` or cleanup rc 0; flag defaults false; `_vgd_do_delete` excludes check mode; DELETE by `uoid.uuid`; every curl `no_log` |
+| 6 | **Audit** | Groups listed before the volume delete, deleted after it; include gated on `--check` or cleanup rc 0; flag defaults false; `_vgd_do_delete` excludes check mode; DELETE by `uoid.uuid`; every curl `no_log`; `__z_volume:` handled in both the plan and the re-check |
 | 7 | Flag off | Node deleted, no group touched, plan says so |
 
 Mutation-tested (9): deleting under `--check`, ignoring other members in the
 re-check or in the plan, ignoring a namePattern expression, DELETE by name,
 dropping the DELETE status gate or the "still listed" check, dropping the
 cleanup-rc gate, and ignoring `decommission_volume_group_match` each fail a
-test.
+test. Plus 3 for the placeholder: not reading it in the re-check (TEST 2),
+not reading it in the plan (TEST 6), and reading ANY placeholder as this
+run's volume (TEST 4g).
 
 ## `test_api_body_redaction.yml`
 

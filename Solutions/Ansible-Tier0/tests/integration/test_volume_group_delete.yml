@@ -4,9 +4,9 @@
 # command, as the Slurm epilog needs for its per-job tier0-<job>_<ts> groups.
 #
 # What is pinned:
-#   1. The groups are read BEFORE the volume delete. After the cascade a group
-#      no longer lists the volume, so afterwards there is no telling which
-#      groups held it. (TEST 6 source order; TEST 2 end to end.)
+#   1. The groups are read BEFORE the volume delete. Afterwards a group shows
+#      only a "__z_volume:" placeholder and the volume is gone from the volume
+#      list, so there is no telling which run's volume it was. (TEST 6 source order; TEST 2 end to end.)
 #   2. Only a group holding this run's volumes and NOTHING else is deleted —
 #      not one that still holds another node's volume, not a namePattern
 #      group, not one outside decommission_volume_group_match. (TESTs 2, 4)
@@ -18,6 +18,11 @@
 #      a real Anvil rejects a PUT by name); its status is gated with the body
 #      redacted; a group still listed after the DELETE fails. (TEST 4)
 #   6. The flag off leaves every group alone. (TEST 7)
+#   7. A real Anvil does not remove a deleted volume from its groups: it swaps
+#      the location for {"_type": "VOLUME_GROUP", "name": "__z_volume:<vol>"}
+#      (captured from a field Anvil). That placeholder is read as the volume
+#      it names — ours makes the group deletable, anyone else's keeps it.
+#      The mock reproduces it on every volume delete. (TESTs 2, 6)
 #
 # TESTs 1-3, 5 and 7 run the REAL playbook — and cleanup_instance_nodes.py —
 # against mock_anvil_decommission.py over TLS. TEST 4 runs the task file
@@ -67,6 +72,11 @@
           - "'decommission_delete_volume_groups: false' in _dc_code"
           # Never a DELETE under --check.
           - "_vgd_code is search('_vgd_do_delete: >-\\s*\\n[^\\n]*\\n\\s*and not ansible_check_mode')"
+          # A deleted volume is left in its groups as a "__z_volume:<name>"
+          # VOLUME_GROUP reference (real Anvil, job 146). Both the plan and the
+          # pre-DELETE re-read must read it as that volume.
+          - "'__z_volume:' in _dc_code"
+          - "'__z_volume:' in _vgd_code"
           # DELETE by uuid, never by name.
           - _vgd_code is search('-X DELETE')
           - _vgd_code is search('volume-groups/\{\{ _vgd_json\.uoid\.uuid')
@@ -175,6 +185,9 @@
               - "'vg-shared' in _e2e_groups"
               - "'vg-pattern' in _e2e_groups"
               - "'keep-me-118' in _e2e_groups"
+              # A "__z_volume:" placeholder for a volume THIS run did not delete
+              # still counts as in use.
+              - "'tier0-118_old' in _e2e_groups"
               - "'Volume groups deleted: tier0-118_a' in _e2e_run.stdout"
             fail_msg: |
               rc={{ _e2e_run.rc }} calls={{ _e2e_calls }} groups={{ _e2e_groups }}
@@ -284,6 +297,18 @@
             - name: 'TEST 4b ASSERT'
               ansible.builtin.assert:
                 that: [_vgd_result == 'kept', "_vgd_other == ['expression *']"]
+                fail_msg: "result={{ _vgd_result }} other={{ _vgd_other }}"
+
+            # tier0-118_old holds hb-1 plus a "__z_volume:" placeholder left by
+            # an older deleted volume (hb-0). Only hb-1 was deleted by this run.
+            - name: 'TEST 4g: a placeholder for a volume this run did not delete keeps the group'
+              ansible.builtin.include_tasks: "{{ _role_tasks }}/volume_group_delete.yml"
+              vars:
+                volume_group_delete_config: {name: tier0-118_old, volumes: ["{{ _v1 }}"]}
+
+            - name: 'TEST 4g ASSERT'
+              ansible.builtin.assert:
+                that: [_vgd_result == 'kept', "_vgd_other == ['hb-0::/nvme/tier0']"]
                 fail_msg: "result={{ _vgd_result }} other={{ _vgd_other }}"
 
             - name: 'TEST 4c: a missing group is reported absent, not an error'

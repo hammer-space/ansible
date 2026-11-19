@@ -11,12 +11,15 @@ State at start:
              keep-me-118      hb-1 only               -> emptied, name filter
              vg-shared        hb-1 + hb-2             -> still in use
              vg-pattern       namePattern '*'         -> selects by pattern
+             tier0-118_old    hb-1 + "__z_volume:" ref to an older deleted
+                              volume                  -> still in use
              tier0-reject     hb-1 only; DELETE -> 400 echoing the
                               Authorization header as a JSON object
              tier0-sticky     hb-1 only; DELETE -> 202, never goes away
 
-Deleting a storage volume removes it from every group (the cascade the real
-Anvil performs). DELETE /volume-groups/<x> is accepted only when <x> is the
+Deleting a storage volume replaces it, in every group, with a reference to a
+hidden "__z_volume:<volume name>" volume group, as a real Anvil does.
+DELETE /volume-groups/<x> is accepted only when <x> is the
 group's uuid: by NAME it is rejected, like a PUT by name on a real Anvil.
 
 Modes (argv[3], optional):
@@ -49,6 +52,13 @@ def loc(name):
     return {"_type": "VOLUME_LOCATION", "storageVolume": {"_type": "STORAGE_VOLUME", "name": name}}
 
 
+def placeholder(name):
+    return {"_type": "VOLUME_GROUP",
+            "uoid": {"uuid": "z-" + name, "objectType": "VOLUME_GROUP"},
+            "created": 1795085323975, "modified": 1795085323975, "extendedInfo": {},
+            "name": "__z_volume:" + name, "internalId": 1342177398}
+
+
 def group(name, expressions):
     return {"_type": "VOLUME_GROUP", "name": name, "uoid": {"uuid": "uuid-" + name},
             "expressions": expressions}
@@ -59,6 +69,9 @@ groups = {g["name"]: g for g in [
     group("keep-me-118", [{"operator": "IN", "locations": [loc(V1)]}]),
     group("vg-shared", [{"operator": "IN", "locations": [loc(V1), loc(V2)]}]),
     group("vg-pattern", [{"expressionType": "VOLUME_LOCATION", "namePattern": "*"}]),
+    # holds hb-1 AND a placeholder left by an older, already deleted volume
+    group("tier0-118_old", [{"operator": "IN",
+                             "locations": [loc(V1), placeholder("hb-0::/nvme/tier0")]}]),
     group("tier0-reject", [{"operator": "IN", "locations": [loc(V1)]}]),
     group("tier0-sticky", [{"operator": "IN", "locations": [loc(V1)]}]),
 ]}
@@ -114,11 +127,15 @@ class Handler(BaseHTTPRequestHandler):
             name = p[len("storage-volumes/"):]
             if volumes.pop(name, None) is None:
                 return self.reply(404, {"errorCode": 4002})
+            # A real Anvil does not drop the deleted volume from its groups: it
+            # swaps the location for a hidden per-volume group reference. Shape
+            # captured from a field Anvil (job 146), uuids/ids made up.
             for g in groups.values():
                 for x in g["expressions"]:
                     if "locations" in x:
-                        x["locations"] = [l for l in x["locations"]
-                                          if l.get("storageVolume", {}).get("name") != name]
+                        x["locations"] = [placeholder(name)
+                                          if l.get("storageVolume", {}).get("name") == name else l
+                                          for l in x["locations"]]
             if MODE == "join-on-delete":
                 groups["tier0-118_a"]["expressions"][0]["locations"].append(loc("hb-9::/nvme/tier0"))
             return self.reply(200, {})
