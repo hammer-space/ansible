@@ -71,6 +71,10 @@
     decommission_delete_volume_groups: false
     # Regex on the group name; only matching groups may be deleted. '' = any.
     decommission_volume_group_match: ''
+    # After the volume/node delete, how long to wait for the Anvil to stop
+    # listing them before giving up (no group is deleted on timeout).
+    decommission_wait_timeout: 900
+    decommission_wait_delay: 10
 
   pre_tasks:
     # ------------------------------------------------------------------ #
@@ -409,6 +413,11 @@
                 {%- if vn | length == 0 and (l._type | default('')) == 'VOLUME_GROUP'
                       and (l.name | default('')) is match('__z_volume:') -%}
                   {%- set vn = l.name[('__z_volume:' | length):] -%}
+                  {#- the Anvil appends _<n> when that hidden name is already taken -#}
+                  {%- if vn not in _dc_volumes and vn is search('_[0-9]+$')
+                        and vn.rsplit('_', 1)[0] in _dc_volumes -%}
+                    {%- set vn = vn.rsplit('_', 1)[0] -%}
+                  {%- endif -%}
                 {%- endif -%}
                 {%- if vn | length > 0 and vn in _dc_volumes -%}
                   {%- set c.ours = c.ours + 1 -%}
@@ -560,6 +569,129 @@
       run_once: true
 
     # ------------------------------------------------------------------ #
+    # 3b. Wait until the Anvil no longer lists the volumes and nodes.
+    #
+    #    Volume and node deletes are asynchronous, and the script's own
+    #    "✓ Deleted" is not proof: it ignores the task result and checks with a
+    #    per-name GET that a real Anvil answers 404 (a volume name holds "/").
+    #    In the field a volume reported deleted sat in DECOMMISSIONING_QUIESCED.
+    #    So the LIST endpoints are polled, matched by exact name, until nothing
+    #    this run deleted is still there. Groups are deleted only after that;
+    #    on timeout no group is touched and the run fails naming what is left
+    #    and its state.
+    # ------------------------------------------------------------------ #
+    - name: Wait until the deleted volumes and nodes are gone
+      when:
+        - not ansible_check_mode
+        - (_dc_cleanup.rc | default(1)) == 0
+      delegate_to: localhost
+      run_once: true
+      become: false
+      vars:
+        _dc_wait_retries: >-
+          {{ [((decommission_wait_timeout | int) / ([decommission_wait_delay | int, 1] | max)) | int, 1] | max }}
+      block:
+        - name: Poll the volume list until none of this run's volumes is listed
+          ansible.builtin.shell:
+            cmd: >-
+              curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+              {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+              -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+              "{{ hs_api_url }}/storage-volumes"
+          register: _dc_vol_poll
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          no_log: true
+          retries: "{{ _dc_wait_retries }}"
+          delay: "{{ decommission_wait_delay | int }}"
+          until: >-
+            ((_dc_vol_poll.stdout_lines | default(['0']))[-1] | default('0')) == '200'
+            and (((_dc_vol_poll.stdout_lines[:-1] | join('\n') | trim | default('[]', true)) | from_json)
+                 | selectattr('name', 'defined') | selectattr('name', 'in', _dc_volumes)
+                 | list | length) == 0
+          when: _dc_volumes | length > 0
+
+        - name: Poll the node list until none of this run's nodes is listed
+          ansible.builtin.shell:
+            cmd: >-
+              curl -s -w "\n%{http_code}" --max-time {{ hammerspace_api_curl_timeout | default(60) }}
+              {{ '' if (hammerspace_api_validate_certs | default(false)) else '-k' }}
+              -H "Authorization: Basic {{ (hammerspace_api_user ~ ':' ~ hammerspace_api_password) | b64encode }}"
+              "{{ hs_api_url }}/nodes"
+          register: _dc_node_poll
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          no_log: true
+          retries: "{{ _dc_wait_retries }}"
+          delay: "{{ decommission_wait_delay | int }}"
+          until: >-
+            ((_dc_node_poll.stdout_lines | default(['0']))[-1] | default('0')) == '200'
+            and (((_dc_node_poll.stdout_lines[:-1] | join('\n') | trim | default('[]', true)) | from_json)
+                 | selectattr('name', 'defined') | selectattr('name', 'in', _dc_nodes)
+                 | list | length) == 0
+
+        # Reduced to name/state BEFORE anything is printed: the registered
+        # results come from no_log tasks whose cmd holds the credential.
+        - name: Record what is still listed
+          ansible.builtin.set_fact:
+            _dc_vol_poll_status: "{{ (_dc_vol_poll.stdout_lines | default(['200']))[-1] | default('0') }}"
+            _dc_node_poll_status: "{{ (_dc_node_poll.stdout_lines | default(['0']))[-1] | default('0') }}"
+            _dc_left_volumes: >-
+              {{ ((((_dc_vol_poll.stdout_lines | default(['[]', '200']))[:-1] | join('\n') | trim | default('[]', true)) | from_json)
+                  if ((_dc_vol_poll.stdout_lines | default(['200']))[-1] | default('0')) == '200' else [])
+                 | selectattr('name', 'defined') | selectattr('name', 'in', _dc_volumes)
+                 | map('dict2items')
+                 | map('selectattr', 'key', 'in', ['name', 'storageVolumeState', 'operationalStatus'])
+                 | map('items2dict') | list }}
+            _dc_left_nodes: >-
+              {{ ((((_dc_node_poll.stdout_lines | default(['[]', '0']))[:-1] | join('\n') | trim | default('[]', true)) | from_json)
+                  if ((_dc_node_poll.stdout_lines | default(['0']))[-1] | default('0')) == '200' else [])
+                 | selectattr('name', 'defined') | selectattr('name', 'in', _dc_nodes)
+                 | map(attribute='name') | list }}
+
+        - name: Decide whether the deletes are confirmed
+          ansible.builtin.set_fact:
+            _dc_deletes_confirmed: >-
+              {{ _dc_vol_poll_status == '200' and _dc_node_poll_status == '200'
+                 and _dc_left_volumes | length == 0 and _dc_left_nodes | length == 0 }}
+
+        - name: Report the deletes are confirmed
+          ansible.builtin.debug:
+            msg: >-
+              Confirmed: the Anvil no longer lists the {{ _dc_volumes | length }}
+              volume(s) or the {{ _dc_nodes | length }} node(s) this run deleted.
+          when: _dc_deletes_confirmed | bool
+
+        - name: Fail if the Anvil still lists what this run deleted
+          ansible.builtin.fail:
+            msg: |
+              The Anvil still lists what this run deleted, {{ decommission_wait_timeout }} s
+              after the delete. NO volume group was deleted.
+              {% if _dc_vol_poll_status != '200' or _dc_node_poll_status != '200' %}
+
+              The lists could not be read (volumes HTTP {{ _dc_vol_poll_status }},
+              nodes HTTP {{ _dc_node_poll_status }}), so the deletes are unconfirmed.
+              {% endif %}
+              {% for v in _dc_left_volumes %}
+                volume {{ v.name }}: state {{ v.storageVolumeState | default('?') }}, {{ v.operationalStatus | default('?') }}
+              {% endfor %}
+              {% for n in _dc_left_nodes %}
+                node   {{ n }}
+              {% endfor %}
+
+              A volume in DECOMMISSIONING / DECOMMISSIONING_QUIESCED is still
+              evacuating, or is stuck because its node is unreachable. Check it
+              with `volume-list` on the Anvil. A slow cluster may just need
+              -e decommission_wait_timeout=<seconds>.
+
+              Once the Anvil no longer lists them, delete this run's volume
+              groups in the UI: a re-run cannot attribute an emptied group to
+              volumes that are already gone.
+          when: not (_dc_deletes_confirmed | bool)
+
+    # ------------------------------------------------------------------ #
     # 4. Verify the cascade. The whole point of the old pre-emptive PUT was
     #    that no volume group should be left referencing a volume that no
     #    longer exists. Relying on the delete to do it is fine; relying on it
@@ -700,6 +832,8 @@
         - decommission_delete_volume_groups | bool
         - inventory_hostname == (ansible_play_hosts | first)
         - ansible_check_mode or ((_dc_cleanup.rc | default(1)) == 0)
+        # ...and the Anvil no longer lists the volumes and nodes (3b).
+        - ansible_check_mode or (_dc_deletes_confirmed | default(false) | bool)
 
     - name: Fail if volume or node deletion reported an error
       ansible.builtin.fail:

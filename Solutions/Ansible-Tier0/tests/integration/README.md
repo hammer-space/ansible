@@ -573,7 +573,16 @@ VOLUME_GROUP" in the field while the test passed. The mock now leaves the
 captured placeholder on every volume delete, and both the plan and the
 pre-DELETE re-read read `__z_volume:<name>` as that volume.
 
-TESTs 1–3, 5 and 7 run the REAL playbook, and `cleanup_instance_nodes.py`,
+The hidden group's name must be unique. When a placeholder for an earlier
+volume of the same name still exists — the same node decommissioned job
+after job — the Anvil appends a counter: `__z_volume:10.1.16.4::/nvme/tier0_14`
+(field, the job after the first fix shipped; the exact-name fix kept that
+group too). A trailing `_<digits>` is stripped only when the name as written
+is not itself one of the run's volumes. The mock's `vg-shared` starts with an
+older hb-1 placeholder, so deleting hb-1 yields `__z_volume:hb-1::/nvme/tier0_1`
+and TEST 2 deletes a group whose placeholder is suffixed.
+
+TESTs 1–3, 5 and 7–9 run the REAL playbook, and `cleanup_instance_nodes.py`,
 against `mock_anvil_decommission.py` over TLS (self-signed cert, made per run)
 through `_decommission_e2e.yml`. They need a `python3` with `requests`; the
 test uses the interpreter running Ansible, or `python3`, and FAILS if neither
@@ -590,14 +599,24 @@ over plain http. The mock proves the gating, not that a real Anvil answers
 | 5 | Node delete fails (mock `fail-node-delete`) | Play fails on the cleanup exit code; no group DELETE |
 | 6 | **Audit** | Groups listed before the volume delete, deleted after it; include gated on `--check` or cleanup rc 0; flag defaults false; `_vgd_do_delete` excludes check mode; DELETE by `uoid.uuid`; every curl `no_log`; `__z_volume:` handled in both the plan and the re-check |
 | 7 | Flag off | Node deleted, no group touched, plan says so |
+| 8 | Async delete (mock `slow-delete`): volume and node stay listed for 3 more reads; per-name GET 404s as on a field Anvil | Playbook polls the LIST endpoints (retries visible), reports "Confirmed", then deletes `tier0-118_a` |
+| 9 | Stuck volume (mock `stuck-volume`): never leaves the list, `DECOMMISSIONING_QUIESCED` | rc != 0, "still lists what this run deleted" with the volume and its state, no group DELETE, no credential in the output |
 
 Mutation-tested (9): deleting under `--check`, ignoring other members in the
 re-check or in the plan, ignoring a namePattern expression, DELETE by name,
 dropping the DELETE status gate or the "still listed" check, dropping the
 cleanup-rc gate, and ignoring `decommission_volume_group_match` each fail a
-test. Plus 3 for the placeholder: not reading it in the re-check (TEST 2),
-not reading it in the plan (TEST 6), and reading ANY placeholder as this
-run's volume (TEST 4g).
+test. Plus 5 for the placeholder: not reading it in the re-check (TEST 2),
+not reading it in the plan (TEST 6), reading ANY placeholder as this run's
+volume (TEST 4g), and not stripping the `_<n>` suffix in the re-check
+(TEST 2, and TEST 6) or in the plan (TEST 6). Plus 4 for the wait gate
+(TESTs 8–9): dropping the failure on timeout, dropping it AND the group
+gate, not waiting (`until: true`), and ignoring volumes still listed.
+
+The cleanup script's own "✓ Deleted" is not evidence: it checks with a
+per-name GET that a field Anvil 404s (a volume name holds `/`), and it
+ignores the delete task's result. Hence the LIST polling, and why both new
+mock modes 404 the per-name GET.
 
 ## `test_api_body_redaction.yml`
 

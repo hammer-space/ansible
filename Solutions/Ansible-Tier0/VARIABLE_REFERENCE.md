@@ -549,6 +549,8 @@ controller and talks only to the API.
 | `decommission_explicit_volume_group_leave` | `false` | Remove volumes from their volume groups with an explicit PUT *before* deleting them. Not needed: deleting a volume removes it from its groups, and the playbook verifies that after the delete. Set to `true` only if the post-delete verification warns that references survived. |
 | `decommission_delete_volume_groups` | `false` | Also delete the volume groups this run empties, so node, volumes and group go in one command. A group is deleted only if it held at least one of the deleted volumes and **nothing else** — a group that still holds another node's volume, or selects volumes by pattern, is kept with a warning. Each group is re-checked immediately before its delete, and none is deleted if the volume or node delete failed. |
 | `decommission_volume_group_match` | `''` | Regex on the group name. With `decommission_delete_volume_groups`, only matching groups may be deleted — e.g. `'^tier0-12345_'` to limit a Slurm epilog to its own job's group. Empty = any group the run empties. |
+| `decommission_wait_timeout` | `900` | Seconds to wait, after the volume and node delete, for the Anvil to stop listing them. Deletes are asynchronous, so volume groups are deleted only once nothing this run removed is still listed. On timeout the run fails, naming each remaining volume and its state (e.g. `DECOMMISSIONING_QUIESCED`), and no volume group is deleted. |
+| `decommission_wait_delay` | `10` | Seconds between those checks. |
 
 Deleting a storage volume also removes it from its volume groups, so the
 playbook relies on that and then re-reads the groups to confirm. If a group

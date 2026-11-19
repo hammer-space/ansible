@@ -89,6 +89,12 @@
 # placeholder names the deleted volume, so it is read as that volume — without
 # this, every emptied group is kept as "still in use".
 #
+# The hidden group's name must be unique, so when an older placeholder for a
+# volume of the same name still exists, the Anvil appends a counter:
+#   "__z_volume:10.1.16.4::/nvme/tier0_14"   (field, job 147: the same node
+# had been decommissioned many times). A trailing _<digits> is stripped ONLY
+# when the name as written is not itself one of this run's volumes.
+#
 # Everything the group still selects that is NOT one of the deleted volumes.
 # An expression with no `locations` (a namePattern) and a location that names
 # no storage volume are both counted: they select something this run did not
@@ -106,6 +112,10 @@
           {%- if vn | length == 0 and (l._type | default('')) == 'VOLUME_GROUP'
                 and (l.name | default('')) is match('__z_volume:') -%}
             {%- set vn = l.name[('__z_volume:' | length):] -%}
+            {%- if vn not in volume_group_delete_config.volumes and vn is search('_[0-9]+$')
+                  and vn.rsplit('_', 1)[0] in volume_group_delete_config.volumes -%}
+              {%- set vn = vn.rsplit('_', 1)[0] -%}
+            {%- endif -%}
           {%- endif -%}
           {%- if vn | length == 0 -%}
             {%- set ns.out = ns.out + [l._type | default('unnamed location')] -%}

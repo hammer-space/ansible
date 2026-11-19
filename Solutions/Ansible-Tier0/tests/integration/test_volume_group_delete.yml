@@ -18,11 +18,18 @@
 #      a real Anvil rejects a PUT by name); its status is gated with the body
 #      redacted; a group still listed after the DELETE fails. (TEST 4)
 #   6. The flag off leaves every group alone. (TEST 7)
+#   8. Groups are deleted only after the Anvil stops LISTING the volumes and
+#      nodes (polled by exact name; the per-name GET is not trusted — the mock
+#      404s it, as a field Anvil does). A volume that never leaves fails the
+#      run with its state, and no group is touched. (TESTs 8, 9)
 #   7. A real Anvil does not remove a deleted volume from its groups: it swaps
 #      the location for {"_type": "VOLUME_GROUP", "name": "__z_volume:<vol>"}
 #      (captured from a field Anvil). That placeholder is read as the volume
 #      it names — ours makes the group deletable, anyone else's keeps it.
 #      The mock reproduces it on every volume delete. (TESTs 2, 6)
+#      When that hidden name is already taken by an older placeholder, the
+#      Anvil appends "_<n>" (field: "...::/nvme/tier0_14"); the mock does the
+#      same, so TEST 2 deletes a group whose placeholder is suffixed.
 #
 # TESTs 1-3, 5 and 7 run the REAL playbook — and cleanup_instance_nodes.py —
 # against mock_anvil_decommission.py over TLS. TEST 4 runs the task file
@@ -77,6 +84,10 @@
           # pre-DELETE re-read must read it as that volume.
           - "'__z_volume:' in _dc_code"
           - "'__z_volume:' in _vgd_code"
+          # ...including the "_<n>" the Anvil appends when the hidden name is
+          # already taken (field: "__z_volume:10.1.16.4::/nvme/tier0_14").
+          - "_dc_code.count(\"rsplit('_', 1)\") >= 2"
+          - "_vgd_code.count(\"rsplit('_', 1)\") >= 2"
           # DELETE by uuid, never by name.
           - _vgd_code is search('-X DELETE')
           - _vgd_code is search('volume-groups/\{\{ _vgd_json\.uoid\.uuid')
@@ -247,6 +258,55 @@
               - _e2e_calls | select('match', 'DELETE volume-groups/') | list | length == 0
               - "'tier0-118_a' in _e2e_groups"
               - "'none (decommission_delete_volume_groups=false)' in _e2e_run.stdout"
+            fail_msg: |
+              rc={{ _e2e_run.rc }} calls={{ _e2e_calls }} groups={{ _e2e_groups }}
+              {{ _e2e_run.stdout[-3000:] }}
+
+        # ---------------------------------------------------------- TEST 8
+        # Deletes are async: the volume and node stay LISTED for 3 more reads,
+        # and the per-name GET 404s (as on a field Anvil), so the cleanup
+        # script believes they are gone at once. The playbook must wait.
+        - name: 'TEST 8: groups are deleted only once the Anvil stops listing the volume and node'
+          ansible.builtin.include_tasks: _decommission_e2e.yml
+          vars:
+            _e2e_mode: slow-delete
+            _e2e_args: ['-e', 'decommission_confirm=true', '-e', 'decommission_delete_volume_groups=true',
+                        '-e', 'decommission_volume_group_match=^tier0-118_']
+
+        - name: 'TEST 8 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _e2e_run.rc == 0
+              - "'Confirmed: the Anvil no longer lists' in _e2e_run.stdout"
+              - "'FAILED - RETRYING: [hb-1 -> localhost]: Poll the volume list' in _e2e_run.stdout"
+              - "'DELETE volume-groups/uuid-tier0-118_a' in _e2e_calls"
+              - "'Volume groups deleted: tier0-118_a' in _e2e_run.stdout"
+            fail_msg: |
+              rc={{ _e2e_run.rc }} calls={{ _e2e_calls }} groups={{ _e2e_groups }}
+              {{ _e2e_run.stdout[-3000:] }}
+
+        # ---------------------------------------------------------- TEST 9
+        # The field case: the volume was "deleted" but sits in
+        # DECOMMISSIONING_QUIESCED forever. No group may be deleted, and the
+        # run must fail naming the volume and its state.
+        - name: 'TEST 9: a volume that never leaves fails the run and keeps every group'
+          ansible.builtin.include_tasks: _decommission_e2e.yml
+          vars:
+            _e2e_mode: stuck-volume
+            _e2e_args: ['-e', 'decommission_confirm=true', '-e', 'decommission_delete_volume_groups=true',
+                        '-e', 'decommission_volume_group_match=^tier0-118_']
+
+        - name: 'TEST 9 ASSERT'
+          ansible.builtin.assert:
+            that:
+              - _e2e_run.rc != 0
+              - "'The Anvil still lists what this run deleted' in _e2e_run.stdout"
+              - "'volume ' ~ _v1 ~ ': state DECOMMISSIONING_QUIESCED' in _e2e_run.stdout"
+              - _e2e_calls | select('match', 'DELETE volume-groups/') | list | length == 0
+              - "'tier0-118_a' in _e2e_groups"
+              # The credential never reaches the output.
+              - "'Mock-Passw0rd' not in _e2e_run.stdout"
+              - "('admin:Mock-Passw0rd!' | b64encode) not in _e2e_run.stdout"
             fail_msg: |
               rc={{ _e2e_run.rc }} calls={{ _e2e_calls }} groups={{ _e2e_groups }}
               {{ _e2e_run.stdout[-3000:] }}

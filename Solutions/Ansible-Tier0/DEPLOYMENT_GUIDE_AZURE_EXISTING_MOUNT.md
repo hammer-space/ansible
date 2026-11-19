@@ -267,9 +267,13 @@ ansible-playbook decommission_tier0.yml \
   -e decommission_confirm=true
 ```
 
-Order: **delete the volumes → delete the node → verify the volume groups**.
-Deleting a volume removes it from its volume groups; the playbook then
-re-reads the groups and warns if any still references a deleted volume.
+Order: **delete the volumes → delete the node → wait until the Anvil no
+longer lists them → verify the volume groups**. Deletes are asynchronous, so
+the playbook waits (up to `decommission_wait_timeout`, default 900 s) before
+touching any volume group. If a volume is still listed after that — for
+example stuck in `DECOMMISSIONING_QUIESCED` because its node is no longer
+reachable — the run fails, names the volume and its state, and deletes no
+volume group.
 
 ### Node, volumes and volume group in one command
 

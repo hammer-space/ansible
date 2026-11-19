@@ -2,7 +2,8 @@
 # Helper for test_volume_group_delete.yml: run the REAL decommission_tier0.yml
 # against a fresh TLS mock Anvil, then read back what it did.
 #
-# Input:  _e2e_mode  mock mode ('' | fail-node-delete | join-on-delete)
+# Input:  _e2e_mode  mock mode ('' | fail-node-delete | join-on-delete |
+#                    slow-delete | stuck-volume)
 #         _e2e_args  extra ansible-playbook arguments (list)
 # Output: _e2e_run     the ansible-playbook result (rc, stdout)
 #         _e2e_calls   every write the mock received, "METHOD path"
@@ -44,7 +45,9 @@
                      'hammerspace_api_validate_certs': false,
                      'hammerspace_keyvault_uri': '',
                      'hammerspace_volume_group_delete_wait_retries': 2,
-                     'hammerspace_volume_group_delete_wait_delay': 0} | to_json]
+                     'hammerspace_volume_group_delete_wait_delay': 0,
+                     'decommission_wait_timeout': 6,
+                     'decommission_wait_delay': 0} | to_json]
              + _e2e_args }}
       environment:
         PATH: "{{ _e2e_tmp.path }}/bin:{{ _e2e_path_env }}"

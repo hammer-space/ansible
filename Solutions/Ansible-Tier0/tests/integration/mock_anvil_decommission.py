@@ -9,7 +9,8 @@ State at start:
     volumes  hb-1::/nvme/tier0, hb-2::/nvme/tier0
     groups   tier0-118_a      hb-1 only               -> emptied by hb-1
              keep-me-118      hb-1 only               -> emptied, name filter
-             vg-shared        hb-1 + hb-2             -> still in use
+             vg-shared        hb-1 + hb-2 + an older hb-1 placeholder
+                                                      -> still in use
              vg-pattern       namePattern '*'         -> selects by pattern
              tier0-118_old    hb-1 + "__z_volume:" ref to an older deleted
                               volume                  -> still in use
@@ -26,6 +27,13 @@ Modes (argv[3], optional):
     fail-node-delete   DELETE /nodes/<uuid> -> 500
     join-on-delete     deleting a volume adds a foreign volume to tier0-118_a,
                        i.e. another job joined it between plan and delete
+    slow-delete        a deleted volume / node stays LISTED for the next 3
+                       reads of /storage-volumes / /nodes (async delete)
+    stuck-volume       a deleted volume never leaves the list; it sits in
+                       DECOMMISSIONING_QUIESCED (field: its node had gone)
+In slow-delete and stuck-volume, GET /storage-volumes/<name> answers 404, as a
+field Anvil does for a name containing "/", so cleanup_instance_nodes.py
+believes the volume is gone at once — the playbook's wait must not.
 
 GET /_calls returns every write as "METHOD path", for the assertions.
 
@@ -52,11 +60,22 @@ def loc(name):
     return {"_type": "VOLUME_LOCATION", "storageVolume": {"_type": "STORAGE_VOLUME", "name": name}}
 
 
-def placeholder(name):
+def placeholder(name, taken=()):
+    # The hidden group name must be unique: when "__z_volume:<name>" is
+    # already used, the Anvil appends _<n> (field: "...::/nvme/tier0_14").
+    zname, n = "__z_volume:" + name, 0
+    while zname in taken:
+        n += 1
+        zname = "__z_volume:%s_%d" % (name, n)
     return {"_type": "VOLUME_GROUP",
-            "uoid": {"uuid": "z-" + name, "objectType": "VOLUME_GROUP"},
+            "uoid": {"uuid": "z-" + zname, "objectType": "VOLUME_GROUP"},
             "created": 1795085323975, "modified": 1795085323975, "extendedInfo": {},
-            "name": "__z_volume:" + name, "internalId": 1342177398}
+            "name": zname, "internalId": 1342177398}
+
+
+def placeholder_names():
+    return {l.get("name") for g in groups.values() for x in g["expressions"]
+            for l in x.get("locations", []) if l.get("_type") == "VOLUME_GROUP"}
 
 
 def group(name, expressions):
@@ -67,7 +86,10 @@ def group(name, expressions):
 groups = {g["name"]: g for g in [
     group("tier0-118_a", [{"operator": "IN", "locations": [loc(V1)]}]),
     group("keep-me-118", [{"operator": "IN", "locations": [loc(V1)]}]),
-    group("vg-shared", [{"operator": "IN", "locations": [loc(V1), loc(V2)]}]),
+    # also holds the placeholder of an EARLIER volume named like hb-1's, so
+    # deleting hb-1 now yields "__z_volume:hb-1::/nvme/tier0_1"
+    group("vg-shared", [{"operator": "IN",
+                         "locations": [loc(V1), loc(V2), placeholder(V1)]}]),
     group("vg-pattern", [{"expressionType": "VOLUME_LOCATION", "namePattern": "*"}]),
     # holds hb-1 AND a placeholder left by an older, already deleted volume
     group("tier0-118_old", [{"operator": "IN",
@@ -76,6 +98,28 @@ groups = {g["name"]: g for g in [
     group("tier0-sticky", [{"operator": "IN", "locations": [loc(V1)]}]),
 ]}
 calls = []
+pending_volumes = {}   # name -> list reads left before it disappears
+pending_nodes = {}
+SLOW_READS = 3
+
+
+def finish_volume_delete(name):
+    volumes.pop(name, None)
+    taken = placeholder_names()
+    for g in groups.values():
+        for x in g["expressions"]:
+            if "locations" in x:
+                x["locations"] = [placeholder(name, taken)
+                                  if l.get("storageVolume", {}).get("name") == name else l
+                                  for l in x["locations"]]
+
+
+def tick(pending, finish):
+    for name in list(pending):
+        pending[name] -= 1
+        if pending[name] <= 0:
+            del pending[name]
+            finish(name)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -107,10 +151,16 @@ class Handler(BaseHTTPRequestHandler):
         if p.startswith("tasks/"):
             return self.reply(200, {"status": "COMPLETED"})
         if p == "nodes":
-            return self.reply(200, list(nodes.values()))
+            out = list(nodes.values())
+            tick(pending_nodes, lambda n: nodes.pop(n, None))
+            return self.reply(200, out)
         if p == "storage-volumes":
-            return self.reply(200, list(volumes.values()))
+            out = list(volumes.values())
+            tick(pending_volumes, finish_volume_delete)
+            return self.reply(200, out)
         if p.startswith("storage-volumes/"):
+            if MODE in ("slow-delete", "stuck-volume"):
+                return self.reply(404, {"errorCode": 4002})
             v = volumes.get(p[len("storage-volumes/"):])
             return self.reply(200, v) if v else self.reply(404, {"errorCode": 4002})
         if p == "volume-groups":
@@ -125,17 +175,19 @@ class Handler(BaseHTTPRequestHandler):
         calls.append("DELETE " + p)
         if p.startswith("storage-volumes/"):
             name = p[len("storage-volumes/"):]
-            if volumes.pop(name, None) is None:
+            if name not in volumes:
                 return self.reply(404, {"errorCode": 4002})
             # A real Anvil does not drop the deleted volume from its groups: it
-            # swaps the location for a hidden per-volume group reference. Shape
-            # captured from a field Anvil (job 146), uuids/ids made up.
-            for g in groups.values():
-                for x in g["expressions"]:
-                    if "locations" in x:
-                        x["locations"] = [placeholder(name)
-                                          if l.get("storageVolume", {}).get("name") == name else l
-                                          for l in x["locations"]]
+            # swaps the location for a hidden per-volume group reference
+            # (finish_volume_delete). Shape captured from a field Anvil.
+            if MODE == "stuck-volume":
+                volumes[name]["storageVolumeState"] = "DECOMMISSIONING_QUIESCED"
+                volumes[name]["operationalStatus"] = "UNAVAILABLE"
+            elif MODE == "slow-delete":
+                volumes[name]["storageVolumeState"] = "DECOMMISSIONING"
+                pending_volumes[name] = SLOW_READS
+            else:
+                finish_volume_delete(name)
             if MODE == "join-on-delete":
                 groups["tier0-118_a"]["expressions"][0]["locations"].append(loc("hb-9::/nvme/tier0"))
             return self.reply(200, {})
@@ -145,7 +197,10 @@ class Handler(BaseHTTPRequestHandler):
             uuid = p[len("nodes/"):]
             for n in list(nodes):
                 if nodes[n]["uoid"]["uuid"] == uuid:
-                    del nodes[n]
+                    if MODE == "slow-delete":
+                        pending_nodes[n] = SLOW_READS
+                    else:
+                        del nodes[n]
             return self.reply(200, {})
         if p.startswith("volume-groups/"):
             ref = p[len("volume-groups/"):]
